@@ -80,12 +80,12 @@ def test_unmatched_falls_back_to_defaults_end_to_end(client, stub_target_api):
     assert payload["task_id"] == 25339113
 
 
-def test_wrong_user_is_skipped_without_calling_target(client, stub_target_api):
+def test_wrong_user_is_rejected_with_422(client, stub_target_api):
     body = (FIXTURES_DIR / "activity_create_wrong_user.json").read_bytes()
     r = post(client, body, signed_headers(body))
 
-    assert r.status_code == 200
-    assert r.json() == {"skipped": "user_filter"}
+    assert r.status_code == 422
+    assert r.json()["detail"] == "user_filter: 555555555"
     assert stub_target_api["calls"] == []  # never reached the target API
 
 
@@ -180,24 +180,24 @@ def test_delete_event_is_noop_when_target_missing(client, stub_target_api):
     assert [c[1] for c in stub_target_api["calls"]] == ["GET"]
 
 
-def test_unknown_event_is_skipped(client, stub_target_api):
-    """Events outside {create, update, delete} are skipped without target calls."""
+def test_unknown_event_is_rejected_with_422(client, stub_target_api):
+    """Events outside {create, update, delete} are rejected with 422."""
     body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
     headers = signed_headers(body, event="archive")
 
     r = post(client, body, headers)
-    assert r.status_code == 200
-    assert r.json() == {"skipped": "event_not_handled", "event": "archive"}
+    assert r.status_code == 422
+    assert r.json()["detail"] == "event_not_handled: archive"
     assert stub_target_api["calls"] == []
 
 
-def test_non_activity_target_is_skipped(client, stub_target_api):
+def test_non_activity_target_is_rejected_with_422(client, stub_target_api):
     body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
     headers = signed_headers(body, target="Project")
 
     r = post(client, body, headers)
-    assert r.status_code == 200
-    assert r.json() == {"skipped": "not_activity_target"}
+    assert r.status_code == 422
+    assert r.json()["detail"] == "not_activity_target: Project"
     assert stub_target_api["calls"] == []
 
 

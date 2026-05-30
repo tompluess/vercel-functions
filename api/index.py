@@ -65,11 +65,13 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
     target = request.headers.get("x-moco-target")
     event = request.headers.get("x-moco-event")
     if target != "Activity":
-        logger.info("skipping: not_activity_target (target=%s event=%s)", target, event)
-        return {"skipped": "not_activity_target"}
+        logger.warning("rejecting: not_activity_target (target=%s event=%s)",
+                       target, event)
+        raise HTTPException(422, f"not_activity_target: {target}")
     if event not in ("create", "update", "delete"):
-        logger.info("skipping: event_not_handled (event=%s target=%s)", event, target)
-        return {"skipped": "event_not_handled", "event": event}
+        logger.warning("rejecting: event_not_handled (event=%s target=%s)",
+                       event, target)
+        raise HTTPException(422, f"event_not_handled: {event}")
 
     try:
         body = json.loads(raw)
@@ -84,9 +86,9 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
     if event != "delete":
         user_id = (body.get("user") or {}).get("id")
         if str(user_id) != cfg["MOCO_USER_ID_FILTER"]:
-            logger.info("skipping: user_filter (user_id=%s body_keys=%s)",
-                        user_id, sorted(body.keys()))
-            return {"skipped": "user_filter"}
+            logger.warning("rejecting: user_filter (user_id=%s body_keys=%s)",
+                           user_id, sorted(body.keys()))
+            raise HTTPException(422, f"user_filter: {user_id}")
 
     service = MocoSyncService(
         target_subdomain=cfg["MOCO_TARGET_SUBDOMAIN"],
