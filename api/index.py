@@ -97,6 +97,9 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
     except urlerror.URLError as e:
         logger.error("target unreachable: %s", e)
         raise HTTPException(502, "target_unreachable")
+    except Exception as e:
+        logger.exception("Exception: %s, Error on request with payload=%s", e, body)
+        raise HTTPException(500, f"internal_error: {e}")
 
     logger.info("synced source=%s event=%s result=%s",
                 body.get("id"), event, result)

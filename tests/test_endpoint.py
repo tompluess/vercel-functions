@@ -201,3 +201,28 @@ def test_missing_env_returns_500(client, monkeypatch, stub_target_api):
     r = post(client, body, signed_headers(body))
     assert r.status_code == 500
     assert r.json()["detail"] == "server_misconfigured"
+
+
+def test_unexpected_exception_returns_500_and_logs_payload(
+    client, stub_target_api, monkeypatch, caplog
+):
+    """Anything other than HTTPError/URLError bubbling out of the service must
+    log 'Exception, Error on Request' with the parsed payload and return 500."""
+    import logging
+    import api.moco_sync_service as svc
+
+    def boom(self, source):
+        raise RuntimeError("unexpected internal failure")
+
+    monkeypatch.setattr(svc.MocoSyncService, "sync_create", boom)
+    caplog.set_level(logging.ERROR, logger="moco_sync")
+
+    body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
+    r = post(client, body, signed_headers(body))
+
+    assert r.status_code == 500
+    assert r.json()["detail"] == "internal_error: unexpected internal failure"
+    assert "Error on request with payload" in caplog.text
+    # The exception message AND the full parsed payload must appear in the log.
+    assert "unexpected internal failure" in caplog.text
+    assert "Implement webhook receiver" in caplog.text
