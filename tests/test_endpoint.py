@@ -121,14 +121,49 @@ def test_wrong_source_account_returns_401(client, stub_target_api):
     assert r.json()["detail"] == "wrong_source_account"
 
 
-def test_delete_event_is_skipped(client, stub_target_api):
-    """Only create and update are handled; delete and other events are skipped."""
+def test_delete_event_removes_target_activity(client, stub_target_api):
+    from tests.conftest import load_fixture
+    stub_target_api["activities_for_date_response"] = load_fixture(
+        "target_activities_for_date.json"
+    )
     body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
-    headers = signed_headers(body, event="delete")
+    r = post(client, body, signed_headers(body, event="delete"))
+
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["ok"] is True
+    assert payload["event"] == "delete"
+    assert payload["deleted_id"] == 88888881
+
+    # GET activities (lookup) + DELETE activity. No projects mapping needed.
+    methods = [c[1] for c in stub_target_api["calls"]]
+    assert methods == ["GET", "DELETE"]
+    delete_call = stub_target_api["calls"][1]
+    assert delete_call[0] == "https://skyr.mocoapp.com/api/v1/activities/88888881"
+
+
+def test_delete_event_is_noop_when_target_missing(client, stub_target_api):
+    """Delete is idempotent: no target found means the desired state already holds."""
+    stub_target_api["activities_for_date_response"] = []
+    body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
+    r = post(client, body, signed_headers(body, event="delete"))
+
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["event"] == "delete"
+    assert payload["skipped"] == "target_not_found"
+    # Only the lookup happened — no DELETE issued.
+    assert [c[1] for c in stub_target_api["calls"]] == ["GET"]
+
+
+def test_unknown_event_is_skipped(client, stub_target_api):
+    """Events outside {create, update, delete} are skipped without target calls."""
+    body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
+    headers = signed_headers(body, event="archive")
 
     r = post(client, body, headers)
     assert r.status_code == 200
-    assert r.json() == {"skipped": "event_not_handled", "event": "delete"}
+    assert r.json() == {"skipped": "event_not_handled", "event": "archive"}
     assert stub_target_api["calls"] == []
 
 

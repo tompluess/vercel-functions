@@ -118,6 +118,8 @@ def stub_target_api(monkeypatch):
             return FakeUrlopenResponse(
                 json.dumps(state["next_put_response"]).encode()
             )
+        if method == "DELETE" and "/activities/" in url:
+            return FakeUrlopenResponse(b"")
         raise AssertionError(f"unexpected request: {method} {url}")
 
     import api.moco_sync_service as svc

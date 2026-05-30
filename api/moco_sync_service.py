@@ -55,6 +55,19 @@ class MocoSyncService:
         return {"updated_id": updated.get("id"),
                 "project_id": project_id, "task_id": task_id}
 
+    def sync_delete(self, source: dict) -> dict[str, Any]:
+        """Find the existing target activity by remote_id and DELETE it.
+        If no target activity is found, the desired state already holds —
+        return a skip marker so the caller sees an explicit no-op."""
+        existing = self._find_target_by_remote_id(
+            date=source.get("date") or "",
+            source_id=str(source.get("id") or ""),
+        )
+        if existing is None:
+            return {"skipped": "target_not_found"}
+        self._delete_activity(existing["id"])
+        return {"deleted_id": existing["id"]}
+
     def _resolve_project_and_task(self, source: dict) -> tuple[int, int]:
         projects = self._get_projects()
         project_name = (source.get("project") or {}).get("name")
@@ -127,3 +140,9 @@ class MocoSyncService:
                                  method="PUT", headers=headers)
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
+
+    def _delete_activity(self, activity_id: int) -> None:
+        url = f"{self._base_url}/activities/{activity_id}"
+        req = urlrequest.Request(url, method="DELETE", headers=self._auth_headers)
+        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS):
+            pass

@@ -2,7 +2,7 @@
 Vercel Functions entrypoint.
 
   GET  /                — health check
-  POST /api/moco-sync   — Moco Activity create/update webhook receiver
+  POST /api/moco-sync   — Moco Activity create/update/delete webhook receiver
 
 This file is intentionally thin: it parses the request, delegates auth to
 `MocoWebhookValidator`, and hands the parsed activity to `MocoSyncService`.
@@ -65,7 +65,7 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
     if request.headers.get("x-moco-target") != "Activity":
         return {"skipped": "not_activity_target"}
     event = request.headers.get("x-moco-event")
-    if event not in ("create", "update"):
+    if event not in ("create", "update", "delete"):
         return {"skipped": "event_not_handled", "event": event}
 
     try:
@@ -85,9 +85,11 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
         default_task_id=int(cfg["MOCO_TARGET_DEFAULT_TASK_ID"]),
         source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
     )
+    dispatch = {"create": service.sync_create,
+                "update": service.sync_update,
+                "delete": service.sync_delete}
     try:
-        result = (service.sync_create(body) if event == "create"
-                  else service.sync_update(body))
+        result = dispatch[event](body)
     except urlerror.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")[:500]
         logger.error("target API error: %s %s", e.code, err_body)

@@ -169,3 +169,49 @@ def test_update_ignores_activities_from_other_remote_services(stub_target_api):
 
     assert "created_id" in result
     assert result.get("upserted") is True
+
+
+def test_delete_finds_existing_target_and_issues_delete(stub_target_api):
+    """Delete path: GET /activities for the source date, find by
+    (remote_service, remote_id), then DELETE /activities/{id}. No project
+    mapping required."""
+    source = load_fixture("activity_create_matched.json")
+    stub_target_api["activities_for_date_response"] = load_fixture(
+        "target_activities_for_date.json"
+    )
+
+    service = MocoSyncService(**DEFAULTS)
+    result = service.sync_delete(source)
+
+    assert result == {"deleted_id": 88888881}
+    assert [c[1] for c in stub_target_api["calls"]] == ["GET", "DELETE"]
+    delete_call = stub_target_api["calls"][1]
+    assert delete_call[0] == "https://skyr.mocoapp.com/api/v1/activities/88888881"
+    assert delete_call[2] is None  # no body on DELETE
+
+
+def test_delete_is_idempotent_when_no_target_found(stub_target_api):
+    """If the source activity was never synced (or already removed), DELETE
+    skips with target_not_found — desired state already holds."""
+    source = load_fixture("activity_create_matched.json")
+    stub_target_api["activities_for_date_response"] = []
+
+    service = MocoSyncService(**DEFAULTS)
+    result = service.sync_delete(source)
+
+    assert result == {"skipped": "target_not_found"}
+    assert [c[1] for c in stub_target_api["calls"]] == ["GET"]
+
+
+def test_delete_does_not_match_other_remote_services(stub_target_api):
+    """Same remote_id from a different remote_service must not be deleted."""
+    source = load_fixture("activity_create_matched.json")
+    activities = load_fixture("target_activities_for_date.json")
+    activities = [a for a in activities if a["remote_service"] != "solar"]
+    stub_target_api["activities_for_date_response"] = activities
+
+    service = MocoSyncService(**DEFAULTS)
+    result = service.sync_delete(source)
+
+    assert result == {"skipped": "target_not_found"}
+    assert [c[1] for c in stub_target_api["calls"]] == ["GET"]
