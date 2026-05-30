@@ -1,0 +1,6 @@
+.vercel
+.claude/settings.local.json
+__pycache__/
+*.py[cod]
+.venv/
+.python-version
