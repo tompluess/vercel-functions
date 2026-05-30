@@ -1,0 +1,37 @@
+{
+  "id": 1064823759,
+  "date": "2025-01-10",
+  "hours": 0.5,
+  "description": "Someone else's activity",
+  "billed": false,
+  "billable": true,
+  "invoice_id": null,
+  "tag": "",
+  "remote_service": "",
+  "remote_id": null,
+  "remote_url": null,
+  "project": {
+    "id": 1234500001,
+    "name": "Webseite und IT Services",
+    "billable": true
+  },
+  "task": {
+    "id": 1234500002,
+    "name": "Development",
+    "billable": true
+  },
+  "customer": {
+    "id": 762286145,
+    "name": "PVcontracting AG"
+  },
+  "user": {
+    "id": 555555555,
+    "firstname": "Other",
+    "lastname": "User"
+  },
+  "timer_started_at": null,
+  "created_at": "2025-01-10T13:00:00Z",
+  "updated_at": "2025-01-10T13:00:00Z",
+  "hourly_rate": 150,
+  "seconds": 1800
+}

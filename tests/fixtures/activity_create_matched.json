@@ -1,0 +1,37 @@
+{
+  "id": 1064823757,
+  "date": "2025-01-10",
+  "hours": 0.25,
+  "description": "Implement webhook receiver",
+  "billed": false,
+  "billable": true,
+  "invoice_id": null,
+  "tag": "backend",
+  "remote_service": "github",
+  "remote_id": "PR-42",
+  "remote_url": "https://github.com/example/repo/pull/42",
+  "project": {
+    "id": 1234500001,
+    "name": "Webseite und IT Services",
+    "billable": true
+  },
+  "task": {
+    "id": 1234500002,
+    "name": "Development",
+    "billable": true
+  },
+  "customer": {
+    "id": 762286145,
+    "name": "PVcontracting AG"
+  },
+  "user": {
+    "id": 933719334,
+    "firstname": "Tom",
+    "lastname": "Plüss"
+  },
+  "timer_started_at": null,
+  "created_at": "2025-01-10T12:15:47Z",
+  "updated_at": "2025-01-10T12:15:47Z",
+  "hourly_rate": 150,
+  "seconds": 900
+}
