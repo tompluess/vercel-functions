@@ -1,5 +1,6 @@
 """MocoSyncService — replicates a Moco Activity into a target Moco account."""
 
+import datetime as dt
 import json
 from typing import Any
 from urllib import request as urlrequest
@@ -17,6 +18,9 @@ class MocoSyncService:
     """
 
     HTTP_TIMEOUT_SECONDS = 10
+    # Moco's delete webhook ships only {id}, no date — scan this many days
+    # back from today when looking up the target activity.
+    DATELESS_LOOKUP_DAYS = 365
 
     def __init__(self, *, target_subdomain: str, target_api_key: str,
                  target_company_id: str, default_project_id: int,
@@ -42,7 +46,7 @@ class MocoSyncService:
         """Find the existing target activity by remote_id and PUT the new payload.
         If no target activity is found, fall through to create (upsert)."""
         existing = self._find_target_by_remote_id(
-            date=source.get("date") or "",
+            date=source.get("date"),
             namespaced_id=self._namespaced_id(source),
         )
         project_id, task_id = self._resolve_project_and_task(source)
@@ -61,7 +65,7 @@ class MocoSyncService:
         If no target activity is found, the desired state already holds —
         return a skip marker so the caller sees an explicit no-op."""
         existing = self._find_target_by_remote_id(
-            date=source.get("date") or "",
+            date=source.get("date"),
             namespaced_id=self._namespaced_id(source),
         )
         if existing is None:
@@ -112,14 +116,23 @@ class MocoSyncService:
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
 
-    def _find_target_by_remote_id(self, *, date: str, namespaced_id: str) -> dict | None:
+    def _find_target_by_remote_id(self, *, date: str | None,
+                                  namespaced_id: str) -> dict | None:
         """Locate a previously-synced target activity by namespaced remote_id.
 
-        Scans activities for the given date — Moco's `/activities` listing is
-        already scoped to the API token's user, so no further user filtering
-        is needed.
+        When the source webhook carries a date (create/update), the lookup is
+        scoped to that single day. When it doesn't (delete: body is just
+        `{id}`), fall back to a `DATELESS_LOOKUP_DAYS`-window ending today.
+        Moco's `/activities` listing is already scoped to the API token's
+        user, so no further user filtering is needed.
         """
-        url = f"{self._base_url}/activities?from={date}&to={date}"
+        if date:
+            date_from = date_to = date
+        else:
+            today = dt.date.today()
+            date_from = (today - dt.timedelta(days=self.DATELESS_LOOKUP_DAYS)).isoformat()
+            date_to = today.isoformat()
+        url = f"{self._base_url}/activities?from={date_from}&to={date_to}"
         req = urlrequest.Request(url, headers=self._auth_headers)
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
             activities = json.loads(resp.read())

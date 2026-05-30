@@ -205,6 +205,30 @@ def test_delete_is_idempotent_when_no_target_found(stub_target_api):
     assert [c[1] for c in stub_target_api["calls"]] == ["GET"]
 
 
+def test_delete_with_dateless_source_widens_the_lookup_window(stub_target_api):
+    """Moco's Activity:delete webhook ships only `{id}`. When the source dict
+    has no `date`, the GET /activities query must scan a window ending today
+    instead of a single missing day."""
+    import datetime as dt
+    source = {"id": 1064823757}
+    stub_target_api["activities_for_date_response"] = load_fixture(
+        "target_activities_for_date.json"
+    )
+
+    service = MocoSyncService(**DEFAULTS)
+    result = service.sync_delete(source)
+
+    assert result == {"deleted_id": 88888881}
+    lookup_url = stub_target_api["calls"][0][0]
+    qs = lookup_url.split("?")[1]
+    params = dict(p.split("=") for p in qs.split("&"))
+    today = dt.date.today().isoformat()
+    expected_from = (dt.date.today()
+                     - dt.timedelta(days=service.DATELESS_LOOKUP_DAYS)).isoformat()
+    assert params["to"] == today
+    assert params["from"] == expected_from
+
+
 def test_delete_does_not_match_other_source_namespaces(stub_target_api):
     """Same numeric ID under a different source-namespace must not be deleted."""
     source = load_fixture("activity_create_matched.json")

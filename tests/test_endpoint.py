@@ -142,6 +142,30 @@ def test_delete_event_removes_target_activity(client, stub_target_api):
     assert delete_call[0] == "https://skyr.mocoapp.com/api/v1/activities/88888881"
 
 
+def test_delete_handles_minimal_payload_from_moco(client, stub_target_api):
+    """Moco's real Activity:delete webhook ships only `{id}` — no `user`,
+    no `date`, no `project`. The user-id must come from x-moco-user-id, and
+    the lookup must widen its date range when no date is in the body."""
+    from tests.conftest import load_fixture
+    stub_target_api["activities_for_date_response"] = load_fixture(
+        "target_activities_for_date.json"
+    )
+    body = (FIXTURES_DIR / "activity_delete_minimal.json").read_bytes()
+    r = post(client, body, signed_headers(body, event="delete"))
+
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["event"] == "delete"
+    assert payload["deleted_id"] == 88888881
+
+    # GET /activities should have widened to a date range (not a single day).
+    lookup_url = stub_target_api["calls"][0][0]
+    assert "?from=" in lookup_url and "&to=" in lookup_url
+    qs = lookup_url.split("?")[1]
+    params = dict(p.split("=") for p in qs.split("&"))
+    assert params["from"] != params["to"]  # widened, not single-day
+
+
 def test_delete_event_is_noop_when_target_missing(client, stub_target_api):
     """Delete is idempotent: no target found means the desired state already holds."""
     stub_target_api["activities_for_date_response"] = []

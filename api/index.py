@@ -62,10 +62,13 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
     if not validator.account_matches(request.headers.get("x-moco-account-url", "")):
         logger.warning("wrong source account")
         raise HTTPException(401, "wrong_source_account")
-    if request.headers.get("x-moco-target") != "Activity":
-        return {"skipped": "not_activity_target"}
+    target = request.headers.get("x-moco-target")
     event = request.headers.get("x-moco-event")
+    if target != "Activity":
+        logger.info("skipping: not_activity_target (target=%s event=%s)", target, event)
+        return {"skipped": "not_activity_target"}
     if event not in ("create", "update", "delete"):
+        logger.info("skipping: event_not_handled (event=%s target=%s)", event, target)
         return {"skipped": "event_not_handled", "event": event}
 
     try:
@@ -73,9 +76,17 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
     except json.JSONDecodeError:
         raise HTTPException(400, "invalid_json")
 
-    user_id = (body.get("user") or {}).get("id")
-    if str(user_id) != cfg["MOCO_USER_ID_FILTER"]:
-        return {"skipped": "user_filter"}
+    # Skip user filtering on delete — Moco's delete webhook body is just
+    # {id}, so there's no user.id to read. Safety is preserved by the
+    # namespaced-id lookup in sync_delete: we'll only ever delete a target
+    # activity that we ourselves created, which already passed the filter on
+    # create/update.
+    if event != "delete":
+        user_id = (body.get("user") or {}).get("id")
+        if str(user_id) != cfg["MOCO_USER_ID_FILTER"]:
+            logger.info("skipping: user_filter (user_id=%s body_keys=%s)",
+                        user_id, sorted(body.keys()))
+            return {"skipped": "user_filter"}
 
     service = MocoSyncService(
         target_subdomain=cfg["MOCO_TARGET_SUBDOMAIN"],
