@@ -1,0 +1,26 @@
+[
+  {
+    "id": 947156885,
+    "identifier": "P24001",
+    "name": "Intern",
+    "active": true,
+    "billable": false,
+    "tasks": [
+      {"id": 25339113, "name": "Buchhaltung", "billable": true, "active": true},
+      {"id": 25339114, "name": "HR",          "billable": true, "active": true},
+      {"id": 25339115, "name": "Meetings",    "billable": true, "active": true}
+    ]
+  },
+  {
+    "id": 1234500001,
+    "identifier": "P24002",
+    "name": "Webseite und IT Services",
+    "active": true,
+    "billable": true,
+    "tasks": [
+      {"id": 1234500002, "name": "Development", "billable": true, "active": true},
+      {"id": 1234500003, "name": "Design",      "billable": true, "active": true},
+      {"id": 1234500004, "name": "Ops",         "billable": true, "active": true}
+    ]
+  }
+]

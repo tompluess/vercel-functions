@@ -1,0 +1,37 @@
+{
+  "id": 1064823758,
+  "date": "2025-02-14",
+  "hours": 1.0,
+  "description": "Unknown project work",
+  "billed": false,
+  "billable": false,
+  "invoice_id": null,
+  "tag": "",
+  "remote_service": "",
+  "remote_id": null,
+  "remote_url": null,
+  "project": {
+    "id": 9999999999,
+    "name": "Phantom Project",
+    "billable": false
+  },
+  "task": {
+    "id": 9999999998,
+    "name": "Phantom Task",
+    "billable": false
+  },
+  "customer": {
+    "id": 762286145,
+    "name": "PVcontracting AG"
+  },
+  "user": {
+    "id": 933719334,
+    "firstname": "Tom",
+    "lastname": "Plüss"
+  },
+  "timer_started_at": null,
+  "created_at": "2025-02-14T09:00:00Z",
+  "updated_at": "2025-02-14T09:00:00Z",
+  "hourly_rate": 0,
+  "seconds": 3600
+}
