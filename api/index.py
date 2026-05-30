@@ -16,7 +16,7 @@ from urllib import error as urlerror
 
 from fastapi import FastAPI, HTTPException, Request
 
-from api.moco_sync_service import MocoSyncService
+from api.moco_sync_service import MocoSyncService, TargetNotFoundError
 from api.moco_webhook_validator import MocoWebhookValidator
 
 logger = logging.getLogger("moco_sync")
@@ -103,6 +103,9 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
                 "delete": service.sync_delete}
     try:
         result = dispatch[event](body)
+    except TargetNotFoundError as e:
+        logger.warning("delete: target_not_found remote_id=%s", e)
+        raise HTTPException(404, f"target_not_found: {e}")
     except urlerror.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")[:500]
         logger.error("target API error: %s %s", e.code, err_body)

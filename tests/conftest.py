@@ -66,10 +66,15 @@ def set_env(monkeypatch):
 
 
 class FakeUrlopenResponse:
-    """Minimal context-manager response object compatible with urlopen()."""
+    """Minimal context-manager response object compatible with urlopen().
 
-    def __init__(self, body: bytes):
+    Exposes a `.headers` dict so callers that read response headers (e.g.
+    `X-Total` for pagination diagnostics) get the values tests configure.
+    """
+
+    def __init__(self, body: bytes, headers: dict | None = None):
         self._body = body
+        self.headers = headers or {}
 
     def __enter__(self):
         return self
@@ -90,6 +95,7 @@ def stub_target_api(monkeypatch):
     state = {
         "projects_response": load_fixture("target_projects.json"),
         "activities_for_date_response": [],
+        "activities_for_date_total": None,  # overrides X-Total; defaults to len(response)
         "next_post_response": {"id": 99999999},
         "next_put_response": {"id": 88888881},
         "calls": [],
@@ -107,8 +113,13 @@ def stub_target_api(monkeypatch):
                 json.dumps(state["projects_response"]).encode()
             )
         if method == "GET" and "/activities" in url:
+            activities = state["activities_for_date_response"]
+            total = state["activities_for_date_total"]
+            if total is None:
+                total = len(activities)
             return FakeUrlopenResponse(
-                json.dumps(state["activities_for_date_response"]).encode()
+                json.dumps(activities).encode(),
+                headers={"X-Total": str(total)},
             )
         if method == "POST" and url.endswith("/activities"):
             return FakeUrlopenResponse(

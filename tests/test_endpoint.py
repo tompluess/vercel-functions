@@ -166,16 +166,15 @@ def test_delete_handles_minimal_payload_from_moco(client, stub_target_api):
     assert params["from"] != params["to"]  # widened, not single-day
 
 
-def test_delete_event_is_noop_when_target_missing(client, stub_target_api):
-    """Delete is idempotent: no target found means the desired state already holds."""
+def test_delete_returns_404_when_target_missing(client, stub_target_api):
+    """If the corresponding target activity isn't found, surface a 404 so
+    Moco's delivery log makes the mismatch visible."""
     stub_target_api["activities_for_date_response"] = []
     body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
     r = post(client, body, signed_headers(body, event="delete"))
 
-    assert r.status_code == 200
-    payload = r.json()
-    assert payload["event"] == "delete"
-    assert payload["skipped"] == "target_not_found"
+    assert r.status_code == 404
+    assert r.json()["detail"] == "target_not_found: solar:1064823757"
     # Only the lookup happened — no DELETE issued.
     assert [c[1] for c in stub_target_api["calls"]] == ["GET"]
 

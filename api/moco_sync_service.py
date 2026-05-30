@@ -2,8 +2,16 @@
 
 import datetime as dt
 import json
+import logging
 from typing import Any
 from urllib import request as urlrequest
+
+logger = logging.getLogger("moco_sync")
+
+
+class TargetNotFoundError(LookupError):
+    """Raised by sync_delete when no target activity matches the source's
+    namespaced remote_id. Caller decides how to surface it (e.g. HTTP 404)."""
 
 
 class MocoSyncService:
@@ -19,8 +27,12 @@ class MocoSyncService:
 
     HTTP_TIMEOUT_SECONDS = 10
     # Moco's delete webhook ships only {id}, no date — scan this many days
-    # back from today when looking up the target activity.
-    DATELESS_LOOKUP_DAYS = 365
+    # back from today when looking up the target activity. Kept tight to
+    # stay within a single Moco /activities page (default 100): wider
+    # windows risk silent misses on page 2+. The trade-off is that deletes
+    # of activities older than this won't find their target — acceptable
+    # because old time entries are rarely deleted.
+    DATELESS_LOOKUP_DAYS = 14
 
     def __init__(self, *, target_subdomain: str, target_api_key: str,
                  target_company_id: str, default_project_id: int,
@@ -62,14 +74,15 @@ class MocoSyncService:
 
     def sync_delete(self, source: dict) -> dict[str, Any]:
         """Find the existing target activity by remote_id and DELETE it.
-        If no target activity is found, the desired state already holds —
-        return a skip marker so the caller sees an explicit no-op."""
+        Raises TargetNotFoundError if no matching activity is found in the
+        configured lookup window."""
+        namespaced_id = self._namespaced_id(source)
         existing = self._find_target_by_remote_id(
             date=source.get("date"),
-            namespaced_id=self._namespaced_id(source),
+            namespaced_id=namespaced_id,
         )
         if existing is None:
-            return {"skipped": "target_not_found"}
+            raise TargetNotFoundError(namespaced_id)
         self._delete_activity(existing["id"])
         return {"deleted_id": existing["id"]}
 
@@ -135,7 +148,10 @@ class MocoSyncService:
         url = f"{self._base_url}/activities?from={date_from}&to={date_to}"
         req = urlrequest.Request(url, headers=self._auth_headers)
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
+            total = resp.headers.get("X-Total")
             activities = json.loads(resp.read())
+        logger.info("activities lookup: from=%s to=%s X-Total=%s returned=%s",
+                    date_from, date_to, total, len(activities))
         return next(
             (a for a in activities
              if str(a.get("remote_id") or "") == namespaced_id),

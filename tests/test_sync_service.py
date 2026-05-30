@@ -4,7 +4,9 @@ These talk to a stubbed urlopen so we assert the outbound URL, method, and
 JSON body the service constructs, given the JSON fixtures as input.
 """
 
-from api.moco_sync_service import MocoSyncService
+import pytest
+
+from api.moco_sync_service import MocoSyncService, TargetNotFoundError
 from tests.conftest import load_fixture
 
 
@@ -192,16 +194,18 @@ def test_delete_finds_existing_target_and_issues_delete(stub_target_api):
     assert delete_call[2] is None  # no body on DELETE
 
 
-def test_delete_is_idempotent_when_no_target_found(stub_target_api):
-    """If the source activity was never synced (or already removed), DELETE
-    skips with target_not_found — desired state already holds."""
+def test_delete_raises_when_no_target_found(stub_target_api):
+    """If the source activity was never synced (or already removed), the
+    service raises TargetNotFoundError carrying the namespaced id so the
+    caller can decide how to surface it (HTTP 404 in our case)."""
     source = load_fixture("activity_create_matched.json")
     stub_target_api["activities_for_date_response"] = []
 
     service = MocoSyncService(**DEFAULTS)
-    result = service.sync_delete(source)
+    with pytest.raises(TargetNotFoundError) as exc_info:
+        service.sync_delete(source)
 
-    assert result == {"skipped": "target_not_found"}
+    assert str(exc_info.value) == "solar:1064823757"
     assert [c[1] for c in stub_target_api["calls"]] == ["GET"]
 
 
@@ -229,6 +233,28 @@ def test_delete_with_dateless_source_widens_the_lookup_window(stub_target_api):
     assert params["from"] == expected_from
 
 
+def test_activities_lookup_logs_x_total_for_pagination_diagnostics(
+    stub_target_api, caplog,
+):
+    """The lookup logs X-Total (and returned count) at INFO so pagination
+    boundaries are visible — if X-Total > returned, matches on later pages
+    will be missed by the single-page scan."""
+    import logging
+    source = load_fixture("activity_create_matched.json")
+    stub_target_api["activities_for_date_response"] = load_fixture(
+        "target_activities_for_date.json"
+    )
+    stub_target_api["activities_for_date_total"] = 247  # pretend many pages
+    caplog.set_level(logging.INFO, logger="moco_sync")
+
+    service = MocoSyncService(**DEFAULTS)
+    service.sync_update(source)
+
+    assert "activities lookup" in caplog.text
+    assert "X-Total=247" in caplog.text
+    assert "returned=3" in caplog.text  # the fixture has 3 entries
+
+
 def test_delete_does_not_match_other_source_namespaces(stub_target_api):
     """Same numeric ID under a different source-namespace must not be deleted."""
     source = load_fixture("activity_create_matched.json")
@@ -238,7 +264,6 @@ def test_delete_does_not_match_other_source_namespaces(stub_target_api):
     stub_target_api["activities_for_date_response"] = activities
 
     service = MocoSyncService(**DEFAULTS)
-    result = service.sync_delete(source)
-
-    assert result == {"skipped": "target_not_found"}
+    with pytest.raises(TargetNotFoundError):
+        service.sync_delete(source)
     assert [c[1] for c in stub_target_api["calls"]] == ["GET"]

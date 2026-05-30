@@ -34,10 +34,10 @@ updated, or deleted             │ 1. verify HMAC          │
                                              │            PUT /activity/{id} or POST
                                              │              (upsert if not found)
                                              │
-                          delete ────────────┤            GET /activities ▶  (for date)
+                          delete ────────────┤            GET /activities ▶  (14-day window)
                                              │            ◀── activities
                                              ▼            DELETE /activity/{id}
-                                                            (no-op if not found)
+                                                            (404 if not found)
 ```
 
 Source project and task are mapped onto the target account **by name**. If no match is found, configured defaults are used. The link between source and target activity is tracked **statelessly** by writing a namespaced `remote_id` (`{source-account}:{source-id}`) on the target activity — so updates and deletes can be located without any external database.
