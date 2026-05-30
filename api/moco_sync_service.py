@@ -10,13 +10,16 @@ class MocoSyncService:
 
     Maps the source project/task onto the target account by name; falls back
     to configured defaults if no matching project or task exists on the target.
+    Tracks the source-target link statelessly via the target activity's
+    `remote_service` (set to the source account URL) and `remote_id` (set to
+    the source activity's id).
     """
 
     HTTP_TIMEOUT_SECONDS = 10
 
     def __init__(self, *, target_subdomain: str, target_api_key: str,
                  target_company_id: str, default_project_id: int,
-                 default_task_id: int):
+                 default_task_id: int, source_account_url: str):
         self._base_url = f"https://{target_subdomain}.mocoapp.com/api/v1"
         self._auth_headers = {
             "Authorization": f"Token token={target_api_key}",
@@ -25,12 +28,31 @@ class MocoSyncService:
         self._company_id = target_company_id
         self._default_project_id = default_project_id
         self._default_task_id = default_task_id
+        self._source_account_url = source_account_url
 
     def sync_create(self, source: dict) -> dict[str, Any]:
         project_id, task_id = self._resolve_project_and_task(source)
         payload = self._build_payload(source, project_id, task_id)
         created = self._post_activity(payload)
         return {"created_id": created.get("id"),
+                "project_id": project_id, "task_id": task_id}
+
+    def sync_update(self, source: dict) -> dict[str, Any]:
+        """Find the existing target activity by remote_id and PUT the new payload.
+        If no target activity is found, fall through to create (upsert)."""
+        existing = self._find_target_by_remote_id(
+            date=source.get("date") or "",
+            source_id=str(source.get("id") or ""),
+        )
+        project_id, task_id = self._resolve_project_and_task(source)
+        payload = self._build_payload(source, project_id, task_id)
+        if existing is None:
+            created = self._post_activity(payload)
+            return {"created_id": created.get("id"),
+                    "project_id": project_id, "task_id": task_id,
+                    "upserted": True}
+        updated = self._put_activity(existing["id"], payload)
+        return {"updated_id": updated.get("id"),
                 "project_id": project_id, "task_id": task_id}
 
     def _resolve_project_and_task(self, source: dict) -> tuple[int, int]:
@@ -60,8 +82,8 @@ class MocoSyncService:
             "project_id": project_id,
             "task_id": task_id,
             "seconds": source.get("seconds"),
-            "remote_service": source.get("remote_service") or "",
-            "remote_id": source.get("remote_id") or "",
+            "remote_service": self._source_account_url,
+            "remote_id": str(source.get("id") or ""),
             "remote_url": source.get("remote_url") or "",
             "tag": source.get("tag") or "",
         }
@@ -72,10 +94,36 @@ class MocoSyncService:
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
 
+    def _find_target_by_remote_id(self, *, date: str, source_id: str) -> dict | None:
+        """Locate a previously-synced target activity by (remote_service, remote_id).
+
+        Scans activities for the given date — Moco's `/activities` listing is
+        already scoped to the API token's user, so no further user filtering
+        is needed.
+        """
+        url = f"{self._base_url}/activities?from={date}&to={date}"
+        req = urlrequest.Request(url, headers=self._auth_headers)
+        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
+            activities = json.loads(resp.read())
+        return next(
+            (a for a in activities
+             if a.get("remote_service") == self._source_account_url
+             and str(a.get("remote_id") or "") == source_id),
+            None,
+        )
+
     def _post_activity(self, payload: dict) -> dict:
         url = f"{self._base_url}/activities"
         headers = {**self._auth_headers, "Content-Type": "application/json"}
         req = urlrequest.Request(url, data=json.dumps(payload).encode(),
                                  method="POST", headers=headers)
+        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
+            return json.loads(resp.read())
+
+    def _put_activity(self, activity_id: int, payload: dict) -> dict:
+        url = f"{self._base_url}/activities/{activity_id}"
+        headers = {**self._auth_headers, "Content-Type": "application/json"}
+        req = urlrequest.Request(url, data=json.dumps(payload).encode(),
+                                 method="PUT", headers=headers)
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())

@@ -6,23 +6,38 @@ Serverless webhook handlers deployed to [Vercel](https://vercel.com), written in
 
 ### `POST /api/moco-sync`
 
-Receives an [Activity:create webhook](https://github.com/hundertzehn/mocoapp-api-docs) from a source [Moco](https://www.mocoapp.com) account and replicates the activity into a target Moco account.
+Receives [Activity webhooks](https://github.com/hundertzehn/mocoapp-api-docs) (`create` and `update`) from a source [Moco](https://www.mocoapp.com) account and replicates them into a target Moco account.
 
 The flow:
 
 ```
 Source Moco                           Vercel Function                          Target Moco
 ─────────────                         ───────────────                          ─────────────
-Activity created  ──webhook──▶  ┌────────────────────┐                         GET /projects
-                                │ 1. verify HMAC     │  ──auth headers──▶
+Activity created  ──webhook──▶  ┌────────────────────┐
+or updated                      │ 1. verify HMAC     │
                                 │ 2. check timestamp │
-                                │ 3. check account   │  ◀──project list─────
-                                │ 4. filter event/   │
-                                │    target/user     │  ──POST /activity──▶  Activity replicated
-                                └────────────────────┘
+                                │ 3. check account   │
+                                │ 4. accept event in │
+                                │    {create, update}│
+                                │ 5. filter by user  │
+                                └─────────┬──────────┘
+                                          │
+                       create ────────────┤                                    GET /projects ──▶
+                                          │                                    ◀── project list
+                                          │                                    POST /activity ─▶
+                                          │
+                       update ────────────┤                                    GET /activities ▶
+                                          │                                       (for date)
+                                          │                                    ◀── activities
+                                          │                                    GET /projects ──▶
+                                          │                                    ◀── project list
+                                          │                          PUT /activity/{id} or POST
+                                          ▼                              (upsert if not found)
 ```
 
-Source project and task are mapped onto the target account **by name**. If no match is found, configured defaults are used. Useful when two related companies share an employee and time entries logged on one side need to mirror to the other.
+Source project and task are mapped onto the target account **by name**. If no match is found, configured defaults are used. The link between source and target activity is tracked **statelessly** by writing `remote_service` and `remote_id` on the target activity — so updates can be located without any external database.
+
+Useful when two related companies share an employee and time entries logged on one side need to mirror to the other.
 
 ## Architecture
 

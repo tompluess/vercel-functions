@@ -2,7 +2,7 @@
 Vercel Functions entrypoint.
 
   GET  /                — health check
-  POST /api/moco-sync   — Moco Activity:create webhook receiver
+  POST /api/moco-sync   — Moco Activity create/update webhook receiver
 
 This file is intentionally thin: it parses the request, delegates auth to
 `MocoWebhookValidator`, and hands the parsed activity to `MocoSyncService`.
@@ -62,10 +62,11 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
     if not validator.account_matches(request.headers.get("x-moco-account-url", "")):
         logger.warning("wrong source account")
         raise HTTPException(401, "wrong_source_account")
-    if request.headers.get("x-moco-event") != "create":
-        return {"skipped": "not_create_event"}
     if request.headers.get("x-moco-target") != "Activity":
         return {"skipped": "not_activity_target"}
+    event = request.headers.get("x-moco-event")
+    if event not in ("create", "update"):
+        return {"skipped": "event_not_handled", "event": event}
 
     try:
         body = json.loads(raw)
@@ -82,9 +83,11 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
         target_company_id=cfg["MOCO_TARGET_COMPANY_ID"],
         default_project_id=int(cfg["MOCO_TARGET_DEFAULT_PROJECT_ID"]),
         default_task_id=int(cfg["MOCO_TARGET_DEFAULT_TASK_ID"]),
+        source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
     )
     try:
-        result = service.sync_create(body)
+        result = (service.sync_create(body) if event == "create"
+                  else service.sync_update(body))
     except urlerror.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")[:500]
         logger.error("target API error: %s %s", e.code, err_body)
@@ -93,5 +96,6 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
         logger.error("target unreachable: %s", e)
         raise HTTPException(502, "target_unreachable")
 
-    logger.info("created target activity id=%s", result["created_id"])
-    return {"ok": True, **result}
+    logger.info("synced source=%s event=%s result=%s",
+                body.get("id"), event, result)
+    return {"ok": True, "event": event, **result}

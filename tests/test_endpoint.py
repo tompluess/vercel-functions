@@ -27,6 +27,7 @@ def test_happy_path_creates_target_activity(client, stub_target_api):
     assert r.status_code == 200
     payload = r.json()
     assert payload["ok"] is True
+    assert payload["event"] == "create"
     assert payload["created_id"] == 99999999
     assert payload["project_id"] == 1234500001
     assert payload["task_id"] == 1234500002
@@ -34,6 +35,39 @@ def test_happy_path_creates_target_activity(client, stub_target_api):
     # GET projects + POST activity were both made.
     methods = [call[1] for call in stub_target_api["calls"]]
     assert methods == ["GET", "POST"]
+
+
+def test_happy_path_updates_existing_target_activity(client, stub_target_api):
+    from tests.conftest import load_fixture
+    stub_target_api["activities_for_date_response"] = load_fixture(
+        "target_activities_for_date.json"
+    )
+    body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
+    r = post(client, body, signed_headers(body, event="update"))
+
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["ok"] is True
+    assert payload["event"] == "update"
+    assert payload["updated_id"] == 88888881
+    assert "created_id" not in payload
+
+    # GET activities (lookup) + GET projects (mapping) + PUT activity.
+    assert [c[1] for c in stub_target_api["calls"]] == ["GET", "GET", "PUT"]
+
+
+def test_update_upserts_when_target_missing(client, stub_target_api):
+    """Update for an unknown source activity creates instead — function is
+    stateless, so a missed create webhook self-heals on the next update."""
+    stub_target_api["activities_for_date_response"] = []
+    body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
+    r = post(client, body, signed_headers(body, event="update"))
+
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["event"] == "update"
+    assert payload["upserted"] is True
+    assert payload["created_id"] == 99999999
 
 
 def test_unmatched_falls_back_to_defaults_end_to_end(client, stub_target_api):
@@ -87,13 +121,14 @@ def test_wrong_source_account_returns_401(client, stub_target_api):
     assert r.json()["detail"] == "wrong_source_account"
 
 
-def test_non_create_event_is_skipped(client, stub_target_api):
+def test_delete_event_is_skipped(client, stub_target_api):
+    """Only create and update are handled; delete and other events are skipped."""
     body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
-    headers = signed_headers(body, event="update")
+    headers = signed_headers(body, event="delete")
 
     r = post(client, body, headers)
     assert r.status_code == 200
-    assert r.json() == {"skipped": "not_create_event"}
+    assert r.json() == {"skipped": "event_not_handled", "event": "delete"}
     assert stub_target_api["calls"] == []
 
 

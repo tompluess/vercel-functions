@@ -83,15 +83,15 @@ class FakeUrlopenResponse:
 
 @pytest.fixture
 def stub_target_api(monkeypatch):
-    """Patches urlopen in both modules that make outbound HTTP.
-
-    Returns a list of (url, method, payload-or-None) tuples captured per call,
-    plus a settable `next_post_response` and `projects_response` so individual
-    tests can override what the target API "returns".
+    """Patches urlopen in api.moco_sync_service. Captures every outbound
+    request as (url, method, payload-or-None) so tests can assert exact
+    behavior. State dict lets individual tests override responses.
     """
     state = {
         "projects_response": load_fixture("target_projects.json"),
+        "activities_for_date_response": [],
         "next_post_response": {"id": 99999999},
+        "next_put_response": {"id": 88888881},
         "calls": [],
     }
 
@@ -106,15 +106,20 @@ def stub_target_api(monkeypatch):
             return FakeUrlopenResponse(
                 json.dumps(state["projects_response"]).encode()
             )
+        if method == "GET" and "/activities" in url:
+            return FakeUrlopenResponse(
+                json.dumps(state["activities_for_date_response"]).encode()
+            )
         if method == "POST" and url.endswith("/activities"):
             return FakeUrlopenResponse(
                 json.dumps(state["next_post_response"]).encode()
             )
+        if method == "PUT" and "/activities/" in url:
+            return FakeUrlopenResponse(
+                json.dumps(state["next_put_response"]).encode()
+            )
         raise AssertionError(f"unexpected request: {method} {url}")
 
-    # Patch both call sites — index.py never calls urlopen itself, but the
-    # service module does, so patching `api.moco_sync_service.urlrequest.urlopen`
-    # is sufficient. We patch via the imported name to keep it explicit.
     import api.moco_sync_service as svc
     monkeypatch.setattr(svc.urlrequest, "urlopen", fake_urlopen)
     return state
