@@ -11,8 +11,9 @@ class MocoSyncService:
     Maps the source project/task onto the target account by name; falls back
     to configured defaults if no matching project or task exists on the target.
     Tracks the source-target link statelessly via the target activity's
-    `remote_service` (set to the source account URL) and `remote_id` (set to
-    the source activity's id).
+    `remote_id`, encoded as `{source_account_url}:{source.id}`. Moco's
+    `remote_service` field is enum-validated server-side (github / trello /
+    jira / …), so we cannot use it to namespace and leave it blank.
     """
 
     HTTP_TIMEOUT_SECONDS = 10
@@ -42,7 +43,7 @@ class MocoSyncService:
         If no target activity is found, fall through to create (upsert)."""
         existing = self._find_target_by_remote_id(
             date=source.get("date") or "",
-            source_id=str(source.get("id") or ""),
+            namespaced_id=self._namespaced_id(source),
         )
         project_id, task_id = self._resolve_project_and_task(source)
         payload = self._build_payload(source, project_id, task_id)
@@ -61,12 +62,15 @@ class MocoSyncService:
         return a skip marker so the caller sees an explicit no-op."""
         existing = self._find_target_by_remote_id(
             date=source.get("date") or "",
-            source_id=str(source.get("id") or ""),
+            namespaced_id=self._namespaced_id(source),
         )
         if existing is None:
             return {"skipped": "target_not_found"}
         self._delete_activity(existing["id"])
         return {"deleted_id": existing["id"]}
+
+    def _namespaced_id(self, source: dict) -> str:
+        return f"{self._source_account_url}:{source.get('id') or ''}"
 
     def _resolve_project_and_task(self, source: dict) -> tuple[int, int]:
         projects = self._get_projects()
@@ -95,8 +99,9 @@ class MocoSyncService:
             "project_id": project_id,
             "task_id": task_id,
             "seconds": source.get("seconds"),
-            "remote_service": self._source_account_url,
-            "remote_id": str(source.get("id") or ""),
+            # remote_service is enum-validated server-side by Moco — leave blank.
+            "remote_service": "",
+            "remote_id": self._namespaced_id(source),
             "remote_url": source.get("remote_url") or "",
             "tag": source.get("tag") or "",
         }
@@ -107,8 +112,8 @@ class MocoSyncService:
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
 
-    def _find_target_by_remote_id(self, *, date: str, source_id: str) -> dict | None:
-        """Locate a previously-synced target activity by (remote_service, remote_id).
+    def _find_target_by_remote_id(self, *, date: str, namespaced_id: str) -> dict | None:
+        """Locate a previously-synced target activity by namespaced remote_id.
 
         Scans activities for the given date — Moco's `/activities` listing is
         already scoped to the API token's user, so no further user filtering
@@ -120,8 +125,7 @@ class MocoSyncService:
             activities = json.loads(resp.read())
         return next(
             (a for a in activities
-             if a.get("remote_service") == self._source_account_url
-             and str(a.get("remote_id") or "") == source_id),
+             if str(a.get("remote_id") or "") == namespaced_id),
             None,
         )
 

@@ -6,8 +6,8 @@
     "seconds": 900,
     "project": {"id": 1234500001, "name": "Webseite und IT Services"},
     "task": {"id": 1234500002, "name": "Development"},
-    "remote_service": "solar",
-    "remote_id": "1064823757",
+    "remote_service": "",
+    "remote_id": "solar:1064823757",
     "remote_url": "https://github.com/example/repo/pull/42",
     "tag": "backend"
   },
@@ -18,8 +18,8 @@
     "seconds": 1800,
     "project": {"id": 947156885, "name": "Intern"},
     "task": {"id": 25339113, "name": "Buchhaltung"},
-    "remote_service": "different-account",
-    "remote_id": "1064823757",
+    "remote_service": "",
+    "remote_id": "different-account:1064823757",
     "remote_url": null,
     "tag": ""
   },

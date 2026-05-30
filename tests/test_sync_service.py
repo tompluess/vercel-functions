@@ -40,8 +40,8 @@ def test_matched_activity_resolves_to_named_project_and_task(stub_target_api):
         "project_id": 1234500001,
         "task_id": 1234500002,
         "seconds": 900,
-        "remote_service": "solar",
-        "remote_id": "1064823757",
+        "remote_service": "",
+        "remote_id": "solar:1064823757",
         "remote_url": "https://github.com/example/repo/pull/42",
         "tag": "backend",
     }
@@ -59,9 +59,10 @@ def test_unmatched_activity_falls_back_to_defaults(stub_target_api):
     _, post_call = stub_target_api["calls"]
     assert post_call[2]["project_id"] == 947156885
     assert post_call[2]["task_id"] == 25339113
-    # Source ID is always wired into remote_id, regardless of source's own.
-    assert post_call[2]["remote_id"] == "1064823758"
-    assert post_call[2]["remote_service"] == "solar"
+    # Source ID is namespaced into remote_id; remote_service is left empty
+    # because Moco rejects non-enum values server-side.
+    assert post_call[2]["remote_id"] == "solar:1064823758"
+    assert post_call[2]["remote_service"] == ""
     # null remote_url is coerced to empty string.
     assert post_call[2]["remote_url"] == ""
 
@@ -87,7 +88,7 @@ def test_after_project_fallback_task_name_is_resolved_against_default_project(
 
 def test_payload_uses_empty_strings_for_missing_optional_fields(stub_target_api):
     """`tag`, `remote_url`, and `description` are coerced to "" when null/missing.
-    `remote_id`/`remote_service` are always set by us, never passed through."""
+    `remote_id` is always our namespaced string; `remote_service` is always ""."""
     source = {
         "id": 12345,
         "date": "2025-03-01",
@@ -103,8 +104,8 @@ def test_payload_uses_empty_strings_for_missing_optional_fields(stub_target_api)
     assert post_call[2]["description"] == ""
     assert post_call[2]["tag"] == ""
     assert post_call[2]["remote_url"] == ""
-    assert post_call[2]["remote_id"] == "12345"
-    assert post_call[2]["remote_service"] == "solar"
+    assert post_call[2]["remote_id"] == "solar:12345"
+    assert post_call[2]["remote_service"] == ""
 
 
 def test_update_finds_existing_target_and_puts(stub_target_api):
@@ -132,8 +133,8 @@ def test_update_finds_existing_target_and_puts(stub_target_api):
     assert put_call[0] == "https://skyr.mocoapp.com/api/v1/activities/88888881"
     # The updated payload carries the new description from the source.
     assert put_call[2]["description"] == "Implement webhook receiver"
-    assert put_call[2]["remote_id"] == "1064823757"
-    assert put_call[2]["remote_service"] == "solar"
+    assert put_call[2]["remote_id"] == "solar:1064823757"
+    assert put_call[2]["remote_service"] == ""
 
 
 def test_update_upserts_when_no_target_activity_matches(stub_target_api):
@@ -153,15 +154,16 @@ def test_update_upserts_when_no_target_activity_matches(stub_target_api):
     assert [c[1] for c in stub_target_api["calls"]] == ["GET", "GET", "POST"]
 
 
-def test_update_ignores_activities_from_other_remote_services(stub_target_api):
-    """Activities with the same remote_id but a different remote_service
+def test_update_ignores_activities_from_other_source_namespaces(stub_target_api):
+    """Activities whose remote_id is namespaced to a different source account
     must NOT be matched — otherwise unrelated integrations would collide."""
     source = load_fixture("activity_create_matched.json")
     activities = load_fixture("target_activities_for_date.json")
-    # Drop the one from "solar" so only the "different-account" entry with the
-    # same remote_id survives. The service should treat this as not-found and
-    # upsert.
-    activities = [a for a in activities if a["remote_service"] != "solar"]
+    # Drop our "solar:..." entry so only the "different-account:..." entry
+    # with the same numeric ID survives. Service should treat as not-found
+    # and upsert.
+    activities = [a for a in activities
+                  if not str(a.get("remote_id") or "").startswith("solar:")]
     stub_target_api["activities_for_date_response"] = activities
 
     service = MocoSyncService(**DEFAULTS)
@@ -203,11 +205,12 @@ def test_delete_is_idempotent_when_no_target_found(stub_target_api):
     assert [c[1] for c in stub_target_api["calls"]] == ["GET"]
 
 
-def test_delete_does_not_match_other_remote_services(stub_target_api):
-    """Same remote_id from a different remote_service must not be deleted."""
+def test_delete_does_not_match_other_source_namespaces(stub_target_api):
+    """Same numeric ID under a different source-namespace must not be deleted."""
     source = load_fixture("activity_create_matched.json")
     activities = load_fixture("target_activities_for_date.json")
-    activities = [a for a in activities if a["remote_service"] != "solar"]
+    activities = [a for a in activities
+                  if not str(a.get("remote_id") or "").startswith("solar:")]
     stub_target_api["activities_for_date_response"] = activities
 
     service = MocoSyncService(**DEFAULTS)

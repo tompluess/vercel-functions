@@ -40,7 +40,7 @@ updated, or deleted             │ 1. verify HMAC          │
                                                             (no-op if not found)
 ```
 
-Source project and task are mapped onto the target account **by name**. If no match is found, configured defaults are used. The link between source and target activity is tracked **statelessly** by writing `remote_service` and `remote_id` on the target activity — so updates can be located without any external database.
+Source project and task are mapped onto the target account **by name**. If no match is found, configured defaults are used. The link between source and target activity is tracked **statelessly** by writing a namespaced `remote_id` (`{source-account}:{source-id}`) on the target activity — so updates and deletes can be located without any external database.
 
 Useful when two related companies share an employee and time entries logged on one side need to mirror to the other.
 
