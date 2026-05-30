@@ -27,6 +27,7 @@ def test_happy_path_creates_target_activity(client, stub_target_api):
     assert r.status_code == 200
     payload = r.json()
     assert payload["ok"] is True
+    assert payload["event"] == "create"
     assert payload["created_id"] == 99999999
     assert payload["project_id"] == 1234500001
     assert payload["task_id"] == 1234500002
@@ -34,6 +35,39 @@ def test_happy_path_creates_target_activity(client, stub_target_api):
     # GET projects + POST activity were both made.
     methods = [call[1] for call in stub_target_api["calls"]]
     assert methods == ["GET", "POST"]
+
+
+def test_happy_path_updates_existing_target_activity(client, stub_target_api):
+    from tests.conftest import load_fixture
+    stub_target_api["activities_for_date_response"] = load_fixture(
+        "target_activities_for_date.json"
+    )
+    body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
+    r = post(client, body, signed_headers(body, event="update"))
+
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["ok"] is True
+    assert payload["event"] == "update"
+    assert payload["updated_id"] == 88888881
+    assert "created_id" not in payload
+
+    # GET activities (lookup) + GET projects (mapping) + PUT activity.
+    assert [c[1] for c in stub_target_api["calls"]] == ["GET", "GET", "PUT"]
+
+
+def test_update_upserts_when_target_missing(client, stub_target_api):
+    """Update for an unknown source activity creates instead — function is
+    stateless, so a missed create webhook self-heals on the next update."""
+    stub_target_api["activities_for_date_response"] = []
+    body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
+    r = post(client, body, signed_headers(body, event="update"))
+
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["event"] == "update"
+    assert payload["upserted"] is True
+    assert payload["created_id"] == 99999999
 
 
 def test_unmatched_falls_back_to_defaults_end_to_end(client, stub_target_api):
@@ -46,12 +80,12 @@ def test_unmatched_falls_back_to_defaults_end_to_end(client, stub_target_api):
     assert payload["task_id"] == 25339113
 
 
-def test_wrong_user_is_skipped_without_calling_target(client, stub_target_api):
+def test_wrong_user_is_rejected_with_422(client, stub_target_api):
     body = (FIXTURES_DIR / "activity_create_wrong_user.json").read_bytes()
     r = post(client, body, signed_headers(body))
 
-    assert r.status_code == 200
-    assert r.json() == {"skipped": "user_filter"}
+    assert r.status_code == 422
+    assert r.json()["detail"] == "user_filter: 555555555"
     assert stub_target_api["calls"] == []  # never reached the target API
 
 
@@ -87,23 +121,82 @@ def test_wrong_source_account_returns_401(client, stub_target_api):
     assert r.json()["detail"] == "wrong_source_account"
 
 
-def test_non_create_event_is_skipped(client, stub_target_api):
+def test_delete_event_removes_target_activity(client, stub_target_api):
+    from tests.conftest import load_fixture
+    stub_target_api["activities_for_date_response"] = load_fixture(
+        "target_activities_for_date.json"
+    )
     body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
-    headers = signed_headers(body, event="update")
+    r = post(client, body, signed_headers(body, event="delete"))
+
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["ok"] is True
+    assert payload["event"] == "delete"
+    assert payload["deleted_id"] == 88888881
+
+    # GET activities (lookup) + DELETE activity. No projects mapping needed.
+    methods = [c[1] for c in stub_target_api["calls"]]
+    assert methods == ["GET", "DELETE"]
+    delete_call = stub_target_api["calls"][1]
+    assert delete_call[0] == "https://skyr.mocoapp.com/api/v1/activities/88888881"
+
+
+def test_delete_handles_minimal_payload_from_moco(client, stub_target_api):
+    """Moco's real Activity:delete webhook ships only `{id}` — no `user`,
+    no `date`, no `project`. The user-id must come from x-moco-user-id, and
+    the lookup must widen its date range when no date is in the body."""
+    from tests.conftest import load_fixture
+    stub_target_api["activities_for_date_response"] = load_fixture(
+        "target_activities_for_date.json"
+    )
+    body = (FIXTURES_DIR / "activity_delete_minimal.json").read_bytes()
+    r = post(client, body, signed_headers(body, event="delete"))
+
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["event"] == "delete"
+    assert payload["deleted_id"] == 88888881
+
+    # GET /activities should have widened to a date range (not a single day).
+    lookup_url = stub_target_api["calls"][0][0]
+    assert "?from=" in lookup_url and "&to=" in lookup_url
+    qs = lookup_url.split("?")[1]
+    params = dict(p.split("=") for p in qs.split("&"))
+    assert params["from"] != params["to"]  # widened, not single-day
+
+
+def test_delete_returns_404_when_target_missing(client, stub_target_api):
+    """If the corresponding target activity isn't found, surface a 404 so
+    Moco's delivery log makes the mismatch visible."""
+    stub_target_api["activities_for_date_response"] = []
+    body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
+    r = post(client, body, signed_headers(body, event="delete"))
+
+    assert r.status_code == 404
+    assert r.json()["detail"] == "target_not_found: solar:1064823757"
+    # Only the lookup happened — no DELETE issued.
+    assert [c[1] for c in stub_target_api["calls"]] == ["GET"]
+
+
+def test_unknown_event_is_rejected_with_422(client, stub_target_api):
+    """Events outside {create, update, delete} are rejected with 422."""
+    body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
+    headers = signed_headers(body, event="archive")
 
     r = post(client, body, headers)
-    assert r.status_code == 200
-    assert r.json() == {"skipped": "not_create_event"}
+    assert r.status_code == 422
+    assert r.json()["detail"] == "event_not_handled: archive"
     assert stub_target_api["calls"] == []
 
 
-def test_non_activity_target_is_skipped(client, stub_target_api):
+def test_non_activity_target_is_rejected_with_422(client, stub_target_api):
     body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
     headers = signed_headers(body, target="Project")
 
     r = post(client, body, headers)
-    assert r.status_code == 200
-    assert r.json() == {"skipped": "not_activity_target"}
+    assert r.status_code == 422
+    assert r.json()["detail"] == "not_activity_target: Project"
     assert stub_target_api["calls"] == []
 
 
@@ -131,3 +224,28 @@ def test_missing_env_returns_500(client, monkeypatch, stub_target_api):
     r = post(client, body, signed_headers(body))
     assert r.status_code == 500
     assert r.json()["detail"] == "server_misconfigured"
+
+
+def test_unexpected_exception_returns_500_and_logs_payload(
+    client, stub_target_api, monkeypatch, caplog
+):
+    """Anything other than HTTPError/URLError bubbling out of the service must
+    log 'Exception, Error on Request' with the parsed payload and return 500."""
+    import logging
+    import api.moco_sync_service as svc
+
+    def boom(self, source):
+        raise RuntimeError("unexpected internal failure")
+
+    monkeypatch.setattr(svc.MocoSyncService, "sync_create", boom)
+    caplog.set_level(logging.ERROR, logger="moco_sync")
+
+    body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
+    r = post(client, body, signed_headers(body))
+
+    assert r.status_code == 500
+    assert r.json()["detail"] == "internal_error: unexpected internal failure"
+    assert "Error on request with payload" in caplog.text
+    # The exception message AND the full parsed payload must appear in the log.
+    assert "unexpected internal failure" in caplog.text
+    assert "Implement webhook receiver" in caplog.text

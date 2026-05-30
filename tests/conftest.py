@@ -66,10 +66,15 @@ def set_env(monkeypatch):
 
 
 class FakeUrlopenResponse:
-    """Minimal context-manager response object compatible with urlopen()."""
+    """Minimal context-manager response object compatible with urlopen().
 
-    def __init__(self, body: bytes):
+    Exposes a `.headers` dict so callers that read response headers (e.g.
+    `X-Total` for pagination diagnostics) get the values tests configure.
+    """
+
+    def __init__(self, body: bytes, headers: dict | None = None):
         self._body = body
+        self.headers = headers or {}
 
     def __enter__(self):
         return self
@@ -83,15 +88,16 @@ class FakeUrlopenResponse:
 
 @pytest.fixture
 def stub_target_api(monkeypatch):
-    """Patches urlopen in both modules that make outbound HTTP.
-
-    Returns a list of (url, method, payload-or-None) tuples captured per call,
-    plus a settable `next_post_response` and `projects_response` so individual
-    tests can override what the target API "returns".
+    """Patches urlopen in api.moco_sync_service. Captures every outbound
+    request as (url, method, payload-or-None) so tests can assert exact
+    behavior. State dict lets individual tests override responses.
     """
     state = {
         "projects_response": load_fixture("target_projects.json"),
+        "activities_for_date_response": [],
+        "activities_for_date_total": None,  # overrides X-Total; defaults to len(response)
         "next_post_response": {"id": 99999999},
+        "next_put_response": {"id": 88888881},
         "calls": [],
     }
 
@@ -106,15 +112,27 @@ def stub_target_api(monkeypatch):
             return FakeUrlopenResponse(
                 json.dumps(state["projects_response"]).encode()
             )
+        if method == "GET" and "/activities" in url:
+            activities = state["activities_for_date_response"]
+            total = state["activities_for_date_total"]
+            if total is None:
+                total = len(activities)
+            return FakeUrlopenResponse(
+                json.dumps(activities).encode(),
+                headers={"X-Total": str(total)},
+            )
         if method == "POST" and url.endswith("/activities"):
             return FakeUrlopenResponse(
                 json.dumps(state["next_post_response"]).encode()
             )
+        if method == "PUT" and "/activities/" in url:
+            return FakeUrlopenResponse(
+                json.dumps(state["next_put_response"]).encode()
+            )
+        if method == "DELETE" and "/activities/" in url:
+            return FakeUrlopenResponse(b"")
         raise AssertionError(f"unexpected request: {method} {url}")
 
-    # Patch both call sites — index.py never calls urlopen itself, but the
-    # service module does, so patching `api.moco_sync_service.urlrequest.urlopen`
-    # is sufficient. We patch via the imported name to keep it explicit.
     import api.moco_sync_service as svc
     monkeypatch.setattr(svc.urlrequest, "urlopen", fake_urlopen)
     return state

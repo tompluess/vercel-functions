@@ -1,8 +1,17 @@
 """MocoSyncService — replicates a Moco Activity into a target Moco account."""
 
+import datetime as dt
 import json
+import logging
 from typing import Any
 from urllib import request as urlrequest
+
+logger = logging.getLogger("moco_sync")
+
+
+class TargetNotFoundError(LookupError):
+    """Raised by sync_delete when no target activity matches the source's
+    namespaced remote_id. Caller decides how to surface it (e.g. HTTP 404)."""
 
 
 class MocoSyncService:
@@ -10,13 +19,24 @@ class MocoSyncService:
 
     Maps the source project/task onto the target account by name; falls back
     to configured defaults if no matching project or task exists on the target.
+    Tracks the source-target link statelessly via the target activity's
+    `remote_id`, encoded as `{source_account_url}:{source.id}`. Moco's
+    `remote_service` field is enum-validated server-side (github / trello /
+    jira / …), so we cannot use it to namespace and leave it blank.
     """
 
     HTTP_TIMEOUT_SECONDS = 10
+    # Moco's delete webhook ships only {id}, no date — scan this many days
+    # back from today when looking up the target activity. Kept tight to
+    # stay within a single Moco /activities page (default 100): wider
+    # windows risk silent misses on page 2+. The trade-off is that deletes
+    # of activities older than this won't find their target — acceptable
+    # because old time entries are rarely deleted.
+    DATELESS_LOOKUP_DAYS = 14
 
     def __init__(self, *, target_subdomain: str, target_api_key: str,
                  target_company_id: str, default_project_id: int,
-                 default_task_id: int):
+                 default_task_id: int, source_account_url: str):
         self._base_url = f"https://{target_subdomain}.mocoapp.com/api/v1"
         self._auth_headers = {
             "Authorization": f"Token token={target_api_key}",
@@ -25,6 +45,7 @@ class MocoSyncService:
         self._company_id = target_company_id
         self._default_project_id = default_project_id
         self._default_task_id = default_task_id
+        self._source_account_url = source_account_url
 
     def sync_create(self, source: dict) -> dict[str, Any]:
         project_id, task_id = self._resolve_project_and_task(source)
@@ -32,6 +53,41 @@ class MocoSyncService:
         created = self._post_activity(payload)
         return {"created_id": created.get("id"),
                 "project_id": project_id, "task_id": task_id}
+
+    def sync_update(self, source: dict) -> dict[str, Any]:
+        """Find the existing target activity by remote_id and PUT the new payload.
+        If no target activity is found, fall through to create (upsert)."""
+        existing = self._find_target_by_remote_id(
+            date=source.get("date"),
+            namespaced_id=self._namespaced_id(source),
+        )
+        project_id, task_id = self._resolve_project_and_task(source)
+        payload = self._build_payload(source, project_id, task_id)
+        if existing is None:
+            created = self._post_activity(payload)
+            return {"created_id": created.get("id"),
+                    "project_id": project_id, "task_id": task_id,
+                    "upserted": True}
+        updated = self._put_activity(existing["id"], payload)
+        return {"updated_id": updated.get("id"),
+                "project_id": project_id, "task_id": task_id}
+
+    def sync_delete(self, source: dict) -> dict[str, Any]:
+        """Find the existing target activity by remote_id and DELETE it.
+        Raises TargetNotFoundError if no matching activity is found in the
+        configured lookup window."""
+        namespaced_id = self._namespaced_id(source)
+        existing = self._find_target_by_remote_id(
+            date=source.get("date"),
+            namespaced_id=namespaced_id,
+        )
+        if existing is None:
+            raise TargetNotFoundError(namespaced_id)
+        self._delete_activity(existing["id"])
+        return {"deleted_id": existing["id"]}
+
+    def _namespaced_id(self, source: dict) -> str:
+        return f"{self._source_account_url}:{source.get('id') or ''}"
 
     def _resolve_project_and_task(self, source: dict) -> tuple[int, int]:
         projects = self._get_projects()
@@ -60,8 +116,9 @@ class MocoSyncService:
             "project_id": project_id,
             "task_id": task_id,
             "seconds": source.get("seconds"),
-            "remote_service": source.get("remote_service") or "",
-            "remote_id": source.get("remote_id") or "",
+            # remote_service is enum-validated server-side by Moco — leave blank.
+            "remote_service": "",
+            "remote_id": self._namespaced_id(source),
             "remote_url": source.get("remote_url") or "",
             "tag": source.get("tag") or "",
         }
@@ -72,6 +129,35 @@ class MocoSyncService:
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
 
+    def _find_target_by_remote_id(self, *, date: str | None,
+                                  namespaced_id: str) -> dict | None:
+        """Locate a previously-synced target activity by namespaced remote_id.
+
+        When the source webhook carries a date (create/update), the lookup is
+        scoped to that single day. When it doesn't (delete: body is just
+        `{id}`), fall back to a `DATELESS_LOOKUP_DAYS`-window ending today.
+        Moco's `/activities` listing is already scoped to the API token's
+        user, so no further user filtering is needed.
+        """
+        if date:
+            date_from = date_to = date
+        else:
+            today = dt.date.today()
+            date_from = (today - dt.timedelta(days=self.DATELESS_LOOKUP_DAYS)).isoformat()
+            date_to = today.isoformat()
+        url = f"{self._base_url}/activities?from={date_from}&to={date_to}"
+        req = urlrequest.Request(url, headers=self._auth_headers)
+        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
+            total = resp.headers.get("X-Total")
+            activities = json.loads(resp.read())
+        logger.info("activities lookup: from=%s to=%s X-Total=%s returned=%s",
+                    date_from, date_to, total, len(activities))
+        return next(
+            (a for a in activities
+             if str(a.get("remote_id") or "") == namespaced_id),
+            None,
+        )
+
     def _post_activity(self, payload: dict) -> dict:
         url = f"{self._base_url}/activities"
         headers = {**self._auth_headers, "Content-Type": "application/json"}
@@ -79,3 +165,17 @@ class MocoSyncService:
                                  method="POST", headers=headers)
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
+
+    def _put_activity(self, activity_id: int, payload: dict) -> dict:
+        url = f"{self._base_url}/activities/{activity_id}"
+        headers = {**self._auth_headers, "Content-Type": "application/json"}
+        req = urlrequest.Request(url, data=json.dumps(payload).encode(),
+                                 method="PUT", headers=headers)
+        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
+            return json.loads(resp.read())
+
+    def _delete_activity(self, activity_id: int) -> None:
+        url = f"{self._base_url}/activities/{activity_id}"
+        req = urlrequest.Request(url, method="DELETE", headers=self._auth_headers)
+        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS):
+            pass
