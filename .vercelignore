@@ -1,0 +1,5 @@
+reference/
+.git/
+.claude/
+.venv/
+__pycache__/
