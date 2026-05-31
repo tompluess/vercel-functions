@@ -1,0 +1,66 @@
+{
+  "id": 4294457,
+  "identifier": "E260107",
+  "receipt_identifier": "80572997",
+  "title": "Aircondition - Rechnung 80572997",
+  "info": "",
+  "iban": "CH7030000001857721765",
+  "reference": "940000201026332300805729978",
+  "date": "2026-05-27",
+  "due_date": "2026-05-15",
+  "service_period_from": "2026-05-01",
+  "service_period_to": "2026-05-31",
+  "status": "pending",
+  "partially_paid": false,
+  "payment_method": "bank_transfer_swiss_qr_esr",
+  "net_total": 211.36,
+  "gross_total": 228.48,
+  "currency": "CHF",
+  "file_url": "https://mocoapp-data.de1.infra.everii.io/objects/objects%2Faccounts%2F001e273d-b5e6-4bc3-9ff3-25c198249962%2Fdocuments%2F40069661%2F848d8f3aca3e49bc.pdf/848d8f3aca3e49bc.pdf?ai=001e273d-b5e6-4bc3-9ff3-25c198249962&ex=1780351199&s=ZsoBZVeU2hEPPrH7DLAWCfL2EoQ5q7onGUbgZdSf8js",
+  "custom_properties": {},
+  "tags": [],
+  "company": {
+    "id": 762286389,
+    "name": "Digitec Galaxus",
+    "iban": "CH7030000001857721765"
+  },
+  "payments": [],
+  "user": {
+    "id": 933719353,
+    "firstname": "Max",
+    "lastname": "Muster"
+  },
+  "refund_request": null,
+  "approval_status": "none",
+  "credit_card_transaction": null,
+  "items": [
+    {
+      "id": 5413788,
+      "title": "Aircondition - Rechnung 80572997",
+      "net_total": 211.36,
+      "tax_total": 17.12,
+      "tax": 8.1,
+      "vat": {
+        "id": 110529,
+        "tax": 8.1,
+        "description": "",
+        "reverse_charge": false,
+        "intra_eu": false,
+        "active": true,
+        "code": null
+      },
+      "tax_included": true,
+      "gross_total": 228.48,
+      "category": {
+        "id": 97249,
+        "name": "Büromaterial",
+        "credit_account": "6500"
+      },
+      "supplier_credit_number": 2000,
+      "expense": null,
+      "receipt": null
+    }
+  ],
+  "created_at": "2026-05-31T11:16:48Z",
+  "updated_at": "2026-05-31T11:16:48Z"
+}

@@ -1,0 +1,13 @@
+{
+  "id": 5064457,
+  "customer_id": 762286147,
+  "project_id": 947168989,
+  "identifier": "R240004",
+  "date": "2024-12-05",
+  "due_date": "2025-01-04",
+  "status": "draft",
+  "title": "Draft - not yet sent",
+  "recipient_address": "Foo\nBar 1\n8000 Zürich",
+  "net_total": 100,
+  "gross_total": 108
+}

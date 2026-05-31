@@ -1,0 +1,28 @@
+{
+  "id": 2413132,
+  "identifier": "E240017",
+  "receipt_identifier": "R-99999",
+  "title": "Lunch meeting",
+  "info": "Geschäftsessen mit Kunde",
+  "iban": null,
+  "reference": null,
+  "date": "2024-12-10",
+  "due_date": null,
+  "status": "pending",
+  "payment_method": "cash",
+  "net_total": 50.00,
+  "gross_total": 53.85,
+  "currency": "CHF",
+  "file_url": null,
+  "company": {"id": 762314140, "name": "Restaurant Beispiel"},
+  "user": {"id": 933719334, "firstname": "Tom", "lastname": "Plüss"},
+  "items": [
+    {
+      "id": 3019593,
+      "title": "Lunch meeting",
+      "net_total": 50.00,
+      "gross_total": 53.85,
+      "category": {"id": 97259, "name": "Bewirtung", "credit_account": "6500"}
+    }
+  ]
+}
