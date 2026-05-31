@@ -1,12 +1,9 @@
 """MocoSyncService — replicates a Moco Activity into a target Moco account."""
 
 import datetime as dt
-import json
-import logging
 from typing import Any
-from urllib import request as urlrequest
 
-logger = logging.getLogger("moco_sync")
+from api.moco_api import MocoAPI
 
 
 class TargetNotFoundError(LookupError):
@@ -23,9 +20,11 @@ class MocoSyncService:
     `remote_id`, encoded as `{source_account_url}:{source.id}`. Moco's
     `remote_service` field is enum-validated server-side (github / trello /
     jira / …), so we cannot use it to namespace and leave it blank.
+
+    HTTP transport is delegated to a `MocoAPI` collaborator so this class
+    contains only business logic and can be unit-tested with a fake.
     """
 
-    HTTP_TIMEOUT_SECONDS = 10
     # Moco's delete webhook ships only {id}, no date — scan this many days
     # back from today when looking up the target activity. Kept tight to
     # stay within a single Moco /activities page (default 100): wider
@@ -34,15 +33,9 @@ class MocoSyncService:
     # because old time entries are rarely deleted.
     DATELESS_LOOKUP_DAYS = 14
 
-    def __init__(self, *, target_subdomain: str, target_api_key: str,
-                 target_company_id: str, default_project_id: int,
+    def __init__(self, *, api: MocoAPI, default_project_id: int,
                  default_task_id: int, source_account_url: str):
-        self._base_url = f"https://{target_subdomain}.mocoapp.com/api/v1"
-        self._auth_headers = {
-            "Authorization": f"Token token={target_api_key}",
-            "Accept": "application/json",
-        }
-        self._company_id = target_company_id
+        self._api = api
         self._default_project_id = default_project_id
         self._default_task_id = default_task_id
         self._source_account_url = source_account_url
@@ -50,7 +43,7 @@ class MocoSyncService:
     def sync_create(self, source: dict) -> dict[str, Any]:
         project_id, task_id = self._resolve_project_and_task(source)
         payload = self._build_payload(source, project_id, task_id)
-        created = self._post_activity(payload)
+        created = self._api.create_activity(payload)
         return {"created_id": created.get("id"),
                 "project_id": project_id, "task_id": task_id}
 
@@ -64,11 +57,11 @@ class MocoSyncService:
         project_id, task_id = self._resolve_project_and_task(source)
         payload = self._build_payload(source, project_id, task_id)
         if existing is None:
-            created = self._post_activity(payload)
+            created = self._api.create_activity(payload)
             return {"created_id": created.get("id"),
                     "project_id": project_id, "task_id": task_id,
                     "upserted": True}
-        updated = self._put_activity(existing["id"], payload)
+        updated = self._api.update_activity(existing["id"], payload)
         return {"updated_id": updated.get("id"),
                 "project_id": project_id, "task_id": task_id}
 
@@ -83,14 +76,14 @@ class MocoSyncService:
         )
         if existing is None:
             raise TargetNotFoundError(namespaced_id)
-        self._delete_activity(existing["id"])
+        self._api.delete_activity(existing["id"])
         return {"deleted_id": existing["id"]}
 
     def _namespaced_id(self, source: dict) -> str:
         return f"{self._source_account_url}:{source.get('id') or ''}"
 
     def _resolve_project_and_task(self, source: dict) -> tuple[int, int]:
-        projects = self._get_projects()
+        projects = self._api.list_projects()
         project_name = (source.get("project") or {}).get("name")
         task_name = (source.get("task") or {}).get("name")
 
@@ -123,12 +116,6 @@ class MocoSyncService:
             "tag": source.get("tag") or "",
         }
 
-    def _get_projects(self) -> list[dict]:
-        url = f"{self._base_url}/projects?company_id={self._company_id}"
-        req = urlrequest.Request(url, headers=self._auth_headers)
-        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
-            return json.loads(resp.read())
-
     def _find_target_by_remote_id(self, *, date: str | None,
                                   namespaced_id: str) -> dict | None:
         """Locate a previously-synced target activity by namespaced remote_id.
@@ -145,37 +132,9 @@ class MocoSyncService:
             today = dt.date.today()
             date_from = (today - dt.timedelta(days=self.DATELESS_LOOKUP_DAYS)).isoformat()
             date_to = today.isoformat()
-        url = f"{self._base_url}/activities?from={date_from}&to={date_to}"
-        req = urlrequest.Request(url, headers=self._auth_headers)
-        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
-            total = resp.headers.get("X-Total")
-            activities = json.loads(resp.read())
-        logger.info("activities lookup: from=%s to=%s X-Total=%s returned=%s",
-                    date_from, date_to, total, len(activities))
+        activities = self._api.list_activities(date_from=date_from, date_to=date_to)
         return next(
             (a for a in activities
              if str(a.get("remote_id") or "") == namespaced_id),
             None,
         )
-
-    def _post_activity(self, payload: dict) -> dict:
-        url = f"{self._base_url}/activities"
-        headers = {**self._auth_headers, "Content-Type": "application/json"}
-        req = urlrequest.Request(url, data=json.dumps(payload).encode(),
-                                 method="POST", headers=headers)
-        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
-            return json.loads(resp.read())
-
-    def _put_activity(self, activity_id: int, payload: dict) -> dict:
-        url = f"{self._base_url}/activities/{activity_id}"
-        headers = {**self._auth_headers, "Content-Type": "application/json"}
-        req = urlrequest.Request(url, data=json.dumps(payload).encode(),
-                                 method="PUT", headers=headers)
-        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
-            return json.loads(resp.read())
-
-    def _delete_activity(self, activity_id: int) -> None:
-        url = f"{self._base_url}/activities/{activity_id}"
-        req = urlrequest.Request(url, method="DELETE", headers=self._auth_headers)
-        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS):
-            pass

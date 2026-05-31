@@ -88,9 +88,9 @@ class FakeUrlopenResponse:
 
 @pytest.fixture
 def stub_target_api(monkeypatch):
-    """Patches urlopen in api.moco_sync_service. Captures every outbound
-    request as (url, method, payload-or-None) so tests can assert exact
-    behavior. State dict lets individual tests override responses.
+    """Patches urlopen in api.moco_api. Captures every outbound request as
+    (url, method, payload-or-None) so tests can assert exact behavior. State
+    dict lets individual tests override responses.
     """
     state = {
         "projects_response": load_fixture("target_projects.json"),
@@ -133,8 +133,8 @@ def stub_target_api(monkeypatch):
             return FakeUrlopenResponse(b"")
         raise AssertionError(f"unexpected request: {method} {url}")
 
-    import api.moco_sync_service as svc
-    monkeypatch.setattr(svc.urlrequest, "urlopen", fake_urlopen)
+    import api.moco_api as api_mod
+    monkeypatch.setattr(api_mod.urlrequest, "urlopen", fake_urlopen)
     return state
 
 
