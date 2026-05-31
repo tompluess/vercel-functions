@@ -1,0 +1,26 @@
+{
+  "id": 2413133,
+  "identifier": "E240018",
+  "receipt_identifier": "",
+  "title": "Unallocated expense",
+  "info": null,
+  "iban": null,
+  "reference": null,
+  "date": "2024-12-11",
+  "due_date": null,
+  "status": "pending",
+  "net_total": 10.00,
+  "gross_total": 10.81,
+  "currency": "CHF",
+  "company": null,
+  "user": {"id": 933719334, "firstname": "Tom"},
+  "items": [
+    {
+      "id": 3019594,
+      "title": "Misc",
+      "net_total": 10.00,
+      "gross_total": 10.81,
+      "category": {"id": 0, "name": "X", "credit_account": "6600"}
+    }
+  ]
+}

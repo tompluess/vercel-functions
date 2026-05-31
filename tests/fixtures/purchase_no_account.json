@@ -1,0 +1,26 @@
+{
+  "id": 2413134,
+  "identifier": "E240019",
+  "receipt_identifier": "",
+  "title": "Expense without booking account",
+  "info": null,
+  "iban": null,
+  "reference": null,
+  "date": "2024-12-12",
+  "due_date": null,
+  "status": "pending",
+  "net_total": 20.00,
+  "gross_total": 21.62,
+  "currency": "CHF",
+  "company": {"id": 762314141, "name": "Misc Vendor"},
+  "user": {"id": 933719334, "firstname": "Tom"},
+  "items": [
+    {
+      "id": 3019595,
+      "title": "Misc",
+      "net_total": 20.00,
+      "gross_total": 21.62,
+      "category": null
+    }
+  ]
+}

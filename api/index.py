@@ -1,11 +1,13 @@
 """
 Vercel Functions entrypoint.
 
-  GET  /                — health check
-  POST /api/moco-sync   — Moco Activity create/update/delete webhook receiver
+  GET  /                        — health check
+  POST /api/moco-sync           — Moco Activity webhook receiver (Moco -> Moco)
+  POST /api/bexio-expense-sync  — Moco Purchase webhook receiver (Moco -> Bexio bill)
+  POST /api/bexio-invoice-sync  — Moco Invoice webhook receiver (Moco -> Bexio invoice)
 
 This file is intentionally thin: it parses the request, delegates auth to
-`MocoWebhookValidator`, and hands the parsed activity to `MocoSyncService`.
+`MocoWebhookValidator`, and hands the parsed body to the appropriate service.
 """
 
 import json
@@ -16,19 +18,28 @@ from urllib import error as urlerror
 
 from fastapi import FastAPI, HTTPException, Request
 
+from api.bexio_api import BexioAPI
+from api.bexio_expense_sync_service import BexioExpenseSyncService
+from api.bexio_invoice_sync_service import BexioInvoiceSyncService
 from api.moco_api import MocoAPI
 from api.moco_sync_service import MocoSyncService, TargetNotFoundError
 from api.moco_webhook_validator import MocoWebhookValidator
+from api.source_moco_client import SourceMocoClient
 
 logger = logging.getLogger("moco_sync")
 logging.basicConfig(level=logging.INFO)
 
 MAX_BODY_BYTES = 64 * 1024
 
-REQUIRED_ENV = [
+REQUIRED_ENV_MOCO_SYNC = [
     "MOCO_WEBHOOK_SECRET", "MOCO_SOURCE_ACCOUNT_URL", "MOCO_USER_ID_FILTER",
     "MOCO_TARGET_SUBDOMAIN", "MOCO_TARGET_API_KEY", "MOCO_TARGET_COMPANY_ID",
     "MOCO_TARGET_DEFAULT_PROJECT_ID", "MOCO_TARGET_DEFAULT_TASK_ID",
+]
+
+REQUIRED_ENV_BEXIO_SYNC = [
+    "MOCO_WEBHOOK_SECRET", "MOCO_SOURCE_ACCOUNT_URL",
+    "MOCO_SOURCE_API_KEY", "BEXIO_API_TOKEN",
 ]
 
 app = FastAPI()
@@ -41,28 +52,10 @@ def hello() -> dict[str, str]:
 
 @app.post("/api/moco-sync")
 async def moco_sync_webhook(request: Request) -> dict[str, Any]:
-    cfg = {k: os.environ.get(k, "") for k in REQUIRED_ENV}
-    if not all(cfg.values()):
-        logger.error("missing required env vars")
-        raise HTTPException(500, "server_misconfigured")
+    cfg = _require_env(REQUIRED_ENV_MOCO_SYNC)
+    raw = await _read_body(request)
+    _verify_moco_auth(cfg, request, raw)
 
-    raw = await request.body()
-    if not raw or len(raw) > MAX_BODY_BYTES:
-        raise HTTPException(413, "invalid_content_length")
-
-    validator = MocoWebhookValidator(
-        secret=cfg["MOCO_WEBHOOK_SECRET"],
-        expected_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
-    )
-    if not validator.verify_signature(raw, request.headers.get("x-moco-signature", "")):
-        logger.warning("signature mismatch")
-        raise HTTPException(401, "invalid_signature")
-    if not validator.timestamp_fresh(request.headers.get("x-moco-timestamp", "")):
-        logger.warning("timestamp out of window")
-        raise HTTPException(401, "timestamp_out_of_window")
-    if not validator.account_matches(request.headers.get("x-moco-account-url", "")):
-        logger.warning("wrong source account")
-        raise HTTPException(401, "wrong_source_account")
     target = request.headers.get("x-moco-target")
     event = request.headers.get("x-moco-event")
     if target != "Activity":
@@ -74,10 +67,7 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
                        event, target)
         raise HTTPException(422, f"event_not_handled: {event}")
 
-    try:
-        body = json.loads(raw)
-    except json.JSONDecodeError:
-        raise HTTPException(400, "invalid_json")
+    body = _parse_json(raw)
 
     # Skip user filtering on delete — Moco's delete webhook body is just
     # {id}, so there's no user.id to read. Safety is preserved by the
@@ -124,3 +114,122 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
     logger.info("synced source=%s event=%s result=%s",
                 body.get("id"), event, result)
     return {"ok": True, "event": event, **result}
+
+
+@app.post("/api/bexio-expense-sync")
+async def bexio_expense_sync_webhook(request: Request) -> dict[str, Any]:
+    return await _handle_bexio_webhook(
+        request,
+        expected_target="Purchase",
+        build_service=lambda cfg: BexioExpenseSyncService(
+            bexio=BexioAPI(api_token=cfg["BEXIO_API_TOKEN"]),
+            source_moco=SourceMocoClient(
+                subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+                api_key=cfg["MOCO_SOURCE_API_KEY"],
+            ),
+            source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+        ),
+    )
+
+
+@app.post("/api/bexio-invoice-sync")
+async def bexio_invoice_sync_webhook(request: Request) -> dict[str, Any]:
+    return await _handle_bexio_webhook(
+        request,
+        expected_target="Invoice",
+        build_service=lambda cfg: BexioInvoiceSyncService(
+            bexio=BexioAPI(api_token=cfg["BEXIO_API_TOKEN"]),
+            source_moco=SourceMocoClient(
+                subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+                api_key=cfg["MOCO_SOURCE_API_KEY"],
+            ),
+            source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+        ),
+    )
+
+
+async def _handle_bexio_webhook(request: Request, *, expected_target: str,
+                                build_service) -> dict[str, Any]:
+    """Shared Moco-webhook → Bexio dispatch pipeline.
+
+    The two Bexio endpoints differ only in (a) the expected `x-moco-target`
+    header and (b) which service is constructed, so the auth/parse/error
+    plumbing is shared.
+    """
+    cfg = _require_env(REQUIRED_ENV_BEXIO_SYNC)
+    raw = await _read_body(request)
+    _verify_moco_auth(cfg, request, raw)
+
+    target = request.headers.get("x-moco-target")
+    event = request.headers.get("x-moco-event")
+    if target != expected_target:
+        logger.warning("rejecting: unexpected target=%s expected=%s event=%s",
+                       target, expected_target, event)
+        raise HTTPException(422, f"unexpected_target: {target}")
+    if event not in ("create", "update"):
+        logger.warning("rejecting: event_not_handled event=%s target=%s",
+                       event, target)
+        raise HTTPException(422, f"event_not_handled: {event}")
+
+    parsed = _parse_json(raw)
+    # Moco wraps the actual entity in a `body` key for these workflows
+    # (matches the n8n "Extract Purchase" code node), but the moco-sync
+    # webhook ships the entity at the top level. Support both shapes.
+    body = parsed.get("body") if isinstance(parsed.get("body"), dict) else parsed
+
+    service = build_service(cfg)
+    try:
+        result = service.sync(body)
+    except urlerror.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")[:500]
+        logger.error("bexio API error: %s %s", e.code, err_body)
+        raise HTTPException(502, f"bexio_error: {e.code} {err_body}")
+    except urlerror.URLError as e:
+        logger.error("upstream unreachable: %s", e)
+        raise HTTPException(502, "upstream_unreachable")
+    except Exception as e:
+        logger.exception("Exception: %s, Error on request with payload=%s", e, body)
+        raise HTTPException(500, f"internal_error: {e}")
+
+    logger.info("bexio sync target=%s event=%s source=%s result=%s",
+                target, event, body.get("id"), result)
+    return {"ok": True, "event": event, **result}
+
+
+def _require_env(keys: list[str]) -> dict[str, str]:
+    cfg = {k: os.environ.get(k, "") for k in keys}
+    if not all(cfg.values()):
+        missing = [k for k, v in cfg.items() if not v]
+        logger.error("missing required env vars: %s", missing)
+        raise HTTPException(500, "server_misconfigured")
+    return cfg
+
+
+async def _read_body(request: Request) -> bytes:
+    raw = await request.body()
+    if not raw or len(raw) > MAX_BODY_BYTES:
+        raise HTTPException(413, "invalid_content_length")
+    return raw
+
+
+def _verify_moco_auth(cfg: dict[str, str], request: Request, raw: bytes) -> None:
+    validator = MocoWebhookValidator(
+        secret=cfg["MOCO_WEBHOOK_SECRET"],
+        expected_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+    )
+    if not validator.verify_signature(raw, request.headers.get("x-moco-signature", "")):
+        logger.warning("signature mismatch")
+        raise HTTPException(401, "invalid_signature")
+    if not validator.timestamp_fresh(request.headers.get("x-moco-timestamp", "")):
+        logger.warning("timestamp out of window")
+        raise HTTPException(401, "timestamp_out_of_window")
+    if not validator.account_matches(request.headers.get("x-moco-account-url", "")):
+        logger.warning("wrong source account")
+        raise HTTPException(401, "wrong_source_account")
+
+
+def _parse_json(raw: bytes) -> dict:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "invalid_json")

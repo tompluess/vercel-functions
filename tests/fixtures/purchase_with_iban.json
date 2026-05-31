@@ -1,0 +1,39 @@
+{
+  "id": 2413131,
+  "identifier": "E240016",
+  "receipt_identifier": "CH240067780",
+  "title": "Visitenkarten und Flyer CH240067780",
+  "info": null,
+  "iban": "CH7708836121049112006",
+  "reference": "CH240067780",
+  "date": "2024-12-09",
+  "due_date": "2024-12-30",
+  "status": "pending",
+  "payment_method": "bank_transfer",
+  "net_total": 62.38,
+  "gross_total": 67.43,
+  "currency": "CHF",
+  "file_url": "https://data.mocoapp.com/objects/dummy.pdf?sig=abc",
+  "company": {
+    "id": 762314139,
+    "name": "FLYERALARM - RatePAY GmbH",
+    "iban": "CH7708836121049112006"
+  },
+  "user": {"id": 933719334, "firstname": "Tom", "lastname": "Plüss"},
+  "items": [
+    {
+      "id": 3019592,
+      "title": "Visitenkarten und Flyer",
+      "net_total": 62.38,
+      "tax_total": 5.05,
+      "tax": 8.1,
+      "gross_total": 67.43,
+      "category": {
+        "id": 97258,
+        "name": "Werbeinserate, elektronische Medien",
+        "credit_account": "6600"
+      },
+      "supplier_credit_number": 2000
+    }
+  ]
+}

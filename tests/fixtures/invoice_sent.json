@@ -1,0 +1,17 @@
+{
+  "id": 5064456,
+  "customer_id": 762286146,
+  "project_id": 947168988,
+  "identifier": "R240003",
+  "date": "2024-12-04",
+  "due_date": "2025-01-03",
+  "status": "sent",
+  "title": "Akonto – Muster-PVA 20kWp",
+  "recipient_address": "Muster AG\nMusterstrasse 123\n12345 Musterstadt",
+  "currency": "CHF",
+  "net_total": 5000,
+  "tax": 8.1,
+  "gross_total": 5405,
+  "user": {"id": 933719334, "firstname": "Tom", "lastname": "Plüss"},
+  "items": [{"id": 24963925, "type": "item", "title": "Akonto 20%", "net_total": 5000}]
+}
