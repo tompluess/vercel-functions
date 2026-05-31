@@ -1,0 +1,33 @@
+{
+  "id": 1763367,
+  "gender": "M",
+  "firstname": "Max",
+  "lastname": "Muster",
+  "title": "",
+  "job_position": "CEO",
+  "mobile_phone": "077 777 77 77",
+  "work_fax": "",
+  "work_phone": "",
+  "work_email": "max@muster.example",
+  "work_address": "",
+  "home_email": "",
+  "home_address": "",
+  "birthday": null,
+  "salutation": "Lieber Max",
+  "info": "",
+  "avatar_url": null,
+  "tags": ["Partner"],
+  "custom_properties": {},
+  "company": {
+    "id": 762296295,
+    "type": "customer",
+    "name": "Muster GmbH"
+  },
+  "user": {
+    "id": 933719353,
+    "firstname": "Anna",
+    "lastname": "Beispiel"
+  },
+  "created_at": "2024-12-04T11:44:07Z",
+  "updated_at": "2025-12-22T16:56:40Z"
+}

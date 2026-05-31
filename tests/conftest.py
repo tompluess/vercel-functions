@@ -25,6 +25,8 @@ TEST_ENV = {
     "MOCO_TARGET_DEFAULT_TASK_ID": "25339113",
     "MOCO_SOURCE_API_KEY": "test_source_moco_key",
     "BEXIO_API_TOKEN": "test_bexio_token",
+    "BREVO_API_KEY": "test_brevo_key",
+    "BREVO_LIST_ID": "5",
 }
 
 

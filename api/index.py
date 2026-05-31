@@ -1,10 +1,11 @@
 """
 Vercel Functions entrypoint.
 
-  GET  /                        — health check
-  POST /api/moco-sync           — Moco Activity webhook receiver (Moco -> Moco)
-  POST /api/bexio-expense-sync  — Moco Purchase webhook receiver (Moco -> Bexio bill)
-  POST /api/bexio-invoice-sync  — Moco Invoice webhook receiver (Moco -> Bexio invoice)
+  GET  /                         — health check
+  POST /api/moco-sync            — Moco Activity webhook receiver (Moco -> Moco)
+  POST /api/bexio-expense-sync   — Moco Purchase webhook receiver (Moco -> Bexio bill)
+  POST /api/bexio-invoice-sync   — Moco Invoice webhook receiver (Moco -> Bexio invoice)
+  POST /api/brevo-contact-sync   — Moco Contact webhook receiver (Moco -> Brevo)
 
 This file is intentionally thin: it parses the request, delegates auth to
 `MocoWebhookValidator`, and hands the parsed body to the appropriate service.
@@ -21,6 +22,8 @@ from fastapi import FastAPI, HTTPException, Request
 from api.bexio_api import BexioAPI
 from api.bexio_expense_sync_service import BexioExpenseSyncService
 from api.bexio_invoice_sync_service import BexioInvoiceSyncService
+from api.brevo_api import BrevoAPI
+from api.brevo_contact_sync_service import BrevoContactSyncService
 from api.moco_api import MocoAPI
 from api.moco_sync_service import MocoSyncService, TargetNotFoundError
 from api.moco_webhook_validator import MocoWebhookValidator
@@ -40,6 +43,11 @@ REQUIRED_ENV_MOCO_SYNC = [
 REQUIRED_ENV_BEXIO_SYNC = [
     "MOCO_WEBHOOK_SECRET", "MOCO_SOURCE_ACCOUNT_URL",
     "MOCO_SOURCE_API_KEY", "BEXIO_API_TOKEN",
+]
+
+REQUIRED_ENV_BREVO_SYNC = [
+    "MOCO_WEBHOOK_SECRET", "MOCO_SOURCE_ACCOUNT_URL",
+    "MOCO_SOURCE_API_KEY", "BREVO_API_KEY", "BREVO_LIST_ID",
 ]
 
 app = FastAPI()
@@ -118,9 +126,11 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
 
 @app.post("/api/bexio-expense-sync")
 async def bexio_expense_sync_webhook(request: Request) -> dict[str, Any]:
-    return await _handle_bexio_webhook(
+    return await _handle_moco_dispatch_webhook(
         request,
+        required_env=REQUIRED_ENV_BEXIO_SYNC,
         expected_target="Purchase",
+        upstream_label="bexio",
         build_service=lambda cfg: BexioExpenseSyncService(
             bexio=BexioAPI(api_token=cfg["BEXIO_API_TOKEN"]),
             source_moco=SourceMocoClient(
@@ -134,9 +144,11 @@ async def bexio_expense_sync_webhook(request: Request) -> dict[str, Any]:
 
 @app.post("/api/bexio-invoice-sync")
 async def bexio_invoice_sync_webhook(request: Request) -> dict[str, Any]:
-    return await _handle_bexio_webhook(
+    return await _handle_moco_dispatch_webhook(
         request,
+        required_env=REQUIRED_ENV_BEXIO_SYNC,
         expected_target="Invoice",
+        upstream_label="bexio",
         build_service=lambda cfg: BexioInvoiceSyncService(
             bexio=BexioAPI(api_token=cfg["BEXIO_API_TOKEN"]),
             source_moco=SourceMocoClient(
@@ -148,15 +160,38 @@ async def bexio_invoice_sync_webhook(request: Request) -> dict[str, Any]:
     )
 
 
-async def _handle_bexio_webhook(request: Request, *, expected_target: str,
-                                build_service) -> dict[str, Any]:
-    """Shared Moco-webhook → Bexio dispatch pipeline.
+@app.post("/api/brevo-contact-sync")
+async def brevo_contact_sync_webhook(request: Request) -> dict[str, Any]:
+    return await _handle_moco_dispatch_webhook(
+        request,
+        required_env=REQUIRED_ENV_BREVO_SYNC,
+        expected_target="Contact",
+        upstream_label="brevo",
+        build_service=lambda cfg: BrevoContactSyncService(
+            brevo=BrevoAPI(api_key=cfg["BREVO_API_KEY"]),
+            source_moco=SourceMocoClient(
+                subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+                api_key=cfg["MOCO_SOURCE_API_KEY"],
+            ),
+            source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+            list_id=int(cfg["BREVO_LIST_ID"]),
+        ),
+    )
 
-    The two Bexio endpoints differ only in (a) the expected `x-moco-target`
-    header and (b) which service is constructed, so the auth/parse/error
-    plumbing is shared.
+
+async def _handle_moco_dispatch_webhook(
+    request: Request, *, required_env: list[str], expected_target: str,
+    upstream_label: str, build_service,
+) -> dict[str, Any]:
+    """Shared Moco-webhook → external-system dispatch pipeline.
+
+    The three webhooks-to-external endpoints (two Bexio, one Brevo) differ
+    only in (a) the required env vars, (b) the expected `x-moco-target`
+    header, (c) which service is constructed, and (d) the error label
+    surfaced on upstream failure. Everything else — auth, parse, envelope
+    handling, error mapping — is shared.
     """
-    cfg = _require_env(REQUIRED_ENV_BEXIO_SYNC)
+    cfg = _require_env(required_env)
     raw = await _read_body(request)
     _verify_moco_auth(cfg, request, raw)
 
@@ -182,8 +217,8 @@ async def _handle_bexio_webhook(request: Request, *, expected_target: str,
         result = service.sync(body)
     except urlerror.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")[:500]
-        logger.error("bexio API error: %s %s", e.code, err_body)
-        raise HTTPException(502, f"bexio_error: {e.code} {err_body}")
+        logger.error("%s API error: %s %s", upstream_label, e.code, err_body)
+        raise HTTPException(502, f"{upstream_label}_error: {e.code} {err_body}")
     except urlerror.URLError as e:
         logger.error("upstream unreachable: %s", e)
         raise HTTPException(502, "upstream_unreachable")
@@ -191,8 +226,8 @@ async def _handle_bexio_webhook(request: Request, *, expected_target: str,
         logger.exception("Exception: %s, Error on request with payload=%s", e, body)
         raise HTTPException(500, f"internal_error: {e}")
 
-    logger.info("bexio sync target=%s event=%s source=%s result=%s",
-                target, event, body.get("id"), result)
+    logger.info("%s sync target=%s event=%s source=%s result=%s",
+                upstream_label, target, event, body.get("id"), result)
     return {"ok": True, "event": event, **result}
 
 
