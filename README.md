@@ -4,13 +4,14 @@ Serverless webhook handlers deployed to [Vercel](https://vercel.com), written in
 
 ## What's in here
 
-Three webhook receivers, all triggered by [Moco webhooks](https://github.com/hundertzehn/mocoapp-api-docs):
+Four webhook receivers, all triggered by [Moco webhooks](https://github.com/hundertzehn/mocoapp-api-docs):
 
 | Endpoint | Trigger | Sink |
 | --- | --- | --- |
 | `POST /api/moco-sync` | `Activity:create / update / delete` | Target Moco account |
 | `POST /api/bexio-expense-sync` | `Purchase:create / update` | [Bexio](https://www.bexio.com) supplier bill |
 | `POST /api/bexio-invoice-sync` | `Invoice:update` (status=sent) | Bexio customer invoice |
+| `POST /api/brevo-contact-sync` | `Contact:create / update` | [Brevo](https://www.brevo.com) contact (+ list) |
 
 ### `POST /api/moco-sync`
 
@@ -73,15 +74,28 @@ Receives Moco `Invoice` webhooks and creates a matching customer invoice in Bexi
 - Creates the invoice with `api_reference` set to the Moco identifier, then calls `/issue` to transition the invoice to Open (awaiting payment).
 - Cross-comments: a Bexio comment with the Moco URL, and a Moco comment with the Bexio URL.
 
+### `POST /api/brevo-contact-sync`
+
+Receives Moco `Contact` webhooks (`create` + `update`) and mirrors the contact into [Brevo](https://www.brevo.com). Replaces the n8n workflow `Add Moco contacts to Brevo.json`.
+
+- Skips when the Moco contact has no `work_email` (Brevo identifies contacts by email).
+- Lookup `GET /v3/contacts/{email}`. Branches on result:
+  - **Not found**: `POST /v3/contacts` with VORNAME, NACHNAME, ADDITIONAL_INFO (today + Moco URL). Posts a comment back to the Moco contact with the new Brevo URL.
+  - **Found**: `PUT /v3/contacts/{email}` updating VORNAME, NACHNAME, RESPONSIBLE_PERSON (Moco owner's full name), JOB_TITLE.
+- Both branches converge to: normalize and set the SMS attribute from `mobile_phone` (matches the n8n JS: keeps `+`/`00` prefixes, drops a single leading `0`, strips whitespace), and add the contact to the configured Brevo list (idempotent).
+- Failures on the SMS update or list-add are logged but do not fail the sync — the contact mutation is the authoritative outcome.
+
 ## Architecture
 
-- [`api/index.py`](api/index.py) — FastAPI entrypoint. Parses the request, runs the auth pipeline, dispatches to the appropriate service. The two Bexio endpoints share `_handle_bexio_webhook` so the auth/parse/error plumbing isn't duplicated.
+- [`api/index.py`](api/index.py) — FastAPI entrypoint. Parses the request, runs the auth pipeline, dispatches to the appropriate service. The three external-sink endpoints (two Bexio, one Brevo) share `_handle_moco_dispatch_webhook` so the auth/parse/error plumbing isn't duplicated.
 - [`api/moco_webhook_validator.py`](api/moco_webhook_validator.py) — `MocoWebhookValidator`: HMAC-SHA256 signature check, ±300s timestamp window, source-account allowlist. Pure, no I/O.
 - [`api/moco_api.py`](api/moco_api.py) / [`api/moco_sync_service.py`](api/moco_sync_service.py) — target-Moco transport and the Activity replication logic.
 - [`api/source_moco_client.py`](api/source_moco_client.py) — read-only/comment-only client for the *source* Moco account (companies, projects, comments, signed file downloads).
 - [`api/bexio_api.py`](api/bexio_api.py) — Bearer-auth Bexio REST wrapper covering contacts, accounts, bills, invoices (incl. state transitions), files (multipart upload), document templates.
 - [`api/bexio_config.py`](api/bexio_config.py) — non-secret Bexio numeric IDs (user, owner, bank, defaults) and the label → revenue-account mapping. Hardcoded since they change rarely and aren't credentials.
 - [`api/bexio_expense_sync_service.py`](api/bexio_expense_sync_service.py) / [`api/bexio_invoice_sync_service.py`](api/bexio_invoice_sync_service.py) — pure business logic; all HTTP transport delegated to the two collaborators above.
+- [`api/brevo_api.py`](api/brevo_api.py) — `api-key`-auth Brevo (ex-Sendinblue) REST wrapper covering contact lookup/create/update and list-add. Maps 404 from the contact lookup to `None` so the service can branch without exceptions.
+- [`api/brevo_contact_sync_service.py`](api/brevo_contact_sync_service.py) — pure business logic for the Brevo flow (lookup → create-or-update → SMS → list add → optional cross-comment to Moco).
 
 Everything uses `urllib` — no external HTTP client dependency.
 
@@ -137,6 +151,14 @@ Required environment variables (configure in the Vercel project, then `vercel en
 | `MOCO_SOURCE_API_KEY` | API token for the **source** Moco account (used to fetch companies/projects and post comments back) |
 | `BEXIO_API_TOKEN` | Bexio API v3 token (sent as `Authorization: Bearer …`) |
 | `BEXIO_MANUAL_BANK_MAP` | *Optional.* JSON map of Moco user first name → Bexio `bank_account_id` for non-IBAN bills. Example: `{"default": 3, "Alice": 5, "Bob": 4}`. Falls back to `bexio_config.BANK_ACCOUNT_ID` when missing. |
+
+**Used by `/api/brevo-contact-sync`:**
+
+| Variable | Purpose |
+| --- | --- |
+| `MOCO_SOURCE_API_KEY` | API token for the **source** Moco account (used to post the cross-link comment back) |
+| `BREVO_API_KEY` | Brevo API v3 key (sent as `api-key: …`) |
+| `BREVO_LIST_ID` | Numeric ID of the Brevo list every synced contact is added to |
 
 ## Author
 

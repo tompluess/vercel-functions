@@ -1,0 +1,29 @@
+{
+  "id": 1763999,
+  "gender": "F",
+  "firstname": "Erika",
+  "lastname": "OhneEmail",
+  "title": "",
+  "job_position": "",
+  "mobile_phone": "",
+  "work_fax": "",
+  "work_phone": "",
+  "work_email": "",
+  "work_address": "",
+  "home_email": "",
+  "home_address": "",
+  "birthday": null,
+  "salutation": "",
+  "info": "",
+  "avatar_url": null,
+  "tags": [],
+  "custom_properties": {},
+  "company": null,
+  "user": {
+    "id": 933719353,
+    "firstname": "Anna",
+    "lastname": "Beispiel"
+  },
+  "created_at": "2025-01-04T11:44:07Z",
+  "updated_at": "2025-01-04T11:44:07Z"
+}
