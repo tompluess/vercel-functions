@@ -16,6 +16,7 @@ from urllib import error as urlerror
 
 from fastapi import FastAPI, HTTPException, Request
 
+from api.moco_api import MocoAPI
 from api.moco_sync_service import MocoSyncService, TargetNotFoundError
 from api.moco_webhook_validator import MocoWebhookValidator
 
@@ -90,10 +91,13 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
                            user_id, sorted(body.keys()))
             raise HTTPException(422, f"user_filter: {user_id}")
 
+    api = MocoAPI(
+        subdomain=cfg["MOCO_TARGET_SUBDOMAIN"],
+        api_key=cfg["MOCO_TARGET_API_KEY"],
+        company_id=cfg["MOCO_TARGET_COMPANY_ID"],
+    )
     service = MocoSyncService(
-        target_subdomain=cfg["MOCO_TARGET_SUBDOMAIN"],
-        target_api_key=cfg["MOCO_TARGET_API_KEY"],
-        target_company_id=cfg["MOCO_TARGET_COMPANY_ID"],
+        api=api,
         default_project_id=int(cfg["MOCO_TARGET_DEFAULT_PROJECT_ID"]),
         default_task_id=int(cfg["MOCO_TARGET_DEFAULT_TASK_ID"]),
         source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],

@@ -1,7 +1,7 @@
 """Unit tests for MocoSyncService — project/task resolution and payload shape.
 
-These talk to a stubbed urlopen so we assert the outbound URL, method, and
-JSON body the service constructs, given the JSON fixtures as input.
+These inject a FakeMocoAPI directly into the service, so no HTTP transport is
+involved. URL/header/X-Total concerns are covered in test_moco_api.py.
 """
 
 import pytest
@@ -11,18 +11,53 @@ from tests.conftest import load_fixture
 
 
 DEFAULTS = dict(
-    target_subdomain="skyr",
-    target_api_key="test_api_key",
-    target_company_id="761404231",
     default_project_id=947156885,
     default_task_id=25339113,
     source_account_url="solar",
 )
 
 
-def test_matched_activity_resolves_to_named_project_and_task(stub_target_api):
+class FakeMocoAPI:
+    """In-memory stand-in for api.moco_api.MocoAPI. Records every call so tests
+    can assert which method was invoked with which arguments."""
+
+    def __init__(self):
+        self.projects: list[dict] = []
+        self.activities_lookup: list[dict] = []
+        self.next_create_response: dict = {"id": 99999999}
+        self.next_update_response: dict = {"id": 88888881}
+        self.calls: list[tuple] = []
+
+    def list_projects(self) -> list[dict]:
+        self.calls.append(("list_projects",))
+        return self.projects
+
+    def list_activities(self, *, date_from: str, date_to: str) -> list[dict]:
+        self.calls.append(("list_activities", date_from, date_to))
+        return self.activities_lookup
+
+    def create_activity(self, payload: dict) -> dict:
+        self.calls.append(("create_activity", payload))
+        return self.next_create_response
+
+    def update_activity(self, activity_id: int, payload: dict) -> dict:
+        self.calls.append(("update_activity", activity_id, payload))
+        return self.next_update_response
+
+    def delete_activity(self, activity_id: int) -> None:
+        self.calls.append(("delete_activity", activity_id))
+
+
+@pytest.fixture
+def api():
+    fake = FakeMocoAPI()
+    fake.projects = load_fixture("target_projects.json")
+    return fake
+
+
+def test_matched_activity_resolves_to_named_project_and_task(api):
     source = load_fixture("activity_create_matched.json")
-    service = MocoSyncService(**DEFAULTS)
+    service = MocoSyncService(api=api, **DEFAULTS)
 
     result = service.sync_create(source)
 
@@ -30,13 +65,9 @@ def test_matched_activity_resolves_to_named_project_and_task(stub_target_api):
                       "project_id": 1234500001,
                       "task_id": 1234500002}
 
-    get_call, post_call = stub_target_api["calls"]
-    assert get_call[1] == "GET"
-    assert get_call[0] == "https://skyr.mocoapp.com/api/v1/projects?company_id=761404231"
-
-    assert post_call[1] == "POST"
-    assert post_call[0] == "https://skyr.mocoapp.com/api/v1/activities"
-    assert post_call[2] == {
+    assert [c[0] for c in api.calls] == ["list_projects", "create_activity"]
+    create_payload = api.calls[1][1]
+    assert create_payload == {
         "date": "2025-01-10",
         "description": "Implement webhook receiver",
         "project_id": 1234500001,
@@ -49,46 +80,42 @@ def test_matched_activity_resolves_to_named_project_and_task(stub_target_api):
     }
 
 
-def test_unmatched_activity_falls_back_to_defaults(stub_target_api):
+def test_unmatched_activity_falls_back_to_defaults(api):
     source = load_fixture("activity_create_unmatched.json")
-    service = MocoSyncService(**DEFAULTS)
+    service = MocoSyncService(api=api, **DEFAULTS)
 
     result = service.sync_create(source)
 
     assert result["project_id"] == 947156885
     assert result["task_id"] == 25339113
 
-    _, post_call = stub_target_api["calls"]
-    assert post_call[2]["project_id"] == 947156885
-    assert post_call[2]["task_id"] == 25339113
+    create_payload = api.calls[1][1]
+    assert create_payload["project_id"] == 947156885
+    assert create_payload["task_id"] == 25339113
     # Source ID is namespaced into remote_id; remote_service is left empty
     # because Moco rejects non-enum values server-side.
-    assert post_call[2]["remote_id"] == "solar:1064823758"
-    assert post_call[2]["remote_service"] == ""
+    assert create_payload["remote_id"] == "solar:1064823758"
+    assert create_payload["remote_service"] == ""
     # null remote_url is coerced to empty string.
-    assert post_call[2]["remote_url"] == ""
+    assert create_payload["remote_url"] == ""
 
 
-def test_after_project_fallback_task_name_is_resolved_against_default_project(
-    stub_target_api,
-):
+def test_after_project_fallback_task_name_is_resolved_against_default_project(api):
     """When the source project doesn't match by name, the service falls back
     to the default project — and *then* searches that project's task list for
     the source task name. A matching task wins over the default task id."""
     source = load_fixture("activity_create_unmatched.json")
-    projects = load_fixture("target_projects.json")
-    projects[0]["tasks"].append({"id": 77777777, "name": "Phantom Task",
-                                 "billable": True, "active": True})
-    stub_target_api["projects_response"] = projects
+    api.projects[0]["tasks"].append({"id": 77777777, "name": "Phantom Task",
+                                     "billable": True, "active": True})
 
-    service = MocoSyncService(**DEFAULTS)
+    service = MocoSyncService(api=api, **DEFAULTS)
     result = service.sync_create(source)
 
     assert result["project_id"] == 947156885
     assert result["task_id"] == 77777777
 
 
-def test_payload_uses_empty_strings_for_missing_optional_fields(stub_target_api):
+def test_payload_uses_empty_strings_for_missing_optional_fields(api):
     """`tag`, `remote_url`, and `description` are coerced to "" when null/missing.
     `remote_id` is always our namespaced string; `remote_service` is always ""."""
     source = {
@@ -99,64 +126,63 @@ def test_payload_uses_empty_strings_for_missing_optional_fields(stub_target_api)
         "project": {"name": "Webseite und IT Services"},
         "task": {"name": "Development"},
     }
-    service = MocoSyncService(**DEFAULTS)
+    service = MocoSyncService(api=api, **DEFAULTS)
     service.sync_create(source)
 
-    _, post_call = stub_target_api["calls"]
-    assert post_call[2]["description"] == ""
-    assert post_call[2]["tag"] == ""
-    assert post_call[2]["remote_url"] == ""
-    assert post_call[2]["remote_id"] == "solar:12345"
-    assert post_call[2]["remote_service"] == ""
+    create_payload = api.calls[1][1]
+    assert create_payload["description"] == ""
+    assert create_payload["tag"] == ""
+    assert create_payload["remote_url"] == ""
+    assert create_payload["remote_id"] == "solar:12345"
+    assert create_payload["remote_service"] == ""
 
 
-def test_update_finds_existing_target_and_puts(stub_target_api):
-    """Update path: GET /activities for the source date, find by
-    (remote_service, remote_id), then PUT /activities/{id}."""
+def test_update_finds_existing_target_and_puts(api):
+    """Update path: list activities for the source date, find by namespaced
+    remote_id, then update the matched target activity."""
     source = load_fixture("activity_create_matched.json")
-    stub_target_api["activities_for_date_response"] = load_fixture(
-        "target_activities_for_date.json"
-    )
+    api.activities_lookup = load_fixture("target_activities_for_date.json")
 
-    service = MocoSyncService(**DEFAULTS)
+    service = MocoSyncService(api=api, **DEFAULTS)
     result = service.sync_update(source)
 
     assert result == {"updated_id": 88888881,
                       "project_id": 1234500001,
                       "task_id": 1234500002}
 
-    # Three calls: GET activities (lookup), GET projects (mapping), PUT activity.
-    assert [c[1] for c in stub_target_api["calls"]] == ["GET", "GET", "PUT"]
-    lookup, _, put_call = stub_target_api["calls"]
-    assert lookup[0] == (
-        "https://skyr.mocoapp.com/api/v1/activities"
-        "?from=2025-01-10&to=2025-01-10"
-    )
-    assert put_call[0] == "https://skyr.mocoapp.com/api/v1/activities/88888881"
+    assert [c[0] for c in api.calls] == [
+        "list_activities", "list_projects", "update_activity",
+    ]
+    lookup_call = api.calls[0]
+    assert lookup_call == ("list_activities", "2025-01-10", "2025-01-10")
+    update_call = api.calls[2]
+    assert update_call[1] == 88888881  # activity id
     # The updated payload carries the new description from the source.
-    assert put_call[2]["description"] == "Implement webhook receiver"
-    assert put_call[2]["remote_id"] == "solar:1064823757"
-    assert put_call[2]["remote_service"] == ""
+    assert update_call[2]["description"] == "Implement webhook receiver"
+    assert update_call[2]["remote_id"] == "solar:1064823757"
+    assert update_call[2]["remote_service"] == ""
 
 
-def test_update_upserts_when_no_target_activity_matches(stub_target_api):
+def test_update_upserts_when_no_target_activity_matches(api):
     """If no existing target activity matches the source remote_id, fall
-    through to POST (create) — the function is stateless and can't
-    distinguish a missed create-webhook from a real new activity."""
+    through to create — the function is stateless and can't distinguish a
+    missed create-webhook from a real new activity."""
     source = load_fixture("activity_create_matched.json")
-    stub_target_api["activities_for_date_response"] = []
+    api.activities_lookup = []
 
-    service = MocoSyncService(**DEFAULTS)
+    service = MocoSyncService(api=api, **DEFAULTS)
     result = service.sync_update(source)
 
     assert result == {"created_id": 99999999,
                       "project_id": 1234500001,
                       "task_id": 1234500002,
                       "upserted": True}
-    assert [c[1] for c in stub_target_api["calls"]] == ["GET", "GET", "POST"]
+    assert [c[0] for c in api.calls] == [
+        "list_activities", "list_projects", "create_activity",
+    ]
 
 
-def test_update_ignores_activities_from_other_source_namespaces(stub_target_api):
+def test_update_ignores_activities_from_other_source_namespaces(api):
     """Activities whose remote_id is namespaced to a different source account
     must NOT be matched — otherwise unrelated integrations would collide."""
     source = load_fixture("activity_create_matched.json")
@@ -164,106 +190,74 @@ def test_update_ignores_activities_from_other_source_namespaces(stub_target_api)
     # Drop our "solar:..." entry so only the "different-account:..." entry
     # with the same numeric ID survives. Service should treat as not-found
     # and upsert.
-    activities = [a for a in activities
-                  if not str(a.get("remote_id") or "").startswith("solar:")]
-    stub_target_api["activities_for_date_response"] = activities
+    api.activities_lookup = [a for a in activities
+                             if not str(a.get("remote_id") or "").startswith("solar:")]
 
-    service = MocoSyncService(**DEFAULTS)
+    service = MocoSyncService(api=api, **DEFAULTS)
     result = service.sync_update(source)
 
     assert "created_id" in result
     assert result.get("upserted") is True
 
 
-def test_delete_finds_existing_target_and_issues_delete(stub_target_api):
-    """Delete path: GET /activities for the source date, find by
-    (remote_service, remote_id), then DELETE /activities/{id}. No project
-    mapping required."""
+def test_delete_finds_existing_target_and_issues_delete(api):
+    """Delete path: list activities for the source date, find by namespaced
+    remote_id, then delete the matched target activity. No project mapping
+    required."""
     source = load_fixture("activity_create_matched.json")
-    stub_target_api["activities_for_date_response"] = load_fixture(
-        "target_activities_for_date.json"
-    )
+    api.activities_lookup = load_fixture("target_activities_for_date.json")
 
-    service = MocoSyncService(**DEFAULTS)
+    service = MocoSyncService(api=api, **DEFAULTS)
     result = service.sync_delete(source)
 
     assert result == {"deleted_id": 88888881}
-    assert [c[1] for c in stub_target_api["calls"]] == ["GET", "DELETE"]
-    delete_call = stub_target_api["calls"][1]
-    assert delete_call[0] == "https://skyr.mocoapp.com/api/v1/activities/88888881"
-    assert delete_call[2] is None  # no body on DELETE
+    assert [c[0] for c in api.calls] == ["list_activities", "delete_activity"]
+    assert api.calls[1] == ("delete_activity", 88888881)
 
 
-def test_delete_raises_when_no_target_found(stub_target_api):
+def test_delete_raises_when_no_target_found(api):
     """If the source activity was never synced (or already removed), the
     service raises TargetNotFoundError carrying the namespaced id so the
     caller can decide how to surface it (HTTP 404 in our case)."""
     source = load_fixture("activity_create_matched.json")
-    stub_target_api["activities_for_date_response"] = []
+    api.activities_lookup = []
 
-    service = MocoSyncService(**DEFAULTS)
+    service = MocoSyncService(api=api, **DEFAULTS)
     with pytest.raises(TargetNotFoundError) as exc_info:
         service.sync_delete(source)
 
     assert str(exc_info.value) == "solar:1064823757"
-    assert [c[1] for c in stub_target_api["calls"]] == ["GET"]
+    assert [c[0] for c in api.calls] == ["list_activities"]
 
 
-def test_delete_with_dateless_source_widens_the_lookup_window(stub_target_api):
+def test_delete_with_dateless_source_widens_the_lookup_window(api):
     """Moco's Activity:delete webhook ships only `{id}`. When the source dict
-    has no `date`, the GET /activities query must scan a window ending today
-    instead of a single missing day."""
+    has no `date`, the lookup must scan a window ending today instead of a
+    single missing day."""
     import datetime as dt
     source = {"id": 1064823757}
-    stub_target_api["activities_for_date_response"] = load_fixture(
-        "target_activities_for_date.json"
-    )
+    api.activities_lookup = load_fixture("target_activities_for_date.json")
 
-    service = MocoSyncService(**DEFAULTS)
+    service = MocoSyncService(api=api, **DEFAULTS)
     result = service.sync_delete(source)
 
     assert result == {"deleted_id": 88888881}
-    lookup_url = stub_target_api["calls"][0][0]
-    qs = lookup_url.split("?")[1]
-    params = dict(p.split("=") for p in qs.split("&"))
+    _, date_from, date_to = api.calls[0]
     today = dt.date.today().isoformat()
     expected_from = (dt.date.today()
                      - dt.timedelta(days=service.DATELESS_LOOKUP_DAYS)).isoformat()
-    assert params["to"] == today
-    assert params["from"] == expected_from
+    assert date_to == today
+    assert date_from == expected_from
 
 
-def test_activities_lookup_logs_x_total_for_pagination_diagnostics(
-    stub_target_api, caplog,
-):
-    """The lookup logs X-Total (and returned count) at INFO so pagination
-    boundaries are visible — if X-Total > returned, matches on later pages
-    will be missed by the single-page scan."""
-    import logging
-    source = load_fixture("activity_create_matched.json")
-    stub_target_api["activities_for_date_response"] = load_fixture(
-        "target_activities_for_date.json"
-    )
-    stub_target_api["activities_for_date_total"] = 247  # pretend many pages
-    caplog.set_level(logging.INFO, logger="moco_sync")
-
-    service = MocoSyncService(**DEFAULTS)
-    service.sync_update(source)
-
-    assert "activities lookup" in caplog.text
-    assert "X-Total=247" in caplog.text
-    assert "returned=3" in caplog.text  # the fixture has 3 entries
-
-
-def test_delete_does_not_match_other_source_namespaces(stub_target_api):
+def test_delete_does_not_match_other_source_namespaces(api):
     """Same numeric ID under a different source-namespace must not be deleted."""
     source = load_fixture("activity_create_matched.json")
     activities = load_fixture("target_activities_for_date.json")
-    activities = [a for a in activities
-                  if not str(a.get("remote_id") or "").startswith("solar:")]
-    stub_target_api["activities_for_date_response"] = activities
+    api.activities_lookup = [a for a in activities
+                             if not str(a.get("remote_id") or "").startswith("solar:")]
 
-    service = MocoSyncService(**DEFAULTS)
+    service = MocoSyncService(api=api, **DEFAULTS)
     with pytest.raises(TargetNotFoundError):
         service.sync_delete(source)
-    assert [c[1] for c in stub_target_api["calls"]] == ["GET"]
+    assert [c[0] for c in api.calls] == ["list_activities"]
