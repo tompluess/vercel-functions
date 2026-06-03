@@ -27,6 +27,8 @@ TEST_ENV = {
     "BEXIO_API_TOKEN": "test_bexio_token",
     "BREVO_API_KEY": "test_brevo_key",
     "BREVO_LIST_ID": "5",
+    "TELEGRAM_BOT_TOKEN": "test_bot_token",
+    "TELEGRAM_CHAT_ID": "-1002342319319",
 }
 
 
@@ -112,6 +114,12 @@ def stub_target_api(monkeypatch):
         payload = json.loads(data) if data else None
         state["calls"].append((url, method, payload))
 
+        # Telegram error notifications fire on the 5xx path; the urlopen patch
+        # is process-wide (shared urllib.request), so absorb them here too.
+        if "api.telegram.org" in url:
+            return FakeUrlopenResponse(
+                json.dumps({"ok": True, "result": {"message_id": 1}}).encode()
+            )
         if method == "GET" and "/projects" in url:
             return FakeUrlopenResponse(
                 json.dumps(state["projects_response"]).encode()

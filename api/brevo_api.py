@@ -71,7 +71,8 @@ class BrevoAPI:
         re-sync of an already-known contact (seen in prod for
         ev.aschwanden@gmail.com).
 
-        Any other 4xx/5xx is propagated so it can surface as a 502 upstream.
+        Any other 4xx/5xx is propagated so the endpoint can map it (a 4xx →
+        Telegram alert + 200 ok=false; a 5xx → 502 so Moco retries).
         """
         try:
             return self._send_json(

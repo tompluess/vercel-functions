@@ -46,7 +46,8 @@ updated, or deleted             │ 1. verify HMAC          │
                           delete ────────────┤            GET /activities ▶  (14-day window)
                                              │            ◀── activities
                                              ▼            DELETE /activity/{id}
-                                                            (404 if not found)
+                                                            (200 ok=false + Telegram
+                                                             alert if not found)
 ```
 
 Source project and task are mapped onto the target account **by name**. If no match is found, configured defaults are used. The link between source and target activity is tracked **statelessly** by writing a namespaced `remote_id` (`{source-account}:{source-id}`) on the target activity — so updates and deletes can be located without any external database.
@@ -63,6 +64,7 @@ Receives Moco `Purchase` webhooks and creates a matching supplier bill in [Bexio
 - Idempotent: searches `/4.0/purchase/bills?vendor=…&vendor_ref=…` — updates DRAFT bills in-place, creates new ones otherwise, and skips bills that are no longer DRAFT.
 - Branches on `iban`: present → QR or IBAN payment block on the default bank account; absent → MANUAL payment routed to the per-user bank account from `BEXIO_MANUAL_BANK_MAP`.
 - Posts a comment back to the Moco Purchase with the Bexio bill URL.
+- Skip branches (no company, no booking account, bill no longer DRAFT) send a Telegram notification with entity context, mirroring the n8n `…Notification to Telegram` nodes.
 
 ### `POST /api/bexio-invoice-sync`
 
@@ -73,6 +75,7 @@ Receives Moco `Invoice` webhooks and creates a matching customer invoice in Bexi
 - Resolves the revenue account from project labels (e.g. `Stromproduktion → 3010`, `Wartung → 3450`); see `INVOICE_REVENUE_ACCOUNT_BY_LABEL` in [`api/bexio_config.py`](api/bexio_config.py) for the full mapping.
 - Creates the invoice with `api_reference` set to the Moco identifier, then calls `/issue` to transition the invoice to Open (awaiting payment).
 - Cross-comments: a Bexio comment with the Moco URL, and a Moco comment with the Bexio URL.
+- The `no_customer` skip (a sent invoice whose project has no resolvable customer) sends a Telegram notification with the Moco invoice link. The `status != "sent"` gate stays silent (it fires on every draft edit).
 
 ### `POST /api/brevo-contact-sync`
 
@@ -96,8 +99,19 @@ Receives Moco `Contact` webhooks (`create` + `update`) and mirrors the contact i
 - [`api/bexio_expense_sync_service.py`](api/bexio_expense_sync_service.py) / [`api/bexio_invoice_sync_service.py`](api/bexio_invoice_sync_service.py) — pure business logic; all HTTP transport delegated to the two collaborators above.
 - [`api/brevo_api.py`](api/brevo_api.py) — `api-key`-auth Brevo (ex-Sendinblue) REST wrapper covering contact lookup/create/update and list-add. Maps 404 from the contact lookup to `None` so the service can branch without exceptions.
 - [`api/brevo_contact_sync_service.py`](api/brevo_contact_sync_service.py) — pure business logic for the Brevo flow (lookup → create-or-update → SMS → list add → optional cross-comment to Moco).
+- [`api/telegram_notifier.py`](api/telegram_notifier.py) — `TelegramNotifier`: best-effort `sendMessage` to a Telegram chat. Used for error/skip notifications; never raises (a Telegram outage won't change the HTTP response).
 
 Everything uses `urllib` — no external HTTP client dependency.
+
+### Error notifications & the 2xx/5xx contract
+
+Errors are split by a single question: **can a webhook retry fix this?** (ports the n8n `Error Trigger → Send Error to Telegram` handler).
+
+- **Application errors** — a retry can't help: the upstream rejected our request (a 4xx), an unexpected internal error, or a source↔target mismatch. These fire a Telegram alert (endpoint, event, source ID, error detail) and **return HTTP 200 `{"ok": false, "error": …}`** so Moco stops retrying. Telegram carries the visibility.
+- **Infrastructure failures** — transient and retry-worthy: the upstream is unreachable or returns a 5xx. These return **HTTP 502** so Moco retries, and are **not** notified (a flapping upstream would otherwise spam the chat on every retry).
+- **Auth/validation rejections** (bad signature, stale timestamp, wrong target, user-filter) are rejected up front with 401/422 and never notified — they're webhook noise.
+
+The Telegram send is best-effort: it never masks or changes the HTTP response Moco receives.
 
 ## Tech
 
@@ -132,6 +146,8 @@ Required environment variables (configure in the Vercel project, then `vercel en
 | --- | --- |
 | `MOCO_WEBHOOK_SECRET` | Shared secret used by the source Moco account to sign webhook bodies |
 | `MOCO_SOURCE_ACCOUNT_URL` | Expected `x-moco-account-url` header value (e.g. `solar`) |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token (the `…/bot<token>/sendMessage` path) for error/skip notifications |
+| `TELEGRAM_CHAT_ID` | Target Telegram chat/group ID (e.g. `-1002342319319`); per-environment so dev/staging/prod can notify different chats |
 
 **Used by `/api/moco-sync`:**
 

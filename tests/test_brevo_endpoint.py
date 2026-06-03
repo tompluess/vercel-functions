@@ -41,6 +41,10 @@ def stub_pipeline(monkeypatch):
             payload = "<binary>"
         state["calls"].append((method, url, payload))
 
+        # --- Telegram (error notifications) ---
+        if "api.telegram.org" in url:
+            return _resp({"ok": True, "result": {"message_id": 1}})
+
         # --- Brevo ---
         if "api.brevo.com" in url:
             if "/v3/contacts/lists/" in url and url.endswith("/contacts/add"):
@@ -227,6 +231,63 @@ def test_brevo_500_surfaces_as_502(set_env, monkeypatch):
     )
     assert r.status_code == 502
     assert "brevo_error: 500" in r.json()["detail"]
+
+
+def _run_with_brevo_status(set_env_unused, monkeypatch, status):
+    """Drive the endpoint with Brevo's contact lookup raising `status`.
+    Returns (response, telegram_texts)."""
+    telegram_texts: list[str] = []
+
+    def boom(req, timeout=None):
+        if "api.telegram.org" in req.full_url:
+            telegram_texts.append(json.loads(req.data)["text"])
+            return FakeUrlopenResponse(json.dumps({"ok": True}).encode())
+        if "api.brevo.com" in req.full_url:
+            raise urlerror.HTTPError(req.full_url, status, "kaboom", {}, fp=None)
+        return FakeUrlopenResponse(b"{}")
+
+    import api.brevo_api as brevo_mod
+    import api.source_moco_client as src_mod
+    import api.telegram_notifier as tg_mod
+    monkeypatch.setattr(brevo_mod.urlrequest, "urlopen", boom)
+    monkeypatch.setattr(src_mod.urlrequest, "urlopen", boom)
+    monkeypatch.setattr(tg_mod.urlrequest, "urlopen", boom)
+
+    from api.index import app
+    client = TestClient(app)
+    raw = _moco_envelope(load_fixture("contact_create.json"))
+    r = client.post(
+        "/api/brevo-contact-sync",
+        content=raw,
+        headers=signed_headers(raw, target="Contact", event="create"),
+    )
+    return r, telegram_texts
+
+
+def test_upstream_4xx_acks_200_and_pings_telegram(set_env, monkeypatch):
+    """An upstream 4xx (Brevo rejected our request) is an application error a
+    retry can't fix: ACK 200 (ok=false) so Moco stops retrying, and fire a
+    Telegram alert (ports the n8n Error Trigger)."""
+    r, telegram_texts = _run_with_brevo_status(set_env, monkeypatch, 400)
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "brevo_error: 400" in body["error"]
+    assert len(telegram_texts) == 1
+    assert "/api/brevo-contact-sync" in telegram_texts[0]
+    assert "brevo_error: 400" in telegram_texts[0]
+
+
+def test_upstream_5xx_surfaces_502_without_telegram(set_env, monkeypatch):
+    """An upstream 5xx is transient infrastructure: surface 502 so Moco retries
+    (a retry can succeed), and do NOT ping Telegram — otherwise a flapping
+    upstream would spam the chat on every retry."""
+    r, telegram_texts = _run_with_brevo_status(set_env, monkeypatch, 500)
+
+    assert r.status_code == 502
+    assert "brevo_error: 500" in r.json()["detail"]
+    assert telegram_texts == []
 
 
 def test_already_in_list_400_does_not_fail_endpoint(brevo_client, monkeypatch):

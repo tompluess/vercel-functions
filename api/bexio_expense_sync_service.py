@@ -36,18 +36,24 @@ from api.bexio_config import (
     manual_bank_account_id,
 )
 from api.source_moco_client import SourceMocoClient
+from api.telegram_notifier import TelegramNotifier
 
-logger = logging.getLogger("moco_sync")
+logger = logging.getLogger("bexio_expense_sync_service")
 
 
 class BexioExpenseSyncService:
     BEXIO_BILL_URL_TEMPLATE = "https://office.bexio.com/index.php/kb_bill/list#/show/{id}"
 
     def __init__(self, *, bexio: BexioAPI, source_moco: SourceMocoClient,
-                 source_account_url: str):
+                 source_account_url: str,
+                 telegram: TelegramNotifier | None = None):
         self._bexio = bexio
         self._source_moco = source_moco
         self._source_account_url = source_account_url
+        # Optional: when present, the skip branches below DM a Telegram chat
+        # with entity context, mirroring the n8n "...Notification to Telegram"
+        # nodes. Left optional so service unit tests can omit it.
+        self._telegram = telegram
 
     def sync(self, body: dict) -> dict[str, Any]:
         company = body.get("company") or {}
@@ -55,6 +61,7 @@ class BexioExpenseSyncService:
         if not company_name:
             logger.warning("expense sync: skipped (no company) source_id=%s",
                            body.get("id"))
+            self._notify_skip_with_entity("No company given", body)
             return {"skipped": "no_company"}
 
         contact = self._find_or_create_contact(company_name, company.get("id"))
@@ -63,6 +70,7 @@ class BexioExpenseSyncService:
         if not account_no:
             logger.warning("expense sync: skipped (no account) source_id=%s",
                            body.get("id"))
+            self._notify_skip_with_entity("No account given", body)
             return {"skipped": "no_account", "contact_id": contact.get("id")}
 
         account = self._lookup_account(account_no)
@@ -72,6 +80,7 @@ class BexioExpenseSyncService:
         if existing_bill and (existing_bill.get("status") or "").upper() != "DRAFT":
             logger.warning("expense sync: skipped (bill not DRAFT) bill_id=%s status=%s",
                            existing_bill.get("id"), existing_bill.get("status"))
+            self._notify_bill_closed(body)
             return {"skipped": "bill_not_draft",
                     "bill_id": existing_bill.get("id"),
                     "status": existing_bill.get("status")}
@@ -215,6 +224,38 @@ class BexioExpenseSyncService:
             payload["split_into_line_items"] = existing_bill.get("split_into_line_items")
 
         return payload
+
+    # --- telegram skip notifications ----------------------------------------
+
+    def _purchase_url(self, source_id: int | None) -> str:
+        return (f"https://{self._source_account_url}.mocoapp.com"
+                f"/purchases/{source_id}")
+
+    def _notify_skip_with_entity(self, reason: str, body: dict) -> None:
+        """Ports the n8n "No company / No Account Notification to Telegram"
+        nodes: a not-synced expense with the entity context attached."""
+        if not self._telegram:
+            return
+        company = (body.get("company") or {}).get("name") or ""
+        self._telegram.notify(
+            "Expense in Moco not synced to Bexio:\n"
+            f"Reason: {reason}\n"
+            "Expense:\n"
+            f"- Company: {company}\n"
+            f"- Bill ID: {body.get('receipt_identifier') or ''}\n"
+            f"- Date: {body.get('date') or ''}\n"
+            f"- Link to Moco: {self._purchase_url(body.get('id'))}"
+        )
+
+    def _notify_bill_closed(self, body: dict) -> None:
+        """Ports the n8n "Bill is closed Notification to Telegram" node."""
+        if not self._telegram:
+            return
+        self._telegram.notify(
+            f"Expense in Moco not synced to Bexio: {self._purchase_url(body.get('id'))}\n"
+            "Reason: Bill is closed.\n"
+            "Hint: Bill-Id might not be unique (Rechnungsnummer)"
+        )
 
     # --- moco comment back --------------------------------------------------
 

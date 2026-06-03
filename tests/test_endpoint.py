@@ -166,17 +166,21 @@ def test_delete_handles_minimal_payload_from_moco(client, stub_target_api):
     assert params["from"] != params["to"]  # widened, not single-day
 
 
-def test_delete_returns_404_when_target_missing(client, stub_target_api):
-    """If the corresponding target activity isn't found, surface a 404 so
-    Moco's delivery log makes the mismatch visible."""
+def test_delete_target_missing_acks_200_and_notifies(client, stub_target_api):
+    """If the corresponding target activity isn't found, the mismatch is an
+    application error a retry can't fix: ACK with 200 (ok=false) so Moco stops
+    retrying, and fire a Telegram alert instead of the old 404."""
     stub_target_api["activities_for_date_response"] = []
     body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
     r = post(client, body, signed_headers(body, event="delete"))
 
-    assert r.status_code == 404
-    assert r.json()["detail"] == "target_not_found: solar:1064823757"
-    # Only the lookup happened — no DELETE issued.
-    assert [c[1] for c in stub_target_api["calls"]] == ["GET"]
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["ok"] is False
+    assert payload["error"] == "target_not_found: solar:1064823757"
+    # The lookup happened and a Telegram alert was sent — no DELETE issued.
+    assert [c[1] for c in stub_target_api["calls"]] == ["GET", "POST"]
+    assert any("api.telegram.org" in c[0] for c in stub_target_api["calls"])
 
 
 def test_unknown_event_is_rejected_with_422(client, stub_target_api):
@@ -226,11 +230,12 @@ def test_missing_env_returns_500(client, monkeypatch, stub_target_api):
     assert r.json()["detail"] == "server_misconfigured"
 
 
-def test_unexpected_exception_returns_500_and_logs_payload(
+def test_unexpected_exception_acks_200_notifies_and_logs_payload(
     client, stub_target_api, monkeypatch, caplog
 ):
-    """Anything other than HTTPError/URLError bubbling out of the service must
-    log 'Exception, Error on Request' with the parsed payload and return 500."""
+    """An unexpected internal exception is an application error a retry can't
+    fix: log 'Exception, Error on Request' with the parsed payload, fire a
+    Telegram alert, and ACK with 200 (ok=false) so Moco stops retrying."""
     import logging
     import api.moco_sync_service as svc
 
@@ -243,8 +248,12 @@ def test_unexpected_exception_returns_500_and_logs_payload(
     body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
     r = post(client, body, signed_headers(body))
 
-    assert r.status_code == 500
-    assert r.json()["detail"] == "internal_error: unexpected internal failure"
+    assert r.status_code == 200
+    payload = r.json()
+    assert payload["ok"] is False
+    assert payload["error"] == "internal_error: unexpected internal failure"
+    # A Telegram alert was sent.
+    assert any("api.telegram.org" in c[0] for c in stub_target_api["calls"])
     assert "Error on request with payload" in caplog.text
     # The exception message AND the full parsed payload must appear in the log.
     assert "unexpected internal failure" in caplog.text
