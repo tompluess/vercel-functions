@@ -79,9 +79,23 @@ class FakeSourceMoco:
         return self.files.get(url, b"%PDF-1.4 fake")
 
 
+class FakeTelegram:
+    def __init__(self):
+        self.messages: list[str] = []
+
+    def notify(self, text):
+        self.messages.append(text)
+        return True
+
+
 @pytest.fixture
 def bexio():
     return FakeBexioAPI()
+
+
+@pytest.fixture
+def telegram():
+    return FakeTelegram()
 
 
 @pytest.fixture
@@ -335,3 +349,62 @@ def test_moco_comment_failure_does_not_fail_sync(service, bexio, source):
     result = service.sync(body)
     assert result["action"] == "created"
     assert result["bill_id"] == 9001
+
+
+# --- telegram skip notifications --------------------------------------------
+
+@pytest.fixture
+def service_tg(bexio, source, telegram):
+    return BexioExpenseSyncService(bexio=bexio, source_moco=source,
+                                   source_account_url="solar",
+                                   telegram=telegram)
+
+
+def test_notifies_telegram_on_no_company_skip(service_tg, telegram):
+    service_tg.sync(load_fixture("purchase_no_company.json"))
+    assert len(telegram.messages) == 1
+    msg = telegram.messages[0]
+    assert "not synced to Bexio" in msg
+    assert "Reason: No company given" in msg
+    # Entity context carries the Moco purchase deep-link on the source account.
+    assert "https://solar.mocoapp.com/purchases/" in msg
+
+
+def test_notifies_telegram_on_no_account_skip(service_tg, bexio, telegram):
+    bexio.contacts_by_name["Misc Vendor"] = [{"id": 5050}]
+    service_tg.sync(load_fixture("purchase_no_account.json"))
+    assert len(telegram.messages) == 1
+    assert "Reason: No account given" in telegram.messages[0]
+
+
+def test_notifies_telegram_on_bill_closed_skip(service_tg, bexio, telegram):
+    bexio.contacts_by_name["FLYERALARM - RatePAY GmbH"] = [{"id": 5001}]
+    bexio.accounts_by_no["6600"] = [{"id": 7700, "tax_id": 42}]
+    bexio.bills_envelope = {"data": [{"id": 8888, "status": "BOOKED"}],
+                            "paging": {"item_count": 1}}
+    bexio.bill_by_id[8888] = {"id": 8888, "status": "BOOKED"}
+
+    service_tg.sync(load_fixture("purchase_with_iban.json"))
+
+    assert len(telegram.messages) == 1
+    msg = telegram.messages[0]
+    assert "Reason: Bill is closed." in msg
+    assert "Bill-Id might not be unique" in msg
+
+
+def test_no_telegram_message_on_successful_sync(service_tg, bexio, telegram):
+    """A clean create must not ping the chat — notifications are for skips
+    (and, at the endpoint layer, 5xx errors) only."""
+    bexio.contacts_by_name["FLYERALARM - RatePAY GmbH"] = [{"id": 5001}]
+    bexio.accounts_by_no["6600"] = [{"id": 7700, "tax_id": 42}]
+
+    service_tg.sync(load_fixture("purchase_with_iban.json"))
+
+    assert telegram.messages == []
+
+
+def test_skip_works_without_telegram_configured(service, bexio):
+    """telegram is optional — the skip branch must still return its dict when
+    no notifier was injected (service-layer unit tests omit it)."""
+    result = service.sync(load_fixture("purchase_no_company.json"))
+    assert result == {"skipped": "no_company"}

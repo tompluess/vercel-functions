@@ -50,6 +50,10 @@ def stub_pipeline(monkeypatch):
             payload = "<binary>"
         state["calls"].append((method, url, payload))
 
+        # --- Telegram (error + skip notifications) ---
+        if "api.telegram.org" in url:
+            return _resp({"ok": True, "result": {"message_id": 1}})
+
         # --- Bexio ---
         if "api.bexio.com" in url:
             if url.endswith("/2.0/contact/search"):

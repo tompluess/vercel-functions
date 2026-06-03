@@ -28,26 +28,34 @@ from api.moco_api import MocoAPI
 from api.moco_sync_service import MocoSyncService, TargetNotFoundError
 from api.moco_webhook_validator import MocoWebhookValidator
 from api.source_moco_client import SourceMocoClient
+from api.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger("moco_sync")
 logging.basicConfig(level=logging.INFO)
 
 MAX_BODY_BYTES = 64 * 1024
 
+# Telegram error notifications are wired into every endpoint, so these are
+# required everywhere (see _notify_failure / the expense skip notifications).
+REQUIRED_ENV_TELEGRAM = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
+
 REQUIRED_ENV_MOCO_SYNC = [
     "MOCO_WEBHOOK_SECRET", "MOCO_SOURCE_ACCOUNT_URL", "MOCO_USER_ID_FILTER",
     "MOCO_TARGET_SUBDOMAIN", "MOCO_TARGET_API_KEY", "MOCO_TARGET_COMPANY_ID",
     "MOCO_TARGET_DEFAULT_PROJECT_ID", "MOCO_TARGET_DEFAULT_TASK_ID",
+    *REQUIRED_ENV_TELEGRAM,
 ]
 
 REQUIRED_ENV_BEXIO_SYNC = [
     "MOCO_WEBHOOK_SECRET", "MOCO_SOURCE_ACCOUNT_URL",
     "MOCO_SOURCE_API_KEY", "BEXIO_API_TOKEN",
+    *REQUIRED_ENV_TELEGRAM,
 ]
 
 REQUIRED_ENV_BREVO_SYNC = [
     "MOCO_WEBHOOK_SECRET", "MOCO_SOURCE_ACCOUNT_URL",
     "MOCO_SOURCE_API_KEY", "BREVO_API_KEY", "BREVO_LIST_ID",
+    *REQUIRED_ENV_TELEGRAM,
 ]
 
 app = FastAPI()
@@ -100,23 +108,30 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
         default_task_id=int(cfg["MOCO_TARGET_DEFAULT_TASK_ID"]),
         source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
     )
+    notifier = _build_notifier(cfg)
     dispatch = {"create": service.sync_create,
                 "update": service.sync_update,
                 "delete": service.sync_delete}
     try:
         result = dispatch[event](body)
     except TargetNotFoundError as e:
+        # Not a 5xx application error — a benign source↔target mismatch that's
+        # surfaced via Moco's webhook delivery log (404), so no Telegram ping.
         logger.warning("delete: target_not_found remote_id=%s", e)
         raise HTTPException(404, f"target_not_found: {e}")
     except urlerror.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")[:500]
         logger.error("target API error: %s %s", e.code, err_body)
-        raise HTTPException(502, f"target_error: {e.code} {err_body}")
+        detail = f"target_error: {e.code} {err_body}"
+        _notify_failure(notifier, request, event, body, detail)
+        raise HTTPException(502, detail)
     except urlerror.URLError as e:
         logger.error("target unreachable: %s", e)
+        _notify_failure(notifier, request, event, body, "target_unreachable")
         raise HTTPException(502, "target_unreachable")
     except Exception as e:
         logger.exception("Exception: %s, Error on request with payload=%s", e, body)
+        _notify_failure(notifier, request, event, body, f"internal_error: {e}")
         raise HTTPException(500, f"internal_error: {e}")
 
     logger.info("synced source=%s event=%s result=%s",
@@ -131,13 +146,14 @@ async def bexio_expense_sync_webhook(request: Request) -> dict[str, Any]:
         required_env=REQUIRED_ENV_BEXIO_SYNC,
         expected_target="Purchase",
         upstream_label="bexio",
-        build_service=lambda cfg: BexioExpenseSyncService(
+        build_service=lambda cfg, notifier: BexioExpenseSyncService(
             bexio=BexioAPI(api_token=cfg["BEXIO_API_TOKEN"]),
             source_moco=SourceMocoClient(
                 subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
                 api_key=cfg["MOCO_SOURCE_API_KEY"],
             ),
             source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+            telegram=notifier,
         ),
     )
 
@@ -149,7 +165,7 @@ async def bexio_invoice_sync_webhook(request: Request) -> dict[str, Any]:
         required_env=REQUIRED_ENV_BEXIO_SYNC,
         expected_target="Invoice",
         upstream_label="bexio",
-        build_service=lambda cfg: BexioInvoiceSyncService(
+        build_service=lambda cfg, notifier: BexioInvoiceSyncService(
             bexio=BexioAPI(api_token=cfg["BEXIO_API_TOKEN"]),
             source_moco=SourceMocoClient(
                 subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
@@ -167,7 +183,7 @@ async def brevo_contact_sync_webhook(request: Request) -> dict[str, Any]:
         required_env=REQUIRED_ENV_BREVO_SYNC,
         expected_target="Contact",
         upstream_label="brevo",
-        build_service=lambda cfg: BrevoContactSyncService(
+        build_service=lambda cfg, notifier: BrevoContactSyncService(
             brevo=BrevoAPI(api_key=cfg["BREVO_API_KEY"]),
             source_moco=SourceMocoClient(
                 subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
@@ -187,9 +203,10 @@ async def _handle_moco_dispatch_webhook(
 
     The three webhooks-to-external endpoints (two Bexio, one Brevo) differ
     only in (a) the required env vars, (b) the expected `x-moco-target`
-    header, (c) which service is constructed, and (d) the error label
-    surfaced on upstream failure. Everything else — auth, parse, envelope
-    handling, error mapping — is shared.
+    header, (c) which service is constructed (via `build_service(cfg,
+    notifier)`), and (d) the error label surfaced on upstream failure.
+    Everything else — auth, parse, envelope handling, error mapping, and the
+    Telegram failure notification — is shared.
     """
     cfg = _require_env(required_env)
     raw = await _read_body(request)
@@ -212,18 +229,23 @@ async def _handle_moco_dispatch_webhook(
     # webhook ships the entity at the top level. Support both shapes.
     body = parsed.get("body") if isinstance(parsed.get("body"), dict) else parsed
 
-    service = build_service(cfg)
+    notifier = _build_notifier(cfg)
+    service = build_service(cfg, notifier)
     try:
         result = service.sync(body)
     except urlerror.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")[:500]
         logger.error("%s API error: %s %s", upstream_label, e.code, err_body)
-        raise HTTPException(502, f"{upstream_label}_error: {e.code} {err_body}")
+        detail = f"{upstream_label}_error: {e.code} {err_body}"
+        _notify_failure(notifier, request, event, body, detail)
+        raise HTTPException(502, detail)
     except urlerror.URLError as e:
         logger.error("upstream unreachable: %s", e)
+        _notify_failure(notifier, request, event, body, "upstream_unreachable")
         raise HTTPException(502, "upstream_unreachable")
     except Exception as e:
         logger.exception("Exception: %s, Error on request with payload=%s", e, body)
+        _notify_failure(notifier, request, event, body, f"internal_error: {e}")
         raise HTTPException(500, f"internal_error: {e}")
 
     logger.info("%s sync target=%s event=%s source=%s result=%s",
@@ -238,6 +260,33 @@ def _require_env(keys: list[str]) -> dict[str, str]:
         logger.error("missing required env vars: %s", missing)
         raise HTTPException(500, "server_misconfigured")
     return cfg
+
+
+def _build_notifier(cfg: dict[str, str]) -> TelegramNotifier:
+    return TelegramNotifier(
+        bot_token=cfg["TELEGRAM_BOT_TOKEN"],
+        chat_id=cfg["TELEGRAM_CHAT_ID"],
+    )
+
+
+def _notify_failure(notifier: TelegramNotifier, request: Request, event: str,
+                    body: Any, detail: str) -> None:
+    """Best-effort Telegram ping for a 5xx application error.
+
+    Ports the n8n "Error Trigger → Send Error to Telegram" handler: a sync
+    failed, so post which endpoint/event/entity failed and why. `notify`
+    swallows its own transport errors, so this never raises into the already-
+    failing request path.
+    """
+    source_id = body.get("id") if isinstance(body, dict) else None
+    text = (
+        "❌ vercel-functions sync failed\n"
+        f"- Endpoint: {request.url.path}\n"
+        f"- Event: {event}\n"
+        f"- Source ID: {source_id}\n"
+        f"- Error: {detail}"
+    )
+    notifier.notify(text)
 
 
 async def _read_body(request: Request) -> bytes:

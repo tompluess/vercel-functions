@@ -63,6 +63,7 @@ Receives Moco `Purchase` webhooks and creates a matching supplier bill in [Bexio
 - Idempotent: searches `/4.0/purchase/bills?vendor=…&vendor_ref=…` — updates DRAFT bills in-place, creates new ones otherwise, and skips bills that are no longer DRAFT.
 - Branches on `iban`: present → QR or IBAN payment block on the default bank account; absent → MANUAL payment routed to the per-user bank account from `BEXIO_MANUAL_BANK_MAP`.
 - Posts a comment back to the Moco Purchase with the Bexio bill URL.
+- Skip branches (no company, no booking account, bill no longer DRAFT) send a Telegram notification with entity context, mirroring the n8n `…Notification to Telegram` nodes.
 
 ### `POST /api/bexio-invoice-sync`
 
@@ -96,8 +97,13 @@ Receives Moco `Contact` webhooks (`create` + `update`) and mirrors the contact i
 - [`api/bexio_expense_sync_service.py`](api/bexio_expense_sync_service.py) / [`api/bexio_invoice_sync_service.py`](api/bexio_invoice_sync_service.py) — pure business logic; all HTTP transport delegated to the two collaborators above.
 - [`api/brevo_api.py`](api/brevo_api.py) — `api-key`-auth Brevo (ex-Sendinblue) REST wrapper covering contact lookup/create/update and list-add. Maps 404 from the contact lookup to `None` so the service can branch without exceptions.
 - [`api/brevo_contact_sync_service.py`](api/brevo_contact_sync_service.py) — pure business logic for the Brevo flow (lookup → create-or-update → SMS → list add → optional cross-comment to Moco).
+- [`api/telegram_notifier.py`](api/telegram_notifier.py) — `TelegramNotifier`: best-effort `sendMessage` to a Telegram chat. Used for error/skip notifications; never raises (a Telegram outage won't change the HTTP response).
 
 Everything uses `urllib` — no external HTTP client dependency.
+
+### Error notifications
+
+Every endpoint reports **5xx application errors** (502 upstream failures, 500 unexpected errors) to a Telegram chat, porting the n8n `Error Trigger → Send Error to Telegram` handler. The message names the endpoint, event, source entity ID, and the error detail. 4xx auth/validation rejections (bad signature, stale timestamp, wrong target, user-filter) stay silent — they're webhook noise, not application errors. The send is best-effort: it never masks or changes the HTTP response Moco receives.
 
 ## Tech
 
@@ -132,6 +138,8 @@ Required environment variables (configure in the Vercel project, then `vercel en
 | --- | --- |
 | `MOCO_WEBHOOK_SECRET` | Shared secret used by the source Moco account to sign webhook bodies |
 | `MOCO_SOURCE_ACCOUNT_URL` | Expected `x-moco-account-url` header value (e.g. `solar`) |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot token (the `…/bot<token>/sendMessage` path) for error/skip notifications |
+| `TELEGRAM_CHAT_ID` | Target Telegram chat/group ID (e.g. `-1002342319319`); per-environment so dev/staging/prod can notify different chats |
 
 **Used by `/api/moco-sync`:**
 

@@ -41,6 +41,10 @@ def stub_pipeline(monkeypatch):
             payload = "<binary>"
         state["calls"].append((method, url, payload))
 
+        # --- Telegram (error notifications) ---
+        if "api.telegram.org" in url:
+            return _resp({"ok": True, "result": {"message_id": 1}})
+
         # --- Brevo ---
         if "api.brevo.com" in url:
             if "/v3/contacts/lists/" in url and url.endswith("/contacts/add"):
@@ -227,6 +231,43 @@ def test_brevo_500_surfaces_as_502(set_env, monkeypatch):
     )
     assert r.status_code == 502
     assert "brevo_error: 500" in r.json()["detail"]
+
+
+def test_5xx_pings_telegram(set_env, monkeypatch):
+    """On the 502 path, the endpoint must fire a Telegram error notification
+    (ports the n8n Error Trigger). The send is best-effort, so the 502 stands
+    regardless of Telegram's response."""
+    telegram_texts: list[str] = []
+
+    def boom(req, timeout=None):
+        if "api.telegram.org" in req.full_url:
+            telegram_texts.append(json.loads(req.data)["text"])
+            return FakeUrlopenResponse(json.dumps({"ok": True}).encode())
+        if "api.brevo.com" in req.full_url:
+            raise urlerror.HTTPError(req.full_url, 500, "kaboom", {}, fp=None)
+        return FakeUrlopenResponse(b"{}")
+
+    import api.brevo_api as brevo_mod
+    import api.source_moco_client as src_mod
+    import api.telegram_notifier as tg_mod
+    monkeypatch.setattr(brevo_mod.urlrequest, "urlopen", boom)
+    monkeypatch.setattr(src_mod.urlrequest, "urlopen", boom)
+    monkeypatch.setattr(tg_mod.urlrequest, "urlopen", boom)
+
+    from api.index import app
+    client = TestClient(app)
+    raw = _moco_envelope(load_fixture("contact_create.json"))
+    r = client.post(
+        "/api/brevo-contact-sync",
+        content=raw,
+        headers=signed_headers(raw, target="Contact", event="create"),
+    )
+
+    assert r.status_code == 502
+    assert len(telegram_texts) == 1
+    text = telegram_texts[0]
+    assert "/api/brevo-contact-sync" in text
+    assert "brevo_error: 500" in text
 
 
 def test_already_in_list_400_does_not_fail_endpoint(brevo_client, monkeypatch):
