@@ -38,7 +38,7 @@ from api.bexio_config import (
 from api.source_moco_client import SourceMocoClient
 from api.telegram_notifier import TelegramNotifier
 
-logger = logging.getLogger("moco_sync")
+logger = logging.getLogger("bexio_expense_sync_service")
 
 
 class BexioExpenseSyncService:

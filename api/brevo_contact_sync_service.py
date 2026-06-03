@@ -26,7 +26,7 @@ from urllib import error as urlerror
 from api.brevo_api import BrevoAPI
 from api.source_moco_client import SourceMocoClient
 
-logger = logging.getLogger("moco_sync")
+logger = logging.getLogger("brevo_contact_sync_service")
 
 
 class BrevoContactSyncService:
@@ -38,6 +38,10 @@ class BrevoContactSyncService:
         self._source_moco = source_moco
         self._source_account_url = source_account_url
         self._list_id = list_id
+        # No Telegram notifier here: this service's only skip (no_work_email)
+        # is a routine gate (many Moco contacts legitimately have no work
+        # email), not a sync failure, so it deliberately stays silent. The
+        # 5xx-vs-200 error contract is handled upstream in index.py.
 
     def sync(self, body: dict) -> dict[str, Any]:
         email = (body.get("work_email") or "").strip()
