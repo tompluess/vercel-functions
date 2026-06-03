@@ -115,24 +115,27 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
     try:
         result = dispatch[event](body)
     except TargetNotFoundError as e:
-        # Not a 5xx application error — a benign source↔target mismatch that's
-        # surfaced via Moco's webhook delivery log (404), so no Telegram ping.
+        # Application-level mismatch: the source activity has no counterpart in
+        # the target. A retry can't fix it, so notify and ACK with 200 to stop
+        # Moco retrying (the alert now carries the visibility the 404 used to).
         logger.warning("delete: target_not_found remote_id=%s", e)
-        raise HTTPException(404, f"target_not_found: {e}")
+        return _app_error(notifier, request, event, body, f"target_not_found: {e}")
     except urlerror.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")[:500]
         logger.error("target API error: %s %s", e.code, err_body)
         detail = f"target_error: {e.code} {err_body}"
-        _notify_failure(notifier, request, event, body, detail)
-        raise HTTPException(502, detail)
+        if e.code >= 500:
+            # Upstream server error — transient infrastructure; let Moco retry.
+            raise HTTPException(502, detail)
+        return _app_error(notifier, request, event, body, detail)
     except urlerror.URLError as e:
+        # Upstream unreachable — infrastructure; let Moco retry (no Telegram
+        # ping, or a flapping upstream would spam the chat on every retry).
         logger.error("target unreachable: %s", e)
-        _notify_failure(notifier, request, event, body, "target_unreachable")
         raise HTTPException(502, "target_unreachable")
     except Exception as e:
         logger.exception("Exception: %s, Error on request with payload=%s", e, body)
-        _notify_failure(notifier, request, event, body, f"internal_error: {e}")
-        raise HTTPException(500, f"internal_error: {e}")
+        return _app_error(notifier, request, event, body, f"internal_error: {e}")
 
     logger.info("synced source=%s event=%s result=%s",
                 body.get("id"), event, result)
@@ -172,6 +175,7 @@ async def bexio_invoice_sync_webhook(request: Request) -> dict[str, Any]:
                 api_key=cfg["MOCO_SOURCE_API_KEY"],
             ),
             source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+            telegram=notifier,
         ),
     )
 
@@ -237,16 +241,18 @@ async def _handle_moco_dispatch_webhook(
         err_body = e.read().decode("utf-8", errors="replace")[:500]
         logger.error("%s API error: %s %s", upstream_label, e.code, err_body)
         detail = f"{upstream_label}_error: {e.code} {err_body}"
-        _notify_failure(notifier, request, event, body, detail)
-        raise HTTPException(502, detail)
+        if e.code >= 500:
+            # Upstream server error — transient infrastructure; let Moco retry.
+            raise HTTPException(502, detail)
+        return _app_error(notifier, request, event, body, detail)
     except urlerror.URLError as e:
+        # Upstream unreachable — infrastructure; let Moco retry (no Telegram
+        # ping, or a flapping upstream would spam the chat on every retry).
         logger.error("upstream unreachable: %s", e)
-        _notify_failure(notifier, request, event, body, "upstream_unreachable")
         raise HTTPException(502, "upstream_unreachable")
     except Exception as e:
         logger.exception("Exception: %s, Error on request with payload=%s", e, body)
-        _notify_failure(notifier, request, event, body, f"internal_error: {e}")
-        raise HTTPException(500, f"internal_error: {e}")
+        return _app_error(notifier, request, event, body, f"internal_error: {e}")
 
     logger.info("%s sync target=%s event=%s source=%s result=%s",
                 upstream_label, target, event, body.get("id"), result)
@@ -269,24 +275,29 @@ def _build_notifier(cfg: dict[str, str]) -> TelegramNotifier:
     )
 
 
-def _notify_failure(notifier: TelegramNotifier, request: Request, event: str,
-                    body: Any, detail: str) -> None:
-    """Best-effort Telegram ping for a 5xx application error.
+def _app_error(notifier: TelegramNotifier, request: Request, event: str,
+               body: Any, detail: str) -> dict[str, Any]:
+    """Handle an application error: a failure a webhook retry cannot fix.
 
-    Ports the n8n "Error Trigger → Send Error to Telegram" handler: a sync
-    failed, so post which endpoint/event/entity failed and why. `notify`
-    swallows its own transport errors, so this never raises into the already-
-    failing request path.
+    Such failures (the upstream rejected our request with a 4xx, an unexpected
+    internal exception, a source↔target mismatch) used to surface as a non-2xx
+    so they'd show in Moco's delivery log — but that also made Moco retry the
+    request forever. Now that Telegram carries the visibility, we instead fire
+    a best-effort alert and ACK with **HTTP 200** (`ok=false`) so Moco stops
+    retrying. Infrastructure failures (upstream unreachable / 5xx) take the
+    5xx path instead, since for those a retry can actually succeed.
+
+    Ports the n8n "Error Trigger → Send Error to Telegram" handler.
     """
     source_id = body.get("id") if isinstance(body, dict) else None
-    text = (
+    notifier.notify(
         "❌ vercel-functions sync failed\n"
         f"- Endpoint: {request.url.path}\n"
         f"- Event: {event}\n"
         f"- Source ID: {source_id}\n"
         f"- Error: {detail}"
     )
-    notifier.notify(text)
+    return {"ok": False, "event": event, "error": detail}
 
 
 async def _read_body(request: Request) -> bytes:

@@ -8,7 +8,8 @@ from api.moco_api import MocoAPI
 
 class TargetNotFoundError(LookupError):
     """Raised by sync_delete when no target activity matches the source's
-    namespaced remote_id. Caller decides how to surface it (e.g. HTTP 404)."""
+    namespaced remote_id. Caller decides how to surface it (currently a
+    Telegram alert + HTTP 200 ok=false, so Moco stops retrying)."""
 
 
 class MocoSyncService:

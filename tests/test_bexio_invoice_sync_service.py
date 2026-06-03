@@ -93,10 +93,31 @@ def source():
     return src
 
 
+class FakeTelegram:
+    def __init__(self):
+        self.messages: list[str] = []
+
+    def notify(self, text):
+        self.messages.append(text)
+        return True
+
+
+@pytest.fixture
+def telegram():
+    return FakeTelegram()
+
+
 @pytest.fixture
 def service(bexio, source):
     return BexioInvoiceSyncService(bexio=bexio, source_moco=source,
                                    source_account_url="solar")
+
+
+@pytest.fixture
+def service_tg(bexio, source, telegram):
+    return BexioInvoiceSyncService(bexio=bexio, source_moco=source,
+                                   source_account_url="solar",
+                                   telegram=telegram)
 
 
 def test_skips_when_status_is_not_sent(service, bexio, source):
@@ -106,6 +127,31 @@ def test_skips_when_status_is_not_sent(service, bexio, source):
     # No Bexio or source-Moco-project calls at all.
     assert bexio.calls == []
     assert source.calls == []
+
+
+def test_status_not_sent_does_not_notify_telegram(service_tg, source, telegram):
+    """The draft gate fires on every Moco edit — it must stay silent or it
+    would spam the chat. Only no_customer (a genuine sync failure) notifies."""
+    service_tg.sync(load_fixture("invoice_draft.json"))
+    assert telegram.messages == []
+
+
+def test_no_customer_skip_notifies_telegram(service_tg, source, telegram):
+    """A sent invoice whose project has no resolvable customer is the invoice
+    analogue of the expense no_company skip — it pings Telegram with the Moco
+    invoice link."""
+    body = load_fixture("invoice_sent.json")
+    # Project resolves but carries no customer name.
+    source.projects[body["project_id"]] = {"customer": {}, "labels": [],
+                                            "billing_address": ""}
+
+    result = service_tg.sync(body)
+
+    assert result == {"skipped": "no_customer"}
+    assert len(telegram.messages) == 1
+    msg = telegram.messages[0]
+    assert "Reason: No customer given" in msg
+    assert f"solar.mocoapp.com/invoices/{body['id']}" in msg
 
 
 def test_creates_invoice_and_transitions_to_open(service, bexio, source):

@@ -36,6 +36,7 @@ from api.bexio_config import (
     resolve_revenue_account_no,
 )
 from api.source_moco_client import SourceMocoClient
+from api.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger("moco_sync")
 
@@ -44,10 +45,16 @@ class BexioInvoiceSyncService:
     BEXIO_INVOICE_URL_TEMPLATE = "https://office.bexio.com/index.php/kb_invoice/show/id/{id}"
 
     def __init__(self, *, bexio: BexioAPI, source_moco: SourceMocoClient,
-                 source_account_url: str):
+                 source_account_url: str,
+                 telegram: TelegramNotifier | None = None):
         self._bexio = bexio
         self._source_moco = source_moco
         self._source_account_url = source_account_url
+        # Optional: the no_customer skip below DMs a Telegram chat with the
+        # Moco invoice link, mirroring BexioExpenseSyncService's skip
+        # notifications. status_not_sent stays silent — it fires on every draft
+        # edit and would spam. Left optional so service unit tests can omit it.
+        self._telegram = telegram
 
     def sync(self, body: dict) -> dict[str, Any]:
         if body.get("status") != "sent":
@@ -61,6 +68,7 @@ class BexioInvoiceSyncService:
         if not customer_name:
             logger.warning("invoice sync: skipped (no customer) source_id=%s",
                            body.get("id"))
+            self._notify_no_customer(body)
             return {"skipped": "no_customer"}
 
         contact = self._find_or_create_contact(customer_name, body, project)
@@ -129,8 +137,7 @@ class BexioInvoiceSyncService:
         title = _truncate(body.get("title") or "", 80)
         position_text = _truncate(f"{identifier}: {body.get('title') or ''}", 80)
         contact_address = (body.get("recipient_address") or "").replace("\n", ", ")
-        moco_invoice_url = (f"https://{self._source_account_url}.mocoapp.com/invoices/"
-                            f"{body.get('id')}")
+        moco_invoice_url = self._invoice_url(body.get("id"))
 
         return {
             "document_nr": identifier,
@@ -163,14 +170,31 @@ class BexioInvoiceSyncService:
             }],
         }
 
+    # --- telegram skip notification -----------------------------------------
+
+    def _invoice_url(self, source_id: int | None) -> str:
+        return (f"https://{self._source_account_url}.mocoapp.com"
+                f"/invoices/{source_id}")
+
+    def _notify_no_customer(self, body: dict) -> None:
+        """A sent invoice we can't resolve a customer for — the invoice
+        analogue of BexioExpenseSyncService's no_company skip notification."""
+        if not self._telegram:
+            return
+        self._telegram.notify(
+            f"Invoice in Moco not synced to Bexio: {self._invoice_url(body.get('id'))}\n"
+            "Reason: No customer given\n"
+            f"- Invoice ID: {body.get('identifier') or ''}\n"
+            f"- Date: {body.get('date') or ''}"
+        )
+
     # --- moco / bexio cross-comments ----------------------------------------
 
     def _comment_invoice_in_bexio(self, invoice_id: int | None,
                                   source_id: int | None) -> None:
         if not invoice_id or not source_id:
             return
-        moco_url = (f"https://{self._source_account_url}.mocoapp.com/invoices/"
-                    f"{source_id}")
+        moco_url = self._invoice_url(source_id)
         try:
             self._bexio.comment_invoice(invoice_id, {
                 "text": f"Link zur Rechnung in Moco: {moco_url}",
