@@ -182,10 +182,12 @@ class BexioInvoiceSyncService:
         if not self._telegram:
             return
         self._telegram.notify(
-            f"Invoice in Moco not synced to Bexio: {self._invoice_url(body.get('id'))}\n"
+            "Invoice in Moco not synced to Bexio.\n"
             "Reason: No customer given\n"
             f"- Invoice ID: {body.get('identifier') or ''}\n"
-            f"- Date: {body.get('date') or ''}"
+            f"- Date: {body.get('date') or ''}\n"
+            f"- Total: CHF {body.get('net_total') or ''}\n"
+            f"- Invoice in Moco: {self._invoice_url(body.get('id'))}"
         )
 
     # --- moco / bexio cross-comments ----------------------------------------
