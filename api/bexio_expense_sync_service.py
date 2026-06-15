@@ -204,7 +204,7 @@ class BexioExpenseSyncService:
             "line_items": [line_item],
             "discounts": [],
             "payment": _build_payment(body, contact, has_iban=has_iban),
-            "attachment_ids": [attachment_uuid] if attachment_uuid else [],
+            "attachment_ids": _resolve_attachment_ids(attachment_uuid, existing_bill),
         }
 
         if body.get("receipt_identifier"):
@@ -278,6 +278,18 @@ class BexioExpenseSyncService:
 
 
 # --- helpers ----------------------------------------------------------------
+
+def _resolve_attachment_ids(uploaded_uuid: str | None,
+                            existing_bill: dict | None) -> list[str]:
+    # Bexio replaces (not merges) attachment_ids on PUT — sending [] would
+    # detach the existing file. Preserve what's already on the bill when we
+    # didn't upload anything new. Mirrors the n8n update payload.
+    if uploaded_uuid:
+        return [uploaded_uuid]
+    if existing_bill and existing_bill.get("attachment_ids"):
+        return list(existing_bill["attachment_ids"])
+    return []
+
 
 def _account_no_from(body: dict) -> str | None:
     first_item = (body.get("items") or [{}])[0]

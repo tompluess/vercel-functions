@@ -278,6 +278,9 @@ def test_updates_draft_bill_when_found(service, bexio):
     assert payload["split_into_line_items"] is False
     # Existing attachment_ids on the bill -> service does NOT re-upload.
     assert not any(c[0] == "upload_file" for c in bexio.calls)
+    # ...and they must be preserved in the PUT payload — Bexio replaces
+    # attachment_ids on update, so sending [] would detach the file.
+    assert payload["attachment_ids"] == ["existing-uuid"]
 
 
 def test_account_fallback_when_lookup_misses(service, bexio):
