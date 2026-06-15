@@ -71,6 +71,23 @@ class BexioAPI:
     def update_bill(self, bill_id: int, payload: dict) -> dict:
         return self._put_json(f"/4.0/purchase/bills/{bill_id}", payload)
 
+    def book_bill(self, bill_id: int) -> dict:
+        """PUT /4.0/purchase/bills/{id}/bookings/BOOKED — DRAFT -> BOOKED.
+
+        Required before an outgoing payment can be created against the bill.
+        Mirrors the n8n "Set Bill to Booked in Bexio" node.
+        """
+        return self._put_json(f"/4.0/purchase/bills/{bill_id}/bookings/BOOKED",
+                              None)
+
+    def create_outgoing_payment(self, payload: dict) -> dict:
+        """POST /4.0/payment/outgoing-payments — books a payment against a bill.
+
+        Bexio rejects this when the bill is not yet BOOKED or when a payment
+        already exists for the bill.
+        """
+        return self._post_json("/4.0/payment/outgoing-payments", payload)
+
     def create_invoice(self, payload: dict) -> dict:
         return self._post_json("/2.0/kb_invoice", payload)
 

@@ -92,6 +92,32 @@ def manual_bank_account_id(moco_user_firstname: str | None) -> int:
     return int(mapping.get("default", BANK_ACCOUNT_ID))
 
 
+def outgoing_payment_sender() -> dict | None:
+    """Sender (own-company) fields embedded in every Bexio outgoing payment.
+
+    Bexio's POST /4.0/payment/outgoing-payments expects the paying party
+    duplicated in every request (name, IBAN, bank, address). These values
+    are static for our company but shouldn't be committed to a public repo,
+    so they're env-driven via `BEXIO_OUTGOING_PAYMENT_SENDER` (JSON object).
+
+    Expected keys (all strings unless noted): `name`, `iban`, `bank_name`,
+    `bc_no`, `street`, `house_no`, `postcode`, `city`, `country_code`,
+    and `bank_account_id` (int — defaults to BANK_ACCOUNT_ID when absent).
+
+    Returns None when the env var is missing or malformed. The caller is
+    expected to surface that as a Telegram alert and skip payment creation
+    rather than crash the whole sync (the bill is the authoritative side
+    effect; payment creation is an enrichment step).
+    """
+    raw = os.environ.get("BEXIO_OUTGOING_PAYMENT_SENDER", "")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
 def resolve_revenue_account_no(project_labels: list[str]) -> str:
     """Mirror of the n8n "Evaluate Profit Account" JS node — iterates the
     mapping in order, so later matches win over earlier ones (matches n8n's

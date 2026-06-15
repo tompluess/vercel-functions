@@ -3,10 +3,29 @@
 Injects FakeBexioAPI + FakeSourceMocoClient so no HTTP is touched.
 """
 
+import json
+from urllib import error as urlerror
+
 import pytest
 
 from api.bexio_expense_sync_service import BexioExpenseSyncService
 from tests.conftest import load_fixture
+
+
+SENDER = {
+    "name": "PVcontracting AG", "iban": "CH8580808003633835369",
+    "bank_name": "Raiffeisen", "bc_no": "80808",
+    "street": "Schachenstrasse", "house_no": "15C",
+    "postcode": "6010", "city": "Kriens", "country_code": "CH",
+    "bank_account_id": 2,
+}
+
+
+@pytest.fixture(autouse=True)
+def _outgoing_payment_sender_env(monkeypatch):
+    """All tests run with a configured sender; tests that exercise the
+    missing-env branch delete the var explicitly."""
+    monkeypatch.setenv("BEXIO_OUTGOING_PAYMENT_SENDER", json.dumps(SENDER))
 
 
 class FakeBexioAPI:
@@ -19,6 +38,11 @@ class FakeBexioAPI:
         self.next_create_bill: dict = {"id": 9001}
         self.next_update_bill: dict = {"id": 9001}
         self.next_upload: dict = {"uuid": "file-uuid-1"}
+        self.next_book_bill: dict = {"status": "BOOKED"}
+        self.next_outgoing_payment: dict = {"id": 7001,
+                                            "execution_date": "2024-12-30"}
+        self.book_bill_error: Exception | None = None
+        self.outgoing_payment_error: Exception | None = None
         self.calls: list[tuple] = []
 
     def search_contact_by_name(self, name):
@@ -52,6 +76,18 @@ class FakeBexioAPI:
     def upload_file(self, *, filename, content, mime_type=None):
         self.calls.append(("upload_file", filename, len(content), mime_type))
         return self.next_upload
+
+    def book_bill(self, bill_id):
+        self.calls.append(("book_bill", bill_id))
+        if self.book_bill_error:
+            raise self.book_bill_error
+        return self.next_book_bill
+
+    def create_outgoing_payment(self, payload):
+        self.calls.append(("create_outgoing_payment", payload))
+        if self.outgoing_payment_error:
+            raise self.outgoing_payment_error
+        return self.next_outgoing_payment
 
 
 class FakeSourceMoco:
@@ -143,7 +179,8 @@ def test_creates_bill_with_iban_payment_block(service, bexio, source):
 
     result = service.sync(body)
 
-    assert result == {"action": "created", "bill_id": 9001, "contact_id": 5001}
+    assert result == {"action": "created", "bill_id": 9001, "contact_id": 5001,
+                      "payment_id": 7001}
 
     create_call = next(c for c in bexio.calls if c[0] == "create_bill")
     payload = create_call[1]
@@ -171,12 +208,21 @@ def test_creates_bill_with_iban_payment_block(service, bexio, source):
     upload_call = next(c for c in bexio.calls if c[0] == "upload_file")
     assert upload_call[1] == "2024-12-09 FLYERALARM - RatePAY GmbH CH240067780.pdf"
     assert payload["attachment_ids"] == ["file-uuid-1"]
-    # Comment posted back to Moco
-    assert source.comments == [{
-        "id": 2413131, "type": "Purchase",
-        "text": "Lieferantenrechnung in Bexio erstellt: "
-                "https://office.bexio.com/index.php/kb_bill/list#/show/9001"
-    }]
+    # Two comments posted back to Moco: the creation comment, and the
+    # "booked + Zahlungsausgang" comment after the book+pay step.
+    assert source.comments == [
+        {
+            "id": 2413131, "type": "Purchase",
+            "text": "Lieferantenrechnung in Bexio erstellt: "
+                    "https://office.bexio.com/index.php/kb_bill/list#/show/9001",
+        },
+        {
+            "id": 2413131, "type": "Purchase",
+            "text": ("Lieferantenrechnung in Bexio auf <strong>gebucht</strong> "
+                     "gesetzt und Zahlungsausgang erstellt per 2024-12-30: "
+                     "https://office.bexio.com/index.php/kb_bill/list#/show/9001"),
+        },
+    ]
 
 
 def test_create_without_iban_uses_manual_payment_and_user_bank(
@@ -192,7 +238,8 @@ def test_create_without_iban_uses_manual_payment_and_user_bank(
 
     result = service.sync(body)
 
-    assert result == {"action": "created", "bill_id": 9001, "contact_id": 5060}
+    assert result == {"action": "created", "bill_id": 9001, "contact_id": 5060,
+                      "payment_id": 7001}
     payload = next(c for c in bexio.calls if c[0] == "create_bill")[1]
     assert payload["payment"]["type"] == "MANUAL"
     # Tom is mapped to 9 in BEXIO_MANUAL_BANK_MAP.
@@ -269,7 +316,8 @@ def test_updates_draft_bill_when_found(service, bexio):
 
     result = service.sync(body)
 
-    assert result == {"action": "updated", "bill_id": 8889, "contact_id": 5001}
+    assert result == {"action": "updated", "bill_id": 8889, "contact_id": 5001,
+                      "payment_id": 7001}
     update_call = next(c for c in bexio.calls if c[0] == "update_bill")
     assert update_call[1] == 8889
     payload = update_call[2]
@@ -326,7 +374,7 @@ def test_real_digitec_payload_handles_list_file_upload_response(
     result = service.sync(body)
 
     assert result == {"action": "created", "bill_id": 9001,
-                      "contact_id": 5200}
+                      "contact_id": 5200, "payment_id": 7001}
     # The list's first uuid must end up on the bill's attachment_ids.
     bill_payload = next(c for c in bexio.calls if c[0] == "create_bill")[1]
     assert bill_payload["attachment_ids"] == ["actual-bexio-uuid"]
@@ -411,3 +459,185 @@ def test_skip_works_without_telegram_configured(service, bexio):
     no notifier was injected (service-layer unit tests omit it)."""
     result = service.sync(load_fixture("purchase_no_company.json"))
     assert result == {"skipped": "no_company"}
+
+
+# --- book + outgoing payment ------------------------------------------------
+
+def test_book_and_pay_payload_for_qr_bill(service, bexio):
+    """IBAN + reference -> QR payment with NO fee_type, reference_no set,
+    no message field, sender info from BEXIO_OUTGOING_PAYMENT_SENDER."""
+    bexio.contacts_by_name["FLYERALARM - RatePAY GmbH"] = [
+        {"id": 5001, "street_name": "Kasernenstrasse",
+         "house_number": "1", "postcode": "8004", "city": "Zürich"}
+    ]
+    bexio.accounts_by_no["6600"] = [{"id": 7700, "tax_id": 42}]
+
+    service.sync(load_fixture("purchase_with_iban.json"))
+
+    book_call = next(c for c in bexio.calls if c[0] == "book_bill")
+    assert book_call[1] == 9001  # bill id
+    pay_call = next(c for c in bexio.calls
+                    if c[0] == "create_outgoing_payment")
+    p = pay_call[1]
+    assert p["bill_id"] == "9001"
+    assert p["payment_type"] == "QR"
+    assert p["amount"] == 67.43
+    assert p["currency_code"] == "CHF"
+    assert p["execution_date"] == "2024-12-30"
+    assert p["receiver_iban"] == "CH7708836121049112006"
+    assert p["receiver_name"] == "FLYERALARM - RatePAY GmbH"
+    assert p["receiver_street"] == "Kasernenstrasse"
+    assert p["receiver_house_no"] == "1"
+    assert p["receiver_postcode"] == "8004"
+    assert p["receiver_city"] == "Zürich"
+    assert p["reference_no"] == "CH240067780"
+    assert p["booking_text"] == "CH240067780"
+    assert "message" not in p
+    assert "fee_type" not in p  # QR -> no NO_FEE override
+    # Sender block populated from the env var.
+    assert p["sender_iban"] == SENDER["iban"]
+    assert p["sender_name"] == SENDER["name"]
+    assert p["sender_bank_account_id"] == SENDER["bank_account_id"]
+
+
+def test_book_and_pay_payload_for_iban_without_reference(
+    service, bexio, monkeypatch
+):
+    """IBAN without reference -> IBAN payment with fee_type=NO_FEE and a
+    `message` field (since there's no reference_no for the recipient)."""
+    bexio.contacts_by_name["Vendor"] = [{"id": 5500}]
+    bexio.accounts_by_no["6500"] = [{"id": 7800, "tax_id": 10}]
+    body = {
+        "id": 42, "date": "2024-12-01", "due_date": "2024-12-20",
+        "title": "T", "gross_total": 100,
+        "iban": "CH0000000000000000000",  # IBAN but no reference
+        "receipt_identifier": "INV-1",
+        "company": {"name": "Vendor"},
+        "items": [{"title": "x", "gross_total": 100,
+                   "category": {"credit_account": "6500"}}],
+    }
+
+    service.sync(body)
+
+    p = next(c for c in bexio.calls
+             if c[0] == "create_outgoing_payment")[1]
+    assert p["payment_type"] == "IBAN"
+    assert p["fee_type"] == "NO_FEE"
+    assert p["message"] == "INV-1"
+    assert "reference_no" not in p
+
+
+def test_book_and_pay_payload_for_manual(service, bexio):
+    """No IBAN -> MANUAL payment, no fee_type, receiver_iban omitted entirely.
+
+    Bexio rejects `receiver_iban: ""` with 400 "IBAN contains illegal
+    characters" — for MANUAL we omit the field rather than send empty.
+    """
+    bexio.contacts_by_name["Restaurant Beispiel"] = [{"id": 5060}]
+    bexio.accounts_by_no["6500"] = [{"id": 7800, "tax_id": 33}]
+
+    service.sync(load_fixture("purchase_no_iban.json"))
+
+    p = next(c for c in bexio.calls
+             if c[0] == "create_outgoing_payment")[1]
+    assert p["payment_type"] == "MANUAL"
+    assert "receiver_iban" not in p
+    assert "fee_type" not in p
+
+
+def test_book_and_pay_normalizes_iban_with_spaces(service, bexio):
+    """IBAN pasted with spaces (the way humans copy them) is normalized to
+    a contiguous uppercase string before being sent to Bexio — otherwise
+    Bexio's strict /4.0/payment/outgoing-payments validator rejects it
+    with `400 IBAN contains illegal characters`. Bill creation succeeds
+    either way (its IBAN field is permissive)."""
+    bexio.contacts_by_name["Vendor"] = [{"id": 5500}]
+    bexio.accounts_by_no["6500"] = [{"id": 7800, "tax_id": 10}]
+    body = {
+        "id": 42, "date": "2024-12-01", "due_date": "2024-12-20",
+        "title": "T", "gross_total": 100,
+        "iban": " ch77  0883 6121 0491 1200 6 ",
+        "receipt_identifier": "INV-1",
+        "company": {"name": "Vendor"},
+        "items": [{"title": "x", "gross_total": 100,
+                   "category": {"credit_account": "6500"}}],
+    }
+
+    service.sync(body)
+
+    bill_payload = next(c for c in bexio.calls if c[0] == "create_bill")[1]
+    assert bill_payload["payment"]["iban"] == "CH7708836121049112006"
+    p = next(c for c in bexio.calls
+             if c[0] == "create_outgoing_payment")[1]
+    assert p["receiver_iban"] == "CH7708836121049112006"
+
+
+def test_book_failure_notifies_telegram_and_keeps_sync_ok(
+    service_tg, bexio, telegram
+):
+    """book_bill 4xx (e.g. payment already exists on replay) -> sync still
+    succeeds and the failure is announced on Telegram with bill context."""
+    bexio.contacts_by_name["FLYERALARM - RatePAY GmbH"] = [{"id": 5001}]
+    bexio.accounts_by_no["6600"] = [{"id": 7700, "tax_id": 42}]
+    bexio.book_bill_error = urlerror.HTTPError(
+        "url", 422, "Bill not in DRAFT", {},
+        fp=_io_bytes(b'{"message":"Cannot book non-draft bill"}'),
+    )
+
+    result = service_tg.sync(load_fixture("purchase_with_iban.json"))
+
+    assert result["action"] == "created"
+    assert result["bill_id"] == 9001
+    assert "payment_id" not in result
+    assert not any(c[0] == "create_outgoing_payment" for c in bexio.calls)
+    assert len(telegram.messages) == 1
+    msg = telegram.messages[0]
+    assert "booking/payment failed" in msg
+    assert "Cannot book non-draft bill" in msg
+    assert "https://office.bexio.com/index.php/kb_bill/list#/show/9001" in msg
+    assert "https://solar.mocoapp.com/purchases/" in msg
+
+
+def test_outgoing_payment_failure_notifies_telegram(
+    service_tg, bexio, telegram
+):
+    """Bill books fine but create_outgoing_payment fails (e.g. payment
+    already exists for the bill) -> Telegram alert, no booking comment in
+    Moco, sync still returns success."""
+    bexio.contacts_by_name["FLYERALARM - RatePAY GmbH"] = [{"id": 5001}]
+    bexio.accounts_by_no["6600"] = [{"id": 7700, "tax_id": 42}]
+    bexio.outgoing_payment_error = urlerror.HTTPError(
+        "url", 409, "Payment already exists", {},
+        fp=_io_bytes(b'{"message":"Payment already exists for bill"}'),
+    )
+
+    result = service_tg.sync(load_fixture("purchase_with_iban.json"))
+
+    assert result["action"] == "created"
+    assert "payment_id" not in result
+    assert len(telegram.messages) == 1
+    assert "Payment already exists" in telegram.messages[0]
+
+
+def test_missing_sender_env_notifies_and_skips_book_pay(
+    service_tg, bexio, telegram, monkeypatch
+):
+    """When BEXIO_OUTGOING_PAYMENT_SENDER is missing, we don't crash — we
+    skip the book+pay step and surface the misconfiguration on Telegram."""
+    monkeypatch.delenv("BEXIO_OUTGOING_PAYMENT_SENDER", raising=False)
+    bexio.contacts_by_name["FLYERALARM - RatePAY GmbH"] = [{"id": 5001}]
+    bexio.accounts_by_no["6600"] = [{"id": 7700, "tax_id": 42}]
+
+    result = service_tg.sync(load_fixture("purchase_with_iban.json"))
+
+    assert result["action"] == "created"
+    assert "payment_id" not in result
+    assert not any(c[0] in ("book_bill", "create_outgoing_payment")
+                   for c in bexio.calls)
+    assert len(telegram.messages) == 1
+    assert "BEXIO_OUTGOING_PAYMENT_SENDER" in telegram.messages[0]
+
+
+def _io_bytes(data: bytes):
+    import io
+    return io.BytesIO(data)
