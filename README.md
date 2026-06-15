@@ -64,6 +64,7 @@ Receives Moco `Purchase` webhooks and creates a matching supplier bill in [Bexio
 - Idempotent: searches `/4.0/purchase/bills?vendor=…&vendor_ref=…` — updates DRAFT bills in-place, creates new ones otherwise, and skips bills that are no longer DRAFT.
 - Branches on `iban`: present → QR or IBAN payment block on the default bank account; absent → MANUAL payment routed to the per-user bank account from `BEXIO_MANUAL_BANK_MAP`.
 - Posts a comment back to the Moco Purchase with the Bexio bill URL.
+- After create/update the bill is auto-booked (`/4.0/purchase/bills/{id}/bookings/BOOKED`) and an outgoing payment is created (`/4.0/payment/outgoing-payments`), then a second Moco comment is posted noting the booking + payment date. Sender (own-company) details come from `BEXIO_OUTGOING_PAYMENT_SENDER`. MANUAL bills (no IBAN) skip this step silently since Bexio rejects MANUAL outgoing-payment payloads. Failures are soft — log + Telegram alert with both URLs, the sync still returns `ok=true`.
 - Skip branches (no company, no booking account, bill no longer DRAFT) send a Telegram notification with entity context, mirroring the n8n `…Notification to Telegram` nodes.
 
 ### `POST /api/bexio-invoice-sync`
@@ -167,6 +168,7 @@ Required environment variables (configure in the Vercel project, then `vercel en
 | `MOCO_SOURCE_API_KEY` | API token for the **source** Moco account (used to fetch companies/projects and post comments back) |
 | `BEXIO_API_TOKEN` | Bexio API v3 token (sent as `Authorization: Bearer …`) |
 | `BEXIO_MANUAL_BANK_MAP` | *Optional.* JSON map of Moco user first name → Bexio `bank_account_id` for non-IBAN bills. Example: `{"default": 3, "Alice": 5, "Bob": 4}`. Falls back to `bexio_config.BANK_ACCOUNT_ID` when missing. |
+| `BEXIO_OUTGOING_PAYMENT_SENDER` | JSON object with the own-company sender fields embedded in every Bexio outgoing payment created by the expense flow. Expected keys: `name`, `iban`, `bank_name`, `bc_no`, `street`, `house_no`, `postcode`, `city`, `country_code`, `bank_account_id` (int). IBAN must be contiguous (no spaces). When missing/malformed, the book+pay step is skipped and a Telegram alert fires — the bill itself is still created. Not used by the invoice flow. |
 
 **Used by `/api/brevo-contact-sync`:**
 

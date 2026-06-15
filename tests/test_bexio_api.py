@@ -95,6 +95,25 @@ def test_issue_invoice_posts_with_empty_body(bexio_calls):
     assert call["data"] == b""
 
 
+def test_book_bill_puts_to_bookings_booked(bexio_calls):
+    BexioAPI(api_token="t").book_bill(9001)
+
+    call = bexio_calls["calls"][0]
+    assert call["method"] == "PUT"
+    assert call["url"].endswith("/4.0/purchase/bills/9001/bookings/BOOKED")
+    assert call["data"] == b""
+
+
+def test_create_outgoing_payment_posts_json(bexio_calls):
+    BexioAPI(api_token="t").create_outgoing_payment({"bill_id": "9001",
+                                                     "amount": 67.43})
+
+    call = bexio_calls["calls"][0]
+    assert call["method"] == "POST"
+    assert call["url"].endswith("/4.0/payment/outgoing-payments")
+    assert json.loads(call["data"]) == {"bill_id": "9001", "amount": 67.43}
+
+
 def test_upload_file_sends_multipart_with_boundary_and_uuid(bexio_calls):
     bexio_calls["responses"]["/3.0/files"] = {"uuid": "the-uuid"}
 

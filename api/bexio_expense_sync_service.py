@@ -22,6 +22,7 @@ contains only business logic and is unit-tested with fakes (see
 
 import logging
 from typing import Any
+from urllib import error as urlerror
 
 from api.bexio_api import BexioAPI
 from api.bexio_config import (
@@ -34,6 +35,7 @@ from api.bexio_config import (
     OWNER_ID,
     USER_ID,
     manual_bank_account_id,
+    outgoing_payment_sender,
 )
 from api.source_moco_client import SourceMocoClient
 from api.telegram_notifier import TelegramNotifier
@@ -102,8 +104,13 @@ class BexioExpenseSyncService:
 
         self._post_moco_comment(body.get("id"), bill_id, action)
 
-        return {"action": action, "bill_id": bill_id,
-                "contact_id": contact.get("id")}
+        payment_id = self._try_book_and_pay(bill_id, body, contact)
+
+        result = {"action": action, "bill_id": bill_id,
+                  "contact_id": contact.get("id")}
+        if payment_id is not None:
+            result["payment_id"] = payment_id
+        return result
 
     # --- contact handling ---------------------------------------------------
 
@@ -171,7 +178,8 @@ class BexioExpenseSyncService:
     def _build_bill_payload(self, body: dict, contact: dict, account: dict, *,
                             attachment_uuid: str | None,
                             existing_bill: dict | None) -> dict:
-        has_iban = bool(body.get("iban"))
+        iban = _moco_iban(body)
+        has_iban = bool(iban)
         first_item = (body.get("items") or [{}])[0]
         bill_date = body.get("date")
         due_date = body.get("due_date") or _add_days(bill_date, 30)
@@ -203,7 +211,7 @@ class BexioExpenseSyncService:
             },
             "line_items": [line_item],
             "discounts": [],
-            "payment": _build_payment(body, contact, has_iban=has_iban),
+            "payment": _build_payment(body, contact, iban=iban),
             "attachment_ids": _resolve_attachment_ids(attachment_uuid, existing_bill),
         }
 
@@ -224,6 +232,104 @@ class BexioExpenseSyncService:
             payload["split_into_line_items"] = existing_bill.get("split_into_line_items")
 
         return payload
+
+    # --- book + outgoing payment --------------------------------------------
+
+    def _try_book_and_pay(self, bill_id: int | None, body: dict,
+                          contact: dict) -> int | None:
+        """Book the bill and create an outgoing payment in Bexio.
+
+        Runs after both create and update so the bill ends up in BOOKED state
+        with a Zahlungsausgang attached — mirrors the n8n
+        "Set Bill to Booked -> Create Outgoing Payment -> Comment Booked"
+        chain (which only ran on create in n8n; we extend it to update too
+        because the bill_not_draft skip above already guarantees we're
+        operating on a DRAFT bill).
+
+        The bill itself is the authoritative side effect, so failure here
+        does NOT fail the sync: it logs + fires a Telegram alert and
+        returns None. Bexio rejects the call when a payment already exists
+        for the bill — that's the expected failure shape on a replay and
+        the alert surfaces it for human review.
+        """
+        if not bill_id:
+            return None
+        # MANUAL payments (no IBAN on the Moco purchase) are skipped: Bexio's
+        # /4.0/payment/outgoing-payments rejects MANUAL payloads that carry
+        # `message` / `booking_text` / `reference_no`, and routine cash/manual
+        # bills don't benefit from the booking step anyway. Stay silent —
+        # alerting on every MANUAL bill would spam the chat.
+        if not _moco_iban(body):
+            logger.info("expense sync: skipping book+pay for MANUAL bill "
+                        "(no IBAN) bill_id=%s", bill_id)
+            return None
+        sender = outgoing_payment_sender()
+        if not sender:
+            logger.warning("expense sync: BEXIO_OUTGOING_PAYMENT_SENDER "
+                           "missing/malformed, skipping book+pay bill_id=%s",
+                           bill_id)
+            self._notify_book_pay_failure(
+                body, bill_id,
+                "BEXIO_OUTGOING_PAYMENT_SENDER missing or malformed",
+            )
+            return None
+        try:
+            self._bexio.book_bill(bill_id)
+            payment_payload = _build_outgoing_payment_payload(
+                body, contact, sender, bill_id,
+            )
+            payment = self._bexio.create_outgoing_payment(payment_payload)
+        except urlerror.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                err_body = "<unreadable>"
+            logger.warning("expense sync: book/pay failed bill_id=%s "
+                           "status=%s body=%s", bill_id, e.code, err_body)
+            self._notify_book_pay_failure(body, bill_id,
+                                          f"{e.code} {err_body}")
+            return None
+        except Exception as e:
+            logger.exception("expense sync: book/pay failed bill_id=%s",
+                             bill_id)
+            self._notify_book_pay_failure(body, bill_id, str(e))
+            return None
+
+        execution_date = payment.get("execution_date")
+        self._post_moco_booking_comment(body.get("id"), bill_id, execution_date)
+        return payment.get("id")
+
+    def _notify_book_pay_failure(self, body: dict, bill_id: int,
+                                 reason: str) -> None:
+        if not self._telegram:
+            return
+        company = (body.get("company") or {}).get("name") or ""
+        self._telegram.notify(
+            "Expense in Moco synced to Bexio but booking/payment failed:\n"
+            f"- Company: {company}\n"
+            f"- Bill ID: {body.get('receipt_identifier') or ''}\n"
+            f"- Date: {body.get('date') or ''}\n"
+            f"- Bexio Bill: {self.BEXIO_BILL_URL_TEMPLATE.format(id=bill_id)}\n"
+            f"- Moco Expense: {self._purchase_url(body.get('id'))}\n"
+            f"Reason: {reason}"
+        )
+
+    def _post_moco_booking_comment(self, source_id: int | None,
+                                   bill_id: int,
+                                   execution_date: str | None) -> None:
+        if not source_id:
+            return
+        bill_url = self.BEXIO_BILL_URL_TEMPLATE.format(id=bill_id)
+        per = f" per {execution_date}" if execution_date else ""
+        text = ("Lieferantenrechnung in Bexio auf <strong>gebucht</strong> "
+                f"gesetzt und Zahlungsausgang erstellt{per}: {bill_url}")
+        try:
+            self._source_moco.post_comment(commentable_id=source_id,
+                                           commentable_type="Purchase",
+                                           text=text)
+        except Exception:
+            logger.exception("expense sync: booking comment to Moco failed "
+                             "source_id=%s", source_id)
 
     # --- telegram skip notifications ----------------------------------------
 
@@ -279,6 +385,22 @@ class BexioExpenseSyncService:
 
 # --- helpers ----------------------------------------------------------------
 
+def _moco_iban(body: dict) -> str:
+    """Moco-supplied IBAN with whitespace and other non-alphanumeric chars
+    stripped, uppercased.
+
+    Moco lets users paste IBANs with spaces (e.g. "DE89 3704 0044 ..."),
+    which Bexio's /4.0/payment/outgoing-payments validates strictly and
+    rejects with `400 IBAN contains illegal characters`. The bill-create
+    endpoint is more lenient, so the bill itself succeeds while the payment
+    blows up — normalize once at the source so both endpoints see clean
+    input. Treats whitespace-only input as no IBAN, which downgrades the
+    payment branch to MANUAL.
+    """
+    raw = body.get("iban") or ""
+    return "".join(c for c in raw if c.isalnum()).upper()
+
+
 def _resolve_attachment_ids(uploaded_uuid: str | None,
                             existing_bill: dict | None) -> list[str]:
     # Bexio replaces (not merges) attachment_ids on PUT — sending [] would
@@ -306,14 +428,14 @@ def _attachment_filename(body: dict) -> str:
     return f"{base}.pdf"
 
 
-def _build_payment(body: dict, contact: dict, *, has_iban: bool) -> dict:
+def _build_payment(body: dict, contact: dict, *, iban: str) -> dict:
     bill_date = body.get("date")
     due_date = body.get("due_date") or _add_days(bill_date, 20)
     gross = body.get("gross_total")
     receipt_id = body.get("receipt_identifier")
     company_name = (body.get("company") or {}).get("name") or ""
 
-    if has_iban:
+    if iban:
         payment = {
             "type": "QR" if body.get("reference") else "IBAN",
             "bank_account_id": BANK_ACCOUNT_ID,
@@ -321,7 +443,7 @@ def _build_payment(body: dict, contact: dict, *, has_iban: bool) -> dict:
             "execution_date": due_date,
             "amount": gross,
             "exchange_rate": 1,
-            "iban": body.get("iban"),
+            "iban": iban,
             "name": company_name,
             "address": contact.get("street_name") or "Strasse",
             "street": contact.get("street_name") or "Strasse",
@@ -356,6 +478,69 @@ def _build_payment(body: dict, contact: dict, *, has_iban: bool) -> dict:
         payment["reference_no"] = body["reference"]
 
     return payment
+
+
+def _build_outgoing_payment_payload(body: dict, contact: dict,
+                                    sender: dict, bill_id: int) -> dict:
+    """Build the POST /4.0/payment/outgoing-payments body.
+
+    Mirrors the n8n "Create Outgoing Payment in Bexio" jsonBody:
+      - QR/IBAN/MANUAL switched by `iban` + `reference`
+      - fee_type=NO_FEE only for plain IBAN (no QR reference)
+      - booking_text=receipt_identifier when present
+      - reference_no when a reference exists; otherwise message=receipt_identifier
+    Receiver address falls back to the same Strasse/0000/1/Unknown defaults
+    used in the bill's `payment` block so an incomplete Bexio contact still
+    produces a valid payment payload.
+    """
+    iban = _moco_iban(body)
+    has_iban = bool(iban)
+    has_reference = bool(body.get("reference"))
+    bill_date = body.get("date")
+    execution_date = body.get("due_date") or _add_days(bill_date, 20)
+    payment_type = ("QR" if has_iban and has_reference
+                    else "IBAN" if has_iban
+                    else "MANUAL")
+    company_name = (body.get("company") or {}).get("name") or ""
+    receipt_id = body.get("receipt_identifier")
+
+    payload: dict[str, Any] = {
+        "is_salary_payment": False,
+        "amount": body.get("gross_total"),
+        "bill_id": str(bill_id),
+        "currency_code": "CHF",
+        "exchange_rate": 1,
+        "execution_date": execution_date,
+        "payment_type": payment_type,
+        "receiver_city": contact.get("city") or "Unknown",
+        "receiver_country_code": "CH",
+        "receiver_name": company_name,
+        "receiver_postcode": contact.get("postcode") or "0000",
+        "receiver_street": contact.get("street_name") or "Strasse",
+        "receiver_house_no": contact.get("house_number") or "1",
+        "sender_bank_account_id": sender.get("bank_account_id",
+                                             BANK_ACCOUNT_ID),
+        "sender_bank_name": sender.get("bank_name", ""),
+        "sender_bc_no": sender.get("bc_no", ""),
+        "sender_city": sender.get("city", ""),
+        "sender_country_code": sender.get("country_code", "CH"),
+        "sender_house_no": sender.get("house_no", ""),
+        "sender_iban": sender.get("iban", ""),
+        "sender_name": sender.get("name", ""),
+        "sender_postcode": sender.get("postcode", ""),
+        "sender_street": sender.get("street", ""),
+    }
+    if has_iban:
+        payload["receiver_iban"] = iban
+        if not has_reference:
+            payload["fee_type"] = "NO_FEE"
+    if receipt_id:
+        payload["booking_text"] = receipt_id
+    if has_reference:
+        payload["reference_no"] = body["reference"]
+    elif receipt_id:
+        payload["message"] = receipt_id
+    return payload
 
 
 def _add_days(iso_date: str | None, days: int) -> str | None:
