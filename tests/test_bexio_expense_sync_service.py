@@ -238,8 +238,10 @@ def test_create_without_iban_uses_manual_payment_and_user_bank(
 
     result = service.sync(body)
 
-    assert result == {"action": "created", "bill_id": 9001, "contact_id": 5060,
-                      "payment_id": 7001}
+    # MANUAL bills (no IBAN) skip the book+pay step entirely — Bexio's
+    # outgoing-payments endpoint rejects MANUAL payloads, and routine cash
+    # bills don't benefit from auto-booking anyway.
+    assert result == {"action": "created", "bill_id": 9001, "contact_id": 5060}
     payload = next(c for c in bexio.calls if c[0] == "create_bill")[1]
     assert payload["payment"]["type"] == "MANUAL"
     # Tom is mapped to 9 in BEXIO_MANUAL_BANK_MAP.
@@ -249,6 +251,9 @@ def test_create_without_iban_uses_manual_payment_and_user_bank(
     assert payload["attachment_ids"] == []
     # No file_url in fixture => no upload call.
     assert not any(c[0] == "upload_file" for c in bexio.calls)
+    # MANUAL -> no book / no outgoing-payment calls.
+    assert not any(c[0] in ("book_bill", "create_outgoing_payment")
+                   for c in bexio.calls)
 
 
 def test_creates_contact_when_missing_using_moco_company_data(
@@ -527,22 +532,28 @@ def test_book_and_pay_payload_for_iban_without_reference(
     assert "reference_no" not in p
 
 
-def test_book_and_pay_payload_for_manual(service, bexio):
-    """No IBAN -> MANUAL payment, no fee_type, receiver_iban omitted entirely.
+def test_manual_bill_skips_book_and_pay(service, bexio, source):
+    """MANUAL bills (no IBAN) skip booking and outgoing-payment entirely.
 
-    Bexio rejects `receiver_iban: ""` with 400 "IBAN contains illegal
-    characters" — for MANUAL we omit the field rather than send empty.
-    """
+    Bexio rejects MANUAL outgoing-payment payloads when `message` /
+    `booking_text` / `reference_no` are set (400 "message is not allowed
+    for [MANUAL] payment type"), so we skip the step rather than try to
+    strip the fields. Bill is still created; only the booking comment
+    is suppressed."""
     bexio.contacts_by_name["Restaurant Beispiel"] = [{"id": 5060}]
     bexio.accounts_by_no["6500"] = [{"id": 7800, "tax_id": 33}]
 
-    service.sync(load_fixture("purchase_no_iban.json"))
+    result = service.sync(load_fixture("purchase_no_iban.json"))
 
-    p = next(c for c in bexio.calls
-             if c[0] == "create_outgoing_payment")[1]
-    assert p["payment_type"] == "MANUAL"
-    assert "receiver_iban" not in p
-    assert "fee_type" not in p
+    assert result == {"action": "created", "bill_id": 9001,
+                      "contact_id": 5060}
+    methods = [c[0] for c in bexio.calls]
+    assert "book_bill" not in methods
+    assert "create_outgoing_payment" not in methods
+    # The "Lieferantenrechnung erstellt" comment is posted; the "gebucht +
+    # Zahlungsausgang" comment is NOT (no payment was created).
+    assert len(source.comments) == 1
+    assert "gebucht" not in source.comments[0]["text"]
 
 
 def test_book_and_pay_normalizes_iban_with_spaces(service, bexio):

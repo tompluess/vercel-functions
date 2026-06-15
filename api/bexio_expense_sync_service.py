@@ -254,6 +254,15 @@ class BexioExpenseSyncService:
         """
         if not bill_id:
             return None
+        # MANUAL payments (no IBAN on the Moco purchase) are skipped: Bexio's
+        # /4.0/payment/outgoing-payments rejects MANUAL payloads that carry
+        # `message` / `booking_text` / `reference_no`, and routine cash/manual
+        # bills don't benefit from the booking step anyway. Stay silent —
+        # alerting on every MANUAL bill would spam the chat.
+        if not _moco_iban(body):
+            logger.info("expense sync: skipping book+pay for MANUAL bill "
+                        "(no IBAN) bill_id=%s", bill_id)
+            return None
         sender = outgoing_payment_sender()
         if not sender:
             logger.warning("expense sync: BEXIO_OUTGOING_PAYMENT_SENDER "
