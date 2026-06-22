@@ -45,6 +45,7 @@ to list the available codes, then:
 
 import base64
 import logging
+import re
 from dataclasses import replace
 from html import escape
 from typing import Any
@@ -685,9 +686,15 @@ def _format_email_source_comment(email_from: str | None,
     Posted as its own Moco comment (separate from the 🤖 OCR comment)
     when Moco's email-import populated `email_from` / `email_body` on
     the webhook body. Manually-uploaded drafts have neither — in that
-    case this returns "" and the caller skips posting. `<pre>` for the
-    body preserves linewraps/quoting that often matter for context
-    (PO numbers in the subject, sender's note about the invoice, etc).
+    case this returns "" and the caller skips posting.
+
+    Body rendering branches on shape:
+      - HTML body (forwarded email from a webmail client, contains
+        <div>/<br>/<strong>/etc) → sanitize to Moco's allowed tag subset
+        and pass through inline. Otherwise Moco renders raw escaped
+        markup as literal `<div>` text — ugly.
+      - Plain text body → wrap in <pre> so newlines / indentation
+        survive Moco's HTML normalizer.
     """
     if not email_from and not email_body:
         return ""
@@ -701,8 +708,66 @@ def _format_email_source_comment(email_from: str | None,
             body = body[:EMAIL_BODY_MAX_CHARS]
             truncated = (f"\n[…gekürzt von {len(email_body)} auf "
                          f"{EMAIL_BODY_MAX_CHARS} Zeichen]")
-        parts.append(f"<pre>{escape(body)}{escape(truncated)}</pre>")
+        if _looks_like_html(body):
+            rendered = _sanitize_html_for_moco(body)
+            if truncated:
+                rendered += f"<br>{escape(truncated.strip())}"
+            parts.append(rendered)
+        else:
+            parts.append(f"<pre>{escape(body)}{escape(truncated)}</pre>")
     return "<div>" + "<br>".join(parts) + "</div>"
+
+
+# Tags Moco's comment renderer keeps; anything else is stripped on submit.
+_MOCO_ALLOWED_TAGS = {"div", "strong", "em", "u", "pre", "ul", "ol", "li", "br"}
+
+# Common forwarded-email tags rewritten to Moco-allowed equivalents instead
+# of being dropped, so the visual structure (paragraph breaks, bold) is
+# preserved.
+_TAG_REWRITES = {
+    "b": "strong",
+    "i": "em",
+    "p": "div",
+    "h1": "div", "h2": "div", "h3": "div",
+    "h4": "div", "h5": "div", "h6": "div",
+}
+
+
+def _looks_like_html(text: str) -> bool:
+    """True if `text` carries HTML markup we should preserve.
+
+    Conservative pattern — only triggers on actual tag names so plain
+    text containing `<verkauf@example.com>` or `< 5%` doesn't accidentally
+    fall into the HTML branch. Real forwarded emails always carry at
+    least one of these structural tags.
+    """
+    return bool(re.search(
+        r"</?(?:div|p|br|strong|b|em|i|span|a|table|tr|td|"
+        r"html|body|head|h[1-6]|ul|ol|li)\b",
+        text, re.IGNORECASE,
+    ))
+
+
+def _sanitize_html_for_moco(html: str) -> str:
+    """Strip / rewrite tags so only Moco's allowed subset survives.
+
+    Moco's renderer silently strips disallowed tags on submit. We do
+    the same client-side and additionally rewrite common HTML-email
+    tags (`<b>`, `<i>`, `<p>`, `<h1..h6>`) into Moco-allowed substitutes
+    so the structure (bold, paragraphs) is preserved rather than
+    flattened to a wall of text. Attributes are dropped — Moco doesn't
+    accept them on the allowed tags either, and they're a vector for
+    style noise from random webmail clients.
+    """
+    def replace(m: re.Match) -> str:
+        slash = m.group(1) or ""
+        name = m.group(2).lower()
+        if name in _TAG_REWRITES:
+            name = _TAG_REWRITES[name]
+        if name in _MOCO_ALLOWED_TAGS:
+            return f"<{slash}{name}>"
+        return ""   # strip the tag itself, leave inner text in place
+    return re.sub(r"<(/?)([a-zA-Z][a-zA-Z0-9]*)(?:\s[^>]*)?>", replace, html)
 
 
 def _li(label: str, value) -> str:

@@ -770,6 +770,121 @@ def test_email_only_comment_present_with_only_email_from():
     assert "<pre>" not in email_text   # no body → no pre block
 
 
+def test_html_email_body_is_sanitized_to_moco_tags_not_wrapped_in_pre():
+    """Regression: forwarded emails from webmail clients arrive as HTML.
+    Wrapping such a body in <pre> + html-escape would render the markup
+    as literal `<div>` text in the Moco comment. Detect HTML and pass
+    through (after stripping non-allowed tags) so the bold/paragraph
+    structure is preserved."""
+    html_body = (
+        '<div><div>---------- Weitergeleitete Nachricht ----------<br>'
+        '<strong>Von:</strong> verkauf_ro@sonepar.ch'
+        '<br><strong>Betreff:</strong> Rechnung 9001769113</div>'
+        '<div>Sehr geehrte Damen und Herren<br><br>'
+        'Als Anlage erhalten Sie die gewünschte Rechnung.</div></div>'
+    )
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases)
+    s.process("create", {
+        "id": 1, "file_url": "https://x/y.pdf",
+        "email_from": "thomas.pluess@gmail.com",
+        "email_body": html_body,
+    })
+    _, email_text = purchases.comments[0]
+    # No <pre> wrap on an HTML body.
+    assert "<pre>" not in email_text
+    # Structural tags survive unchanged.
+    assert "<strong>Von:</strong>" in email_text
+    assert "<br>" in email_text
+    assert "Weitergeleitete Nachricht" in email_text
+    # The verbatim raw tags from the input must NOT appear as escaped
+    # literals (the failure mode the user reported).
+    assert "&lt;div&gt;" not in email_text
+
+
+def test_html_email_strips_disallowed_tags_and_rewrites_b_i_p():
+    """A forwarded email's `<b>` / `<i>` / `<p>` get rewritten to
+    Moco's allowed subset (<strong>/<em>/<div>); `<span>` / `<font>` /
+    `<a>` / `<table>` are removed entirely (content kept)."""
+    body = (
+        '<p>Hello <b>world</b></p>'
+        '<span style="color:red">Some <font color="blue">colored</font> '
+        'text</span> with <i>italics</i> and a '
+        '<a href="https://example.com">link</a>.'
+        '<table><tr><td>cell</td></tr></table>'
+    )
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases)
+    s.process("create", {
+        "id": 1, "file_url": "https://x/y.pdf",
+        "email_from": "x@y", "email_body": body,
+    })
+    _, text = purchases.comments[0]
+    # Rewrites: b → strong, i → em, p → div.
+    assert "<strong>world</strong>" in text
+    assert "<em>italics</em>" in text
+    assert "<div>Hello" in text
+    # Disallowed tags gone (content kept):
+    assert "<span" not in text
+    assert "<font" not in text
+    assert "<a " not in text and "<a>" not in text
+    assert "<table" not in text and "<tr" not in text and "<td" not in text
+    # Inner text from removed tags still readable.
+    assert "Some" in text and "colored" in text and "link" in text
+    assert "cell" in text
+
+
+def test_plain_text_email_body_still_wrapped_in_pre():
+    """Plain-text bodies (no tags) keep the existing <pre> treatment so
+    indentation and newlines survive Moco's HTML normalizer."""
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases)
+    s.process("create", {
+        "id": 1, "file_url": "https://x/y.pdf",
+        "email_from": "x@y",
+        "email_body": "Line one\n  indented line two\nLine three",
+    })
+    _, text = purchases.comments[0]
+    assert "<pre>" in text
+    assert "</pre>" in text
+    assert "indented line two" in text
+
+
+def test_html_email_attributes_are_dropped():
+    """Attributes on allowed tags (e.g. `<div style="…">`) are stripped
+    too — Moco doesn't render them and they tend to carry CSS noise from
+    random webmail clients."""
+    body = '<div style="font-family:Arial" class="x"><strong id="z">Hi</strong></div>'
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases)
+    s.process("create", {
+        "id": 1, "file_url": "https://x/y.pdf",
+        "email_from": "x@y", "email_body": body,
+    })
+    _, text = purchases.comments[0]
+    assert "<div>" in text   # no attributes
+    assert "<strong>" in text
+    assert "style=" not in text and "class=" not in text and "id=" not in text
+
+
+def test_html_detection_doesnt_misfire_on_plain_text_with_angle_brackets():
+    """Plain text often contains `<email@host>` or `< 5%` — these must
+    NOT trigger the HTML branch (would mangle the angle brackets and
+    drop the email address)."""
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases)
+    s.process("create", {
+        "id": 1, "file_url": "https://x/y.pdf",
+        "email_from": "x@y",
+        "email_body": "Contact: <verkauf@sonepar.ch> for orders < 5%",
+    })
+    _, text = purchases.comments[0]
+    # Plain-text branch (<pre>) kicks in; values are html-escaped.
+    assert "<pre>" in text
+    assert "&lt;verkauf@sonepar.ch&gt;" in text
+    assert "&lt; 5%" in text
+
+
 def test_email_body_is_truncated_when_huge():
     """Defensive: a multi-megabyte forwarded thread shouldn't bloat the
     Moco comment. Truncate to EMAIL_BODY_MAX_CHARS with a marker."""
