@@ -193,6 +193,28 @@ def test_extract_nulls_qr_reference_when_length_is_not_27(client, calls):
     assert result.qr_reference is None
 
 
+def test_extract_nulls_iban_with_invalid_checksum(client, calls):
+    """ISO 13616 mod-97: an OCR-mangled IBAN that fails the checksum gets
+    nulled rather than passed through. Mod-97 has a ~1% false-positive
+    rate so this catches most of the typo-style misreads (one digit
+    flipped, two adjacent swapped, etc.)."""
+    # The valid checksum for the supplier example would be CH93...; flip
+    # one digit so it fails mod-97 but still has 21 chars + starts with CH.
+    payload = {**SAMPLE_OCR, "iban": "CH93007620116238 52958"}   # last digit changed
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    result = client.extract(PDF_BYTES)
+    assert result.iban is None
+
+
+def test_extract_nulls_iban_with_non_iban_text(client, calls):
+    """A non-IBAN string slipping into the field (model halucination)
+    fails the checksum and gets dropped."""
+    payload = {**SAMPLE_OCR, "iban": "ABC12345DEFGHIJKLMN67"}   # 21 alphanum, but not IBAN
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    result = client.extract(PDF_BYTES)
+    assert result.iban is None
+
+
 def test_extract_nulls_qr_reference_when_too_long(client, calls):
     """Symmetric: an over-long reference (model padded with an extra digit)
     is just as broken as a short one."""

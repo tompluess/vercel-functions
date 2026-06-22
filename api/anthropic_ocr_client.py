@@ -106,9 +106,19 @@ SYSTEM_PROMPT = (
     "from the printed text (usually grouped in blocks of 4 / 5 digits). "
     "NEVER attempt to decode the 2D Swiss QR Code image itself — vision "
     "decoding adds spurious digits.\n"
+    "  - Invoices often print MULTIPLE IBANs: a contact-info / "
+    "letterhead IBAN at the top, and the payment IBAN on the Zahlteil at "
+    "the bottom. EXTRACT ONLY THE ZAHLTEIL IBAN — that is the one money "
+    "is actually transferred to. If the document only has one IBAN (no "
+    "separate Zahlteil), use that. Do not blend digits from different "
+    "IBANs.\n"
     "  - Swiss IBAN: exactly 21 characters — 'CH' + 2 check digits + 5 "
-    "digit bank code + 12 alphanumeric account characters. Strip all "
-    "whitespace. If your extraction is not exactly 21 characters, "
+    "digit bank code + 12 ALPHANUMERIC account characters. The account "
+    "portion is NOT necessarily all digits: real-world Swiss IBANs often "
+    "contain uppercase letters (e.g. 'CH22 3000 00DE 1611 6572 0' has "
+    "'DE' inside the account part). Read each character literally — do "
+    "NOT silently convert letters to digits to make it look 'cleaner'. "
+    "Strip whitespace. If your extraction is not exactly 21 characters, "
     "re-examine the printed IBAN (re-count each group of 4) before "
     "responding.\n"
     "  - QR-Referenznummer: exactly 27 digits including leading zeros. "
@@ -420,12 +430,57 @@ def _normalize_qr_reference(value) -> str | None:
 
 
 def _normalize_iban(value) -> str | None:
-    """IBAN with whitespace/non-alphanum stripped, uppercased — matches the
-    normalization Bexio requires (see `bexio_expense_sync_service._moco_iban`).
-    Doing it here means downstream consumers never see a "DE89 3704 ..."
-    formatted variant from the model.
+    """IBAN normalized + mod-97 checksum-validated.
+
+    Strips non-alphanum, uppercases (so downstream consumers never see a
+    "DE89 3704 ..." formatted variant — same shape Bexio expects, see
+    `bexio_expense_sync_service._moco_iban`).
+
+    Then validates the ISO 13616 check digits: rearrange (move first 4
+    chars to end), replace letters with their A=10..Z=35 codes, the
+    resulting integer must be ≡ 1 (mod 97). Invalid → null + warn.
+
+    Why null on checksum failure: Sonnet occasionally mis-OCRs Swiss
+    QR-IBANs that contain alphanumeric characters in the account portion
+    (observed: real `CH22 3000 00DE 1611 6572 0` read as
+    `CH3909000000161165720` — the model dropped the "00DE" and re-padded
+    with digits). The mangled IBAN passes the 21-char length gate but
+    fails mod-97; nulling it out is far safer than pushing it to Moco,
+    where a wrong IBAN would silently send the QR-bill payment to the
+    wrong account.
     """
     if value is None:
         return None
     cleaned = "".join(c for c in str(value) if c.isalnum()).upper()
-    return cleaned or None
+    if not cleaned:
+        return None
+    if not _iban_checksum_valid(cleaned):
+        logger.warning("OCR returned IBAN with invalid mod-97 checksum, "
+                       "nulling field. raw=%r normalized=%r",
+                       value, cleaned)
+        return None
+    return cleaned
+
+
+def _iban_checksum_valid(iban: str) -> bool:
+    """ISO 13616 mod-97 check.
+
+    Rearrange (first 4 chars to end), replace each letter with its
+    A=10, B=11, ..., Z=35 numeric code, treat the resulting digit string
+    as one large integer that must be ≡ 1 modulo 97. Pure: no I/O.
+    """
+    if len(iban) < 4:
+        return False
+    rearranged = iban[4:] + iban[:4]
+    digits: list[str] = []
+    for c in rearranged:
+        if c.isdigit():
+            digits.append(c)
+        elif "A" <= c <= "Z":
+            digits.append(str(ord(c) - ord("A") + 10))
+        else:
+            return False
+    try:
+        return int("".join(digits)) % 97 == 1
+    except ValueError:
+        return False
