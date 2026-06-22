@@ -368,7 +368,10 @@ def test_non_swiss_iban_uses_bank_transfer_even_with_qr_reference():
 def test_payload_skips_optional_fields_when_not_extracted():
     """Optional Moco columns (due_date, receipt_identifier, iban, reference,
     info) only appear in the payload when OCR returned a value — otherwise
-    Moco would interpret null as 'clear this field'."""
+    Moco would interpret null as 'clear this field'. Exception:
+    `due_date` is always computed (OCR value → else invoice_date+30,
+    weekend-shifted), so it stays in the payload — covered in the
+    dedicated due-date tests."""
     invoice = make_invoice(due_date=None, invoice_number=None,
                            iban=None, qr_reference=None,
                            payment_purpose=None)
@@ -376,8 +379,74 @@ def test_payload_skips_optional_fields_when_not_extracted():
     s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
     payload = purchases.creates[0]
-    for key in ("due_date", "receipt_identifier", "iban", "reference", "info"):
+    for key in ("receipt_identifier", "iban", "reference", "info"):
         assert key not in payload, key
+
+
+def test_due_date_uses_ocr_value_when_weekday():
+    """OCR'd due_date on a normal weekday passes through unchanged."""
+    invoice = make_invoice(due_date="2026-06-11")  # Thursday
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["due_date"] == "2026-06-11"
+
+
+def test_due_date_ocr_saturday_rolls_back_to_friday():
+    """A Saturday due_date is unusable for supplier payments — shift to
+    the preceding Friday so the bank schedule actually fires it."""
+    invoice = make_invoice(due_date="2026-06-13")  # Saturday
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["due_date"] == "2026-06-12"  # Friday
+
+
+def test_due_date_ocr_sunday_rolls_back_to_friday():
+    invoice = make_invoice(due_date="2026-06-14")  # Sunday
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["due_date"] == "2026-06-12"  # Friday
+
+
+def test_due_date_defaults_to_invoice_date_plus_30_when_ocr_missing():
+    """No OCR due_date → invoice_date + 30 days. 2026-05-12 + 30d =
+    2026-06-11 (Thursday) → kept as-is."""
+    invoice = make_invoice(invoice_date="2026-05-12", due_date=None)
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["due_date"] == "2026-06-11"
+
+
+def test_due_date_default_plus_30_also_rolls_back_from_weekend():
+    """The weekend-shift rule applies to the computed fallback too:
+    2026-05-14 + 30d = 2026-06-13 (Saturday) → roll back to Friday 06-12."""
+    invoice = make_invoice(invoice_date="2026-05-14", due_date=None)
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["due_date"] == "2026-06-12"
+
+
+def test_due_date_unit_helper():
+    """Direct coverage of the resolver edges that are awkward to drive
+    through the whole service."""
+    from api.supplier_invoice_ocr_service import _resolve_due_date
+
+    # OCR wins over invoice_date + 30.
+    assert _resolve_due_date("2026-01-01", "2026-06-11") == "2026-06-11"
+    # OCR on Sunday → Friday.
+    assert _resolve_due_date("2026-01-01", "2026-06-14") == "2026-06-12"
+    # No OCR → +30d, kept if weekday.
+    assert _resolve_due_date("2026-05-12", None) == "2026-06-11"
+    # Both missing → None (payload omits due_date).
+    assert _resolve_due_date(None, None) is None
+    # Garbage OCR value → return as-is (Moco will validate).
+    assert _resolve_due_date("2026-05-12", "not-a-date") == "not-a-date"
+    # Garbage invoice_date with no OCR → None (couldn't compute fallback).
+    assert _resolve_due_date("garbage", None) is None
 
 
 def test_credit_note_payload_uses_negative_total():

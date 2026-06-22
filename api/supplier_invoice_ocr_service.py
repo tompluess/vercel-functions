@@ -44,6 +44,7 @@ to list the available codes, then:
 """
 
 import base64
+import datetime as dt
 import logging
 import re
 from dataclasses import replace
@@ -479,8 +480,9 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
         },
     }
 
-    if invoice.due_date:
-        payload["due_date"] = invoice.due_date
+    due_date = _resolve_due_date(payload["date"], invoice.due_date)
+    if due_date:
+        payload["due_date"] = due_date
     if invoice.invoice_number:
         payload["receipt_identifier"] = invoice.invoice_number
     if invoice.iban:
@@ -631,6 +633,43 @@ def _is_qr_iban(iban: str | None) -> bool:
     if not iid.isdigit():
         return False
     return 30000 <= int(iid) <= 31999
+
+
+def _resolve_due_date(invoice_date: str | None,
+                      ocr_due_date: str | None) -> str | None:
+    """Decide the `due_date` to send on the new Moco purchase.
+
+    Rules (in priority order):
+      1. Use the OCR-extracted due_date when present.
+      2. Otherwise compute `invoice_date + 30 days`.
+      3. If the resulting date falls on a Saturday or Sunday, roll back
+         to the preceding Friday — supplier payment runs are weekday-only
+         and a weekend due_date would either bounce or settle late.
+
+    Returns None if neither input yields a parseable ISO date (the
+    payload then simply omits the `due_date` field, which Moco accepts).
+    """
+    candidate = ocr_due_date
+    if not candidate:
+        try:
+            base = dt.date.fromisoformat(invoice_date) if invoice_date else None
+        except (TypeError, ValueError):
+            base = None
+        if base is None:
+            return None
+        candidate = (base + dt.timedelta(days=30)).isoformat()
+    try:
+        d = dt.date.fromisoformat(candidate)
+    except (TypeError, ValueError):
+        # Couldn't parse (OCR returned a non-ISO string?). Surface as-is
+        # — Moco will validate and we'll see the error.
+        return candidate
+    # Saturday=5, Sunday=6 → roll back to Friday.
+    if d.weekday() == 5:
+        d -= dt.timedelta(days=1)
+    elif d.weekday() == 6:
+        d -= dt.timedelta(days=2)
+    return d.isoformat()
 
 
 def _payment_method_for(invoice: InvoiceData) -> str:
