@@ -58,6 +58,18 @@ class InvoiceData:
     qr_reference: str | None
     payment_purpose: str | None
     description: str | None
+    # Gutschrift / Rechnung discriminator. Defaults to False (the common
+    # case) so callers can branch with `if invoice.is_credit_note: ...`
+    # without juggling Optional[bool] semantics. A true credit note ends
+    # up booked differently in Moco/Bexio (negative gross_total, "GS-"
+    # numbering prefix), so getting this wrong silently is worse than
+    # not extracting it.
+    is_credit_note: bool
+    # Project / site identifier ("Kommission", "Objekt", "Auftragsnummer",
+    # "Bauvorhaben") — used downstream to auto-assign the resulting
+    # purchase to the matching Moco project. Optional: many supplier
+    # invoices don't carry one, and we don't want to invent a value.
+    commission: str | None
     confidence: float
 
 
@@ -121,7 +133,17 @@ SYSTEM_PROMPT = (
     '  "iban": "string — IBAN without spaces, exactly 21 chars for CH, or null",\n'
     '  "qr_reference": "string — QR-Referenznummer, exactly 27 digits, or null",\n'
     '  "payment_purpose": "string — Zahlungszweck/Mitteilung or null",\n'
-    '  "description": "string — brief description of goods/services (max 200 chars)",\n'
+    '  "description": "string — brief description of goods/services (max 75 chars)",\n'
+    '  "is_credit_note": "boolean — true if this is a credit note '
+    '(Gutschrift / Stornorechnung) rather than a regular invoice (Rechnung). '
+    'Decide based on the document header (e.g. \\"Gutschrift\\" instead of '
+    '\\"Rechnung\\"), an explicitly negative total, or wording like '
+    '\\"Wir schreiben Ihnen gut\\". Default false.",\n'
+    '  "commission": "string — Kommission / Objekt / Auftragsnummer / '
+    'Bauvorhaben / Baustelle — typically a short project identifier or '
+    'site address printed on the invoice header or reference block (used '
+    'downstream to assign the purchase to a Moco project). null if not '
+    'explicitly present — do not infer from the supplier address.",\n'
     '  "confidence": "number — your overall extraction confidence 0.0–1.0"\n'
     "}"
 )
@@ -327,6 +349,8 @@ def _to_invoice_data(data: dict) -> InvoiceData:
         qr_reference=_normalize_qr_reference(data.get("qr_reference")),
         payment_purpose=_str_or_none(data.get("payment_purpose")),
         description=_str_or_none(data.get("description")),
+        is_credit_note=_bool_or_false(data.get("is_credit_note")),
+        commission=_str_or_none(data.get("commission")),
         confidence=_float_or_none(data.get("confidence")) or 0.0,
     )
 
@@ -336,6 +360,21 @@ def _str_or_none(value) -> str | None:
         return None
     s = str(value).strip()
     return s or None
+
+
+def _bool_or_false(value) -> bool:
+    """Coerce the model's `is_credit_note` to a real bool.
+
+    Sonnet usually returns native booleans, but occasionally emits the
+    strings "true"/"false" or "yes"/"no" — accept those too. Anything
+    unrecognized (including None / missing field) defaults to False,
+    which is the safe baseline since most supplier documents are invoices.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "ja", "1"}
+    return False
 
 
 def _float_or_none(value) -> float | None:

@@ -41,6 +41,8 @@ SAMPLE_OCR = {
     "qr_reference": "210000000003139471430009017",
     "payment_purpose": "Rechnung Mai 2026",
     "description": "Solarmodule und Montage",
+    "is_credit_note": False,
+    "commission": "PV-2026-014 Müller Wallisellen",
     "confidence": 0.92,
 }
 
@@ -124,6 +126,8 @@ def test_extract_returns_invoice_data_with_all_fields(client, calls):
     # IBAN spaces stripped + uppercased.
     assert result.iban == "CH9300762011623852957"
     assert result.qr_reference == "210000000003139471430009017"
+    assert result.is_credit_note is False
+    assert result.commission == "PV-2026-014 Müller Wallisellen"
     assert result.confidence == pytest.approx(0.92)
 
 
@@ -334,6 +338,74 @@ def test_extract_raises_when_balanced_object_is_malformed(client, calls):
     calls["next_response"] = _anthropic_response("Here: {supplier_name: 'X',}")
     with pytest.raises(AnthropicOcrError):
         client.extract(PDF_BYTES)
+
+
+def test_extract_returns_credit_note_true_when_model_says_so(client, calls):
+    """A Gutschrift document must surface as is_credit_note=True so the
+    downstream service can book it with a negative gross_total / "GS-"
+    numbering, not as a regular Rechnung."""
+    payload = {**SAMPLE_OCR, "is_credit_note": True}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    result = client.extract(PDF_BYTES)
+    assert result.is_credit_note is True
+
+
+def test_extract_defaults_credit_note_to_false_when_missing(client, calls):
+    """Missing / null / unrecognized values default to False — most supplier
+    documents are regular invoices, so False is the safe baseline."""
+    payload = {k: v for k, v in SAMPLE_OCR.items() if k != "is_credit_note"}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    assert client.extract(PDF_BYTES).is_credit_note is False
+
+    null_payload = {**SAMPLE_OCR, "is_credit_note": None}
+    calls["next_response"] = _anthropic_response(json.dumps(null_payload))
+    assert client.extract(PDF_BYTES).is_credit_note is False
+
+
+def test_extract_coerces_string_booleans_for_credit_note(client, calls):
+    """Sonnet usually returns native bool, but other models / a sloppy run
+    may emit 'true' / 'yes' / 'ja' — accept all three so we don't lose a
+    Gutschrift over JSON-formatting nitpicks."""
+    for raw in ("true", "True", "yes", "ja", "1"):
+        payload = {**SAMPLE_OCR, "is_credit_note": raw}
+        calls["next_response"] = _anthropic_response(json.dumps(payload))
+        assert client.extract(PDF_BYTES).is_credit_note is True, raw
+    for raw in ("false", "no", "nein", "", "maybe", "0"):
+        payload = {**SAMPLE_OCR, "is_credit_note": raw}
+        calls["next_response"] = _anthropic_response(json.dumps(payload))
+        assert client.extract(PDF_BYTES).is_credit_note is False, raw
+
+
+def test_extract_returns_commission_when_present(client, calls):
+    """Commission / Kommission / Objekt — used downstream to assign the
+    Moco project. The value is whatever the invoice prints; we don't
+    normalize it (free-form site identifier or address)."""
+    payload = {**SAMPLE_OCR, "commission": "Bauvorhaben Solaranlage Müller, Wallisellen"}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    result = client.extract(PDF_BYTES)
+    assert result.commission == "Bauvorhaben Solaranlage Müller, Wallisellen"
+
+
+def test_extract_commission_is_none_when_missing(client, calls):
+    """Many supplier invoices carry no commission/object reference. null
+    must round-trip as None so the service doesn't push an empty string
+    into Moco's project field."""
+    payload = {**SAMPLE_OCR, "commission": None}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    assert client.extract(PDF_BYTES).commission is None
+
+    no_field = {k: v for k, v in SAMPLE_OCR.items() if k != "commission"}
+    calls["next_response"] = _anthropic_response(json.dumps(no_field))
+    assert client.extract(PDF_BYTES).commission is None
+
+
+def test_extract_commission_whitespace_only_becomes_none(client, calls):
+    """A whitespace-only commission ('   ') is effectively absent — return
+    None so downstream Moco-project matching doesn't try to look up an
+    empty identifier."""
+    payload = {**SAMPLE_OCR, "commission": "   "}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    assert client.extract(PDF_BYTES).commission is None
 
 
 def test_constructor_accepts_custom_model_override(calls):
