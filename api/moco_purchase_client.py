@@ -57,6 +57,20 @@ class MocoPurchaseClient:
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
 
+    def delete_purchase_draft(self, purchase_id: int) -> None:
+        """DELETE /purchases/drafts/{id} — remove a draft purchase.
+
+        The OCR service calls this after successfully creating a real
+        purchase from the draft, so the operator doesn't have to clean
+        up duplicates manually in Moco's UI. A 404 is treated as "already
+        gone" (idempotent) and swallowed; other failures propagate so
+        the caller can log + alert.
+        """
+        url = f"{self._base_url}/purchases/drafts/{purchase_id}"
+        req = urlrequest.Request(url, method="DELETE", headers=self._auth_headers)
+        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS):
+            return
+
     def list_vat_codes(self) -> list[dict]:
         """GET /vat_code_purchases — list the VAT codes valid on items.
 

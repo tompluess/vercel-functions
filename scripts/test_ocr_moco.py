@@ -311,10 +311,7 @@ def main() -> int:
         email_from=draft.get("email_from"),
         email_body=draft.get("email_body"),
     )
-    ocr_comment = _format_ocr_comment(
-        invoice, draft_id=args.draft_id,
-        source_account_url=subdomain,
-    )
+    ocr_comment = _format_ocr_comment(invoice)
     _print_section("POST /purchases payload (base64 blob elided)")
     _print_payload_summary(payload)
     # The service posts these as two separate Moco comments. Render each

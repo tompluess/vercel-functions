@@ -59,6 +59,28 @@ def test_get_purchase_draft_hits_drafts_url_with_token_auth(client, calls):
     assert headers["authorization"] == "Token token=test_source_key"
 
 
+def test_delete_purchase_draft_issues_delete_to_drafts_url(client, calls):
+    """DELETE /purchases/drafts/{id} — called by the OCR service after a
+    successful real-purchase create so the operator doesn't have to
+    clean up duplicates in Moco's UI."""
+    calls["next_response"] = b""
+    client.delete_purchase_draft(3001069)
+    call = calls["calls"][0]
+    assert call["url"] == "https://solar.mocoapp.com/api/v1/purchases/drafts/3001069"
+    assert call["method"] == "DELETE"
+    headers = {k.lower(): v for k, v in call["headers"].items()}
+    assert headers["authorization"] == "Token token=test_source_key"
+
+
+def test_delete_purchase_draft_propagates_http_errors(client, calls):
+    """A 404 from DELETE (e.g. already deleted on a replay) bubbles up;
+    the service then maps it to a silent idempotent success — but the
+    transport layer stays dumb."""
+    calls["next_status"] = 404
+    with pytest.raises(urlerror.HTTPError):
+        client.delete_purchase_draft(3001069)
+
+
 def test_get_purchase_draft_propagates_http_errors(client, calls):
     """A 403 on the wrong URL space or a 404 must bubble — the validation
     script + the handler need to see the status to decide retry semantics."""

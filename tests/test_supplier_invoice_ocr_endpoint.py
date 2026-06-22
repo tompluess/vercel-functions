@@ -124,6 +124,9 @@ def stub_pipeline(monkeypatch):
                 return FakeUrlopenResponse(json.dumps(created).encode())
             if method == "POST" and url.endswith("/comments"):
                 return FakeUrlopenResponse(json.dumps({"id": 1}).encode())
+            if method == "DELETE" and "/purchases/drafts/" in url:
+                # Service auto-deletes the draft after a successful create.
+                return FakeUrlopenResponse(b"")
             raise AssertionError(f"unexpected Moco request: {method} {url}")
 
         raise AssertionError(f"unexpected request: {method} {url}")
@@ -176,6 +179,11 @@ def test_happy_path_creates_real_purchase_with_attachment(client, stub_pipeline)
     # Base64-decoding the file blob recovers the original PDF bytes.
     decoded = base64.b64decode(payload["file"]["base64"])
     assert decoded == b"%PDF-1.4 fake-test-pdf"
+    # The original draft is auto-deleted after the create succeeds.
+    delete_calls = [c for c in stub_pipeline["calls"]
+                    if c[0] == "DELETE"
+                    and c[1].endswith("/api/v1/purchases/drafts/3001069")]
+    assert len(delete_calls) == 1
 
 
 def test_supplier_not_found_omits_company_id(client, stub_pipeline):

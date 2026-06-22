@@ -153,6 +153,7 @@ class SupplierInvoiceOcrService:
         if new_purchase_id:
             self._post_summary_comments(new_purchase_id, invoice,
                                         draft_id, body)
+            self._delete_draft_after_create(draft_id, new_purchase_id)
 
         self._notify_outcome(new_purchase_id, draft_id, invoice)
 
@@ -297,11 +298,7 @@ class SupplierInvoiceOcrService:
                 logger.exception("ocr: email-source comment failed "
                                  "purchase_id=%s", purchase_id)
 
-        ocr_text = _format_ocr_comment(
-            invoice,
-            draft_id=draft_id,
-            source_account_url=self._source_account_url,
-        )
+        ocr_text = _format_ocr_comment(invoice)
         try:
             self._purchases.post_comment(purchase_id, ocr_text)
         except Exception:
@@ -344,6 +341,55 @@ class SupplierInvoiceOcrService:
     def _notify(self, text: str) -> None:
         if self._telegram:
             self._telegram.notify(text)
+
+    def _delete_draft_after_create(self, draft_id: int,
+                                   new_purchase_id: int) -> None:
+        """Remove the original draft once a real purchase has been created.
+
+        Best-effort: the new purchase is the authoritative side effect, so
+        a failed delete must NOT roll the sync back. A 404 is treated as
+        "already gone" (idempotent — a webhook replay would hit this) and
+        swallowed silently. Any other failure logs at warning and fires
+        a Telegram alert so the operator can clean up by hand; the sync
+        still reports success for the create.
+        """
+        try:
+            self._purchases.delete_purchase_draft(draft_id)
+        except urlerror.HTTPError as e:
+            if e.code == 404:
+                logger.info("ocr: draft %s already gone (delete idempotent)",
+                            draft_id)
+                return
+            err_body = "<unreadable>"
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            logger.warning("ocr: failed to delete draft %s after creating "
+                           "purchase %s: %s %s",
+                           draft_id, new_purchase_id, e.code, err_body)
+            self._notify_draft_delete_failed(draft_id, new_purchase_id,
+                                             e.code, err_body)
+        except Exception as e:
+            logger.exception("ocr: unexpected error deleting draft %s",
+                             draft_id)
+            self._notify_draft_delete_failed(draft_id, new_purchase_id,
+                                             None, str(e))
+
+    def _notify_draft_delete_failed(self, draft_id: int,
+                                    new_purchase_id: int,
+                                    status_code: int | None,
+                                    detail: str) -> None:
+        if not self._telegram:
+            return
+        status = f"HTTP {status_code}" if status_code else "Exception"
+        self._telegram.notify(
+            "⚠️ OCR-Draft konnte nach erfolgreichem Create nicht gelöscht "
+            f"werden — manuell entfernen:\n"
+            f"Draft: {self._draft_url(draft_id)}\n"
+            f"Neue Purchase: {self._purchase_url(new_purchase_id)}\n"
+            f"Detail: {status} {detail}"
+        )
 
     def _notify_moco_4xx(self, draft_id: int, status_code: int,
                          err_body: str) -> None:
@@ -629,8 +675,7 @@ def _today() -> str:
 EMAIL_BODY_MAX_CHARS = 2000
 
 
-def _format_ocr_comment(invoice: InvoiceData, *, draft_id: int,
-                        source_account_url: str) -> str:
+def _format_ocr_comment(invoice: InvoiceData) -> str:
     """HTML comment body for the 🤖 OCR-extraction summary.
 
     Posted as its own Moco comment (separate from the 📧 email-source
@@ -639,6 +684,10 @@ def _format_ocr_comment(invoice: InvoiceData, *, draft_id: int,
     bodies: `div, strong, em, u, pre, ul, ol, li, br` (everything else
     is stripped). Plain-text newlines are NOT preserved, so structure
     via `<br>` and `<ul>`.
+
+    No back-link to the original draft is included — the service
+    auto-deletes the draft after the create succeeds (see
+    `_delete_draft_after_create`).
     """
     parts: list[str] = []
     confidence_pct = f"{invoice.confidence:.0%}"
@@ -667,12 +716,10 @@ def _format_ocr_comment(invoice: InvoiceData, *, draft_id: int,
     if fields:
         parts.append("<ul>" + "".join(fields) + "</ul>")
 
-    draft_link = (f"https://{source_account_url}.mocoapp.com"
-                  f"/purchases/drafts/{draft_id}")
-    parts.append(
-        f"Original-Draft: {escape(draft_link)} "
-        "(kann nach Freigabe gelöscht werden)"
-    )
+    # Original draft is auto-deleted by `_delete_draft_after_create` once
+    # we know the new purchase landed, so no back-link is needed in the
+    # comment. (If the delete fails, the operator gets a separate
+    # Telegram alert with both URLs.)
     parts.append(
         "<strong>⚠️ Bitte Felder prüfen und freigeben.</strong>"
     )

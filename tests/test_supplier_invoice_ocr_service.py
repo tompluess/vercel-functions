@@ -82,6 +82,8 @@ class FakePurchaseClient:
         self.create_error: Exception | None = None
         self.comments: list[tuple[int, str]] = []
         self.comment_error: Exception | None = None
+        self.deleted_drafts: list[int] = []
+        self.delete_draft_error: Exception | None = None
         # Default vat-code list covers the typical Swiss rates so most
         # tests don't need to override it. Shape mirrors the real Moco
         # /vat_code_purchases response: id, tax (in percent), code, active.
@@ -102,6 +104,11 @@ class FakePurchaseClient:
             raise self.create_error
         self.creates.append(payload)
         return {"id": self.next_create_id, **payload}
+
+    def delete_purchase_draft(self, draft_id: int) -> None:
+        if self.delete_draft_error:
+            raise self.delete_draft_error
+        self.deleted_drafts.append(draft_id)
 
     def post_comment(self, purchase_id: int, text: str) -> dict:
         if self.comment_error:
@@ -657,6 +664,86 @@ def test_vat_code_supplier_get_company_failure_falls_through_to_account_default(
     assert purchases.creates[0]["items"][0]["vat_code_id"] == 99
 
 
+# --- draft auto-delete ------------------------------------------------------
+
+def test_draft_is_deleted_after_successful_create():
+    """Once the real purchase is created, the original draft is no longer
+    needed — auto-delete to avoid duplicates in Moco's UI."""
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases)
+    s.process("create", {"id": 3001069, "file_url": "https://x/y.pdf"})
+    assert purchases.deleted_drafts == [3001069]
+
+
+def test_draft_is_not_deleted_when_create_fails_with_4xx():
+    """If POST /purchases 422'd (silent-skip path), the draft must stay
+    so the operator can investigate. Auto-delete only on success."""
+    import io
+    purchases = FakePurchaseClient()
+    purchases.create_error = urlerror.HTTPError(
+        "https://x", 422, "boom", {}, fp=io.BytesIO(b"detail"),
+    )
+    s = build_service(purchases=purchases)
+    s.process("create", {"id": 3001069, "file_url": "https://x/y.pdf"})
+    assert purchases.deleted_drafts == []
+
+
+def test_draft_404_on_delete_is_silently_idempotent():
+    """A 404 from DELETE /purchases/drafts/{id} means the draft is
+    already gone (replay, race) — swallow silently, no Telegram noise."""
+    purchases = FakePurchaseClient()
+    purchases.delete_draft_error = urlerror.HTTPError(
+        "https://x", 404, "not found", {}, fp=None,
+    )
+    tg = FakeTelegram()
+    s = build_service(purchases=purchases, telegram=tg)
+    result = s.process("create", {"id": 3001069,
+                                  "file_url": "https://x/y.pdf"})
+    # Sync still returns success — create succeeded.
+    assert "skipped" not in result
+    # Only the success notification fired; no draft-delete-failed alert.
+    assert all("nicht gelöscht" not in m for m in tg.messages)
+
+
+def test_draft_non_404_delete_failure_alerts_but_keeps_sync_ok():
+    """A 500 / other 4xx from delete is unexpected — alert via Telegram
+    with both URLs so the operator can clean up, but DON'T roll the
+    create back (the new purchase is the authoritative side effect)."""
+    import io
+    purchases = FakePurchaseClient()
+    purchases.delete_draft_error = urlerror.HTTPError(
+        "https://x", 500, "moco down", {},
+        fp=io.BytesIO(b"server error"),
+    )
+    purchases.next_create_id = 4001234
+    tg = FakeTelegram()
+    s = build_service(purchases=purchases, telegram=tg)
+    result = s.process("create", {"id": 3001069,
+                                  "file_url": "https://x/y.pdf"})
+    # Create still succeeded (authoritative side effect).
+    assert result["purchase_id"] == 4001234
+    # And the dedicated alert mentioning BOTH URLs fired.
+    alerts = [m for m in tg.messages if "nicht gelöscht" in m]
+    assert len(alerts) == 1
+    assert "purchases/drafts/3001069" in alerts[0]
+    assert "purchases/4001234" in alerts[0]
+    assert "HTTP 500" in alerts[0]
+
+
+def test_draft_delete_unexpected_exception_alerts():
+    """Defensive: a non-HTTPError (URLError / arbitrary exception)
+    during delete still produces a Telegram alert so the operator
+    finds out — but doesn't fail the sync."""
+    purchases = FakePurchaseClient()
+    purchases.delete_draft_error = RuntimeError("boom")
+    tg = FakeTelegram()
+    s = build_service(purchases=purchases, telegram=tg)
+    result = s.process("create", {"id": 3001069,
+                                  "file_url": "https://x/y.pdf"})
+    assert "skipped" not in result
+    assert any("nicht gelöscht" in m for m in tg.messages)
+
+
 # --- comment + telegram routing --------------------------------------------
 
 def test_comment_text_includes_displayed_fields_and_draft_backlink():
@@ -673,7 +760,8 @@ def test_comment_text_includes_displayed_fields_and_draft_backlink():
     assert "CHF 1234.50" in text
     assert "R-2026-042" in text
     assert "Bauvorhaben Müller" in text
-    assert "purchases/drafts/3001069" in text   # draft back-link
+    # No draft back-link — the draft is auto-deleted after successful create.
+    assert "purchases/drafts/" not in text
     assert "Bitte Felder prüfen" in text
 
 
