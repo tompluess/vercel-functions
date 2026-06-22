@@ -150,7 +150,7 @@ def client(set_env, stub_pipeline):
 
 def test_happy_path_creates_real_purchase_with_attachment(client, stub_pipeline):
     raw = json.dumps(WEBHOOK_BODY).encode()
-    headers = signed_headers(raw, target="supplier-invoice-ocr",
+    headers = signed_headers(raw, target="Purchase::Draft",
                              event="create")
     resp = client.post("/api/supplier-invoice-ocr", content=raw,
                        headers=headers)
@@ -181,7 +181,7 @@ def test_happy_path_creates_real_purchase_with_attachment(client, stub_pipeline)
 def test_supplier_not_found_omits_company_id(client, stub_pipeline):
     stub_pipeline["suppliers"] = []
     raw = json.dumps(WEBHOOK_BODY).encode()
-    headers = signed_headers(raw, target="supplier-invoice-ocr",
+    headers = signed_headers(raw, target="Purchase::Draft",
                              event="create")
     resp = client.post("/api/supplier-invoice-ocr", content=raw,
                        headers=headers)
@@ -196,7 +196,7 @@ def test_supplier_not_found_omits_company_id(client, stub_pipeline):
 
 def test_rejects_wrong_target(client):
     raw = json.dumps(WEBHOOK_BODY).encode()
-    headers = signed_headers(raw, target="not-ocr", event="create")
+    headers = signed_headers(raw, target="not-the-right-target", event="create")
     resp = client.post("/api/supplier-invoice-ocr", content=raw,
                        headers=headers)
     assert resp.status_code == 422
@@ -205,7 +205,7 @@ def test_rejects_wrong_target(client):
 
 def test_rejects_bad_event(client):
     raw = json.dumps(WEBHOOK_BODY).encode()
-    headers = signed_headers(raw, target="supplier-invoice-ocr",
+    headers = signed_headers(raw, target="Purchase::Draft",
                              event="delete")
     resp = client.post("/api/supplier-invoice-ocr", content=raw,
                        headers=headers)
@@ -214,7 +214,7 @@ def test_rejects_bad_event(client):
 
 def test_rejects_bad_signature(client):
     raw = json.dumps(WEBHOOK_BODY).encode()
-    headers = signed_headers(raw, target="supplier-invoice-ocr",
+    headers = signed_headers(raw, target="Purchase::Draft",
                              event="create")
     headers["x-moco-signature"] = "deadbeef"
     resp = client.post("/api/supplier-invoice-ocr", content=raw,
@@ -228,7 +228,7 @@ def test_update_event_skips_without_calling_ocr(client, stub_pipeline):
     """`update` passes the dispatcher's event gate but the service's
     own gate skips OCR — returns ok=true with skipped='event_not_create'."""
     raw = json.dumps(WEBHOOK_BODY).encode()
-    headers = signed_headers(raw, target="supplier-invoice-ocr",
+    headers = signed_headers(raw, target="Purchase::Draft",
                              event="update")
     resp = client.post("/api/supplier-invoice-ocr", content=raw,
                        headers=headers)
@@ -241,7 +241,7 @@ def test_update_event_skips_without_calling_ocr(client, stub_pipeline):
 
 def test_no_file_url_is_skipped_with_telegram_alert(client, stub_pipeline):
     raw = json.dumps({"id": 3001069}).encode()    # no file_url
-    headers = signed_headers(raw, target="supplier-invoice-ocr",
+    headers = signed_headers(raw, target="Purchase::Draft",
                              event="create")
     resp = client.post("/api/supplier-invoice-ocr", content=raw,
                        headers=headers)

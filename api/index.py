@@ -233,11 +233,13 @@ async def supplier_invoice_ocr_webhook(request: Request) -> dict[str, Any]:
 
     target = request.headers.get("x-moco-target")
     event = request.headers.get("x-moco-event")
-    # The Moco webhook config carries an explicit `x-moco-target:
-    # supplier-invoice-ocr` so this endpoint doesn't collide with the
-    # bexio-expense-sync webhook (which also fires on Purchase events).
-    if target != "supplier-invoice-ocr":
-        logger.warning("rejecting: unexpected target=%s expected=supplier-invoice-ocr",
+    # Moco sets `x-moco-target` to the entity class — `Purchase::Draft`
+    # for draft-purchase events (distinct from `Purchase` which the
+    # bexio-expense-sync webhook listens to). So the two endpoints
+    # disambiguate naturally on the target header without needing a
+    # custom override on the webhook config.
+    if target != "Purchase::Draft":
+        logger.warning("rejecting: unexpected target=%s expected=Purchase::Draft",
                        target)
         raise HTTPException(422, f"unexpected_target: {target}")
     if event not in ("create", "update"):
