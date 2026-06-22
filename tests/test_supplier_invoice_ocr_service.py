@@ -1030,6 +1030,56 @@ def test_html_detection_doesnt_misfire_on_plain_text_with_angle_brackets():
     assert "&lt; 5%" in text
 
 
+def test_email_body_whitespace_noise_is_normalized():
+    """Regression: Outlook / webmail forwards arrive with CRLF runs,
+    tab indentation, soft hyphens, zero-width chars, non-breaking
+    spaces — all junk that drowns the actual content in the Moco
+    comment. Normalize before posting (and the truncation marker should
+    reflect the cleaned length, not the pre-normalization noise length)."""
+    # Mirrors the user-reported sample: CRLF + tabs at the top, then
+    # the actual content with zero-width / non-breaking / soft-hyphen
+    # noise sprinkled in.
+    noisy = (
+        "\r\n\t\t\r\n\t\t\r\n      \r\n        \r\n        "
+        "OrderInvoiceSending\r\n\t\t\t\t\r\n\t\t\t\t\r\n      \r\n"
+        "‌Offene‍ ​Rechnungen\xad\xa0 "
+    )
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases)
+    s.process("create", {
+        "id": 1, "file_url": "https://x/y.pdf",
+        "email_from": "x@y", "email_body": noisy,
+    })
+    _, text = purchases.comments[0]
+    # No CRLF, no tab runs, no zero-width chars, no soft hyphen surviving.
+    assert "\r" not in text
+    assert "\t" not in text
+    assert "​" not in text and "‌" not in text
+    assert "‍" not in text and "\xad" not in text
+    # The actual content is intact and readable.
+    assert "OrderInvoiceSending" in text
+    assert "Offene Rechnungen" in text
+
+
+def test_email_body_unit_helper_collapses_blank_lines():
+    """Three+ consecutive blank lines collapse to one (paragraph break);
+    leading/trailing blanks are stripped."""
+    from api.supplier_invoice_ocr_service import _normalize_email_whitespace
+    raw = "\n\n\n  first  \n\n\n\nsecond\n   third\n\n\n"
+    cleaned = _normalize_email_whitespace(raw)
+    # One blank line max between paragraphs; leading/trailing blanks gone.
+    assert cleaned == "first\n\nsecond\nthird"
+
+
+def test_email_body_unit_helper_keeps_html_markup_intact():
+    """The normalizer collapses spaces but must not eat HTML tag chars;
+    forwarded HTML emails go through this step too."""
+    from api.supplier_invoice_ocr_service import _normalize_email_whitespace
+    raw = "\r\n  <div>Hello\xa0<strong>world</strong></div>\t\r\n"
+    cleaned = _normalize_email_whitespace(raw)
+    assert cleaned == "<div>Hello <strong>world</strong></div>"
+
+
 def test_email_body_is_truncated_when_huge():
     """Defensive: a multi-megabyte forwarded thread shouldn't bloat the
     Moco comment. Truncate to EMAIL_BODY_MAX_CHARS with a marker."""

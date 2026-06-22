@@ -758,11 +758,12 @@ def _format_email_source_comment(email_from: str | None,
     if email_from:
         parts.append(f"<strong>Von:</strong> {escape(email_from)}")
     if email_body:
-        body = email_body
+        body = _normalize_email_whitespace(email_body)
+        original_len = len(body)
         truncated = ""
         if len(body) > EMAIL_BODY_MAX_CHARS:
             body = body[:EMAIL_BODY_MAX_CHARS]
-            truncated = (f"\n[…gekürzt von {len(email_body)} auf "
+            truncated = (f"\n[…gekürzt von {original_len} auf "
                          f"{EMAIL_BODY_MAX_CHARS} Zeichen]")
         if _looks_like_html(body):
             rendered = _sanitize_html_for_moco(body)
@@ -787,6 +788,63 @@ _TAG_REWRITES = {
     "h1": "div", "h2": "div", "h3": "div",
     "h4": "div", "h5": "div", "h6": "div",
 }
+
+
+def _normalize_email_whitespace(body: str) -> str:
+    """Strip noise whitespace from a forwarded email body, keep structure.
+
+    Forwarded emails from Outlook / webmail clients often arrive with
+    massive runs of `\\r\\n\\t\\t…` indentation, soft-hyphen / zero-width
+    invisible chars sprinkled by email tracking, and stretches of
+    non-breaking spaces. Posting that verbatim into a Moco comment
+    drowns the actual content. This normalizer keeps the meaningful
+    structure (line breaks at sentence/paragraph boundaries, single
+    spaces inside text) but removes the noise:
+
+      - CRLF / CR → LF
+      - tabs → single space
+      - zero-width / soft-hyphen / BOM chars → removed
+      - non-breaking spaces / figure spaces → regular space
+      - runs of spaces → one space
+      - trailing spaces per line → stripped
+      - three or more blank lines → one blank line
+      - leading / trailing blank lines → stripped
+    """
+    if not body:
+        return body
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+    body = body.translate(str.maketrans({
+        "\u200B": "",       # ZERO WIDTH SPACE
+        "\u200C": "",       # ZERO WIDTH NON-JOINER (the `\u034F`-looking
+                          # combiner-glyph common in tracker-bloated mails)
+        "\u200D": "",       # ZERO WIDTH JOINER
+        "\uFEFF": "",       # BYTE ORDER MARK
+        "\u034F": "",       # COMBINING GRAPHEME JOINER (the `\u034f` glyph)
+        "\xAD":  "",       # SOFT HYPHEN
+        "\u2007": " ",      # FIGURE SPACE -> regular space
+        "\xA0":  " ",      # NO-BREAK SPACE -> regular space
+        "\t":    " ",
+    }))
+    # strip() per line: leading whitespace on a body line is almost always
+    # email-noise (Outlook tab indentation) — not deliberate code-block
+    # style. Run-of-spaces inside the line collapses to one first so
+    # `re.sub` doesn't have to fight `strip()`.
+    lines = [re.sub(r" +", " ", line).strip() for line in body.split("\n")]
+    out: list[str] = []
+    blank_run = 0
+    for line in lines:
+        if line:
+            out.append(line)
+            blank_run = 0
+        else:
+            blank_run += 1
+            if blank_run == 1:
+                out.append("")
+    while out and not out[0]:
+        out.pop(0)
+    while out and not out[-1]:
+        out.pop()
+    return "\n".join(out)
 
 
 def _looks_like_html(text: str) -> bool:

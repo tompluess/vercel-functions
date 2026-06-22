@@ -141,8 +141,14 @@ def _render_html_for_console(html: str) -> str:
     out = re.sub(r"<[^>]+>", "", out)
     # HTML entity decode (&amp; / &lt; / &gt; etc).
     out = unescape(out)
-    # Squash duplicate blank lines and trim.
-    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    # Forwarded HTML emails often render as a wall of single-space /
+    # &nbsp;-padded blank lines between content blocks (`<br>&nbsp;<br>`,
+    # `<div>&nbsp;</div>`). For the console preview we don't need that
+    # spacing — flatten whitespace-only lines (incl. non-breaking space
+    # from `&nbsp;` decode) to empty, then collapse any double+ newlines
+    # to a single newline. `[^\S\n\r]+` = any whitespace EXCEPT newlines.
+    out = re.sub(r"^[^\S\n\r]+$", "", out, flags=re.MULTILINE)
+    out = re.sub(r"\n{2,}", "\n", out).strip()
     return out
 
 
