@@ -459,12 +459,19 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
         item["vat_code_id"] = vat_code_id
 
     payment_method = _payment_method_for(invoice)
+    # "Gutschrift" alongside the standard OCR markers when the model
+    # identified a credit note — easy to filter in Moco's UI and a
+    # second visual cue for the reviewer (on top of the negative total
+    # and the comment warning).
+    tags = list(OCR_TAGS)
+    if invoice.is_credit_note:
+        tags.append("Gutschrift")
     payload: dict[str, Any] = {
         "date": invoice.invoice_date or _today(),
         "currency": invoice.currency or "CHF",
         "payment_method": payment_method,
         "title": title[:255],
-        "tags": list(OCR_TAGS),
+        "tags": tags,
         "items": [item],
         "file": {
             "filename": _attachment_filename(invoice, draft_id),

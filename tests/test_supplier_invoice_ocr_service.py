@@ -390,6 +390,26 @@ def test_credit_note_payload_uses_negative_total():
     assert purchases.creates[0]["items"][0]["total"] == -500.0
 
 
+def test_credit_note_adds_gutschrift_tag():
+    """Beyond the negative total + comment warning, a recognized
+    Gutschrift gets its own tag so the operator can filter for credit
+    notes in Moco's UI (`OCR` + `Review pending` + `Gutschrift`)."""
+    invoice = make_invoice(is_credit_note=True)
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["tags"] == ["OCR", "Review pending", "Gutschrift"]
+
+
+def test_regular_invoice_does_not_get_gutschrift_tag():
+    """Sanity check: a non-credit-note keeps only the standard OCR tags."""
+    invoice = make_invoice(is_credit_note=False)
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["tags"] == ["OCR", "Review pending"]
+
+
 def test_missing_total_falls_back_to_zero():
     """A model that couldn't extract the total still produces a valid Moco
     payload — `total: 0` is acceptable to Moco and prompts the reviewer
