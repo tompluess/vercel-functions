@@ -70,6 +70,10 @@ class InvoiceData:
     # purchase to the matching Moco project. Optional: many supplier
     # invoices don't carry one, and we don't want to invent a value.
     commission: str | None
+    # Delivery / shipping address ("Lieferadresse" / "Baustelle") —
+    # often the site address that pairs with the Kommission. Different
+    # from `supplier_address` (which is the supplier's own HQ).
+    delivery_address: str | None
     confidence: float
 
 
@@ -156,6 +160,12 @@ SYSTEM_PROMPT = (
     'site address printed on the invoice header or reference block (used '
     'downstream to assign the purchase to a Moco project). null if not '
     'explicitly present — do not infer from the supplier address.",\n'
+    '  "delivery_address": "string — Lieferadresse / Liefer-/Versandadresse / '
+    'Baustelle / Lieferort — the delivery or site address where the goods '
+    'or services were delivered, distinct from the supplier_address. '
+    'Often appears under a label like \\"Lieferadresse\\" or \\"Baustelle\\" '
+    'on the invoice. null if not explicitly present — do not reuse the '
+    'supplier_address as a guess.",\n'
     '  "confidence": "number — your overall extraction confidence 0.0–1.0"\n'
     "}"
 )
@@ -363,6 +373,7 @@ def _to_invoice_data(data: dict) -> InvoiceData:
         description=_str_or_none(data.get("description")),
         is_credit_note=_bool_or_false(data.get("is_credit_note")),
         commission=_str_or_none(data.get("commission")),
+        delivery_address=_str_or_none(data.get("delivery_address")),
         confidence=_float_or_none(data.get("confidence")) or 0.0,
     )
 

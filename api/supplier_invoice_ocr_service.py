@@ -708,6 +708,7 @@ def _format_ocr_comment(invoice: InvoiceData) -> str:
 
     fields: list[str] = []
     fields.append(_li("Kommission", invoice.commission))
+    fields.append(_li("Lieferadresse", invoice.delivery_address))
     fields.append(_li("Lieferant", invoice.supplier_name))
     fields.append(_li("Adresse", invoice.supplier_address))
     fields.append(_li(

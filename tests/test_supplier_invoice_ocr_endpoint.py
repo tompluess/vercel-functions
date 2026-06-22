@@ -32,6 +32,7 @@ SAMPLE_OCR = {
     "description": "Solarmodule und Montage",
     "is_credit_note": False,
     "commission": None,
+    "delivery_address": None,
     "confidence": 0.92,
 }
 

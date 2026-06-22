@@ -43,6 +43,7 @@ SAMPLE_OCR = {
     "description": "Solarmodule und Montage",
     "is_credit_note": False,
     "commission": "PV-2026-014 Müller Wallisellen",
+    "delivery_address": "Hauptstrasse 5, 8304 Wallisellen",
     "confidence": 0.92,
 }
 
@@ -128,6 +129,7 @@ def test_extract_returns_invoice_data_with_all_fields(client, calls):
     assert result.qr_reference == "210000000003139471430009017"
     assert result.is_credit_note is False
     assert result.commission == "PV-2026-014 Müller Wallisellen"
+    assert result.delivery_address == "Hauptstrasse 5, 8304 Wallisellen"
     assert result.confidence == pytest.approx(0.92)
 
 

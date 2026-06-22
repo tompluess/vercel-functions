@@ -36,6 +36,7 @@ def make_invoice(**overrides) -> InvoiceData:
         description="Solarmodule und Montage",
         is_credit_note=False,
         commission=None,
+        delivery_address=None,
         confidence=0.92,
     )
     base.update(overrides)
@@ -399,6 +400,38 @@ def test_credit_note_adds_gutschrift_tag():
     s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
     assert purchases.creates[0]["tags"] == ["OCR", "Review pending", "Gutschrift"]
+
+
+def test_comment_includes_delivery_address_after_kommission():
+    """OCR'd Lieferadresse (delivery / site address) lands in the OCR
+    comment right after Kommission so both project-context fields sit
+    together at the top."""
+    invoice = make_invoice(
+        commission="PV-2026-014",
+        delivery_address="Hauptstrasse 5, 8304 Wallisellen",
+    )
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    _, text = purchases.comments[0]
+    assert "Lieferadresse" in text
+    assert "Hauptstrasse 5, 8304 Wallisellen" in text
+    # Kommission appears before Lieferadresse appears before Lieferant.
+    pos_kommission = text.find("Kommission")
+    pos_lieferadresse = text.find("Lieferadresse")
+    pos_lieferant = text.find("Lieferant")
+    assert 0 <= pos_kommission < pos_lieferadresse < pos_lieferant
+
+
+def test_comment_omits_lieferadresse_when_not_extracted():
+    """If OCR couldn't find a Lieferadresse, the line drops out (no
+    empty `<li>Lieferadresse:</li>` placeholder)."""
+    invoice = make_invoice(delivery_address=None)
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    _, text = purchases.comments[0]
+    assert "Lieferadresse" not in text
 
 
 def test_regular_invoice_does_not_get_gutschrift_tag():
