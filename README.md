@@ -4,7 +4,7 @@ Serverless webhook handlers deployed to [Vercel](https://vercel.com), written in
 
 ## What's in here
 
-Four webhook receivers, all triggered by [Moco webhooks](https://github.com/hundertzehn/mocoapp-api-docs):
+Five webhook receivers, all triggered by [Moco webhooks](https://github.com/hundertzehn/mocoapp-api-docs):
 
 | Endpoint | Trigger | Sink |
 | --- | --- | --- |
@@ -12,6 +12,7 @@ Four webhook receivers, all triggered by [Moco webhooks](https://github.com/hund
 | `POST /api/bexio-expense-sync` | `Purchase:create / update` | [Bexio](https://www.bexio.com) supplier bill |
 | `POST /api/bexio-invoice-sync` | `Invoice:update` (status=sent) | Bexio customer invoice |
 | `POST /api/brevo-contact-sync` | `Contact:create / update` | [Brevo](https://www.brevo.com) contact (+ list) |
+| `POST /api/supplier-invoice-ocr` | `Purchase::Draft:create` | Real Moco purchase with OCR'd fields |
 
 ### `POST /api/moco-sync`
 
@@ -89,6 +90,23 @@ Receives Moco `Contact` webhooks (`create` + `update`) and mirrors the contact i
 - Both branches converge to: normalize and set the SMS attribute from `mobile_phone` (matches the n8n JS: keeps `+`/`00` prefixes, drops a single leading `0`, strips whitespace), and add the contact to the configured Brevo list (idempotent).
 - Failures on the SMS update or list-add are logged but do not fail the sync — the contact mutation is the authoritative outcome.
 
+### `POST /api/supplier-invoice-ocr`
+
+Receives Moco `Purchase::Draft:create` webhooks (drafts from Moco's email-import) and turns each one into a fully-populated **real** Moco purchase pre-filled with fields OCR'd from the attached PDF via [Claude Sonnet 4.6 Vision](https://docs.anthropic.com/en/docs/about-claude/models/overview). Moco drafts can't be PATCHed via the API, so the flow creates a fresh purchase and auto-deletes the original draft.
+
+- Downloads the PDF from the draft's signed `file_url` and runs OCR via `AnthropicOcrClient` → typed `InvoiceData` (date, due_date, supplier name/address, IBAN, QR-Referenz, totals, VAT rate, payment_purpose, description, commission, Lieferadresse, Gutschrift flag, confidence).
+- Looks up the supplier in `GET /companies?type=supplier&term=…` and links `company_id` only on a unique exact name match (case-insensitive). Ambiguity is left for the reviewer.
+- VAT-code resolved per invoice from `GET /vat_code_purchases` (active codes only). Priority: OCR `vat_rate` match → supplier company's default → account-wide default → omit + Moco 422.
+- IBAN safety: Moco's email-import populates `iban` / `reference` fields on the draft from its own QR-bill parser. The service prefers those over OCR (vision-OCR has been observed to mangle alphanumeric Swiss QR-IBANs like `CH22 3000 00DE …`). OCR results are mod-97 checksum-validated and nulled on failure. QR-IBAN check (IID `30000`–`31999`) gates the `bank_transfer_swiss_qr_esr` payment method — regular IBANs with a QR-reference fall back to `bank_transfer` and drop the reference (avoids Moco's `"ist keine QR-IBAN"` 422).
+- `POST /purchases` with the OCR'd fields, the PDF base64-embedded as `file: {filename, base64}`, and tags `["OCR", "Review pending"]` (plus `"Gutschrift"` for credit notes — the line-item total is also negated). `due_date` defaults to `invoice_date + 30 days` and weekend dates roll back to Friday.
+- Posts **two** Moco comments on the new purchase: 📧 `Email-Quelle` (sender + body when the draft carries `email_from` / `email_body`; whitespace-normalized; HTML emails sanitized to Moco's allowed tag subset) and 🤖 `OCR-Extraktion` (extracted fields + confidence). HTML-formatted, html-escaped values, capped at Moco's allowed tag subset (`div, strong, em, u, pre, ul, ol, li, br`).
+- Deletes the original draft after the create succeeds (`DELETE /purchases/drafts/{id}`). 404 is treated as idempotent; other failures alert via Telegram but don't roll the create back.
+- Confidence-routed Telegram alert: ✅ when ≥ 85%, ⚠️ when below threshold, ⚠️ Gutschrift warning that overrides the confidence path (the reviewer must check the sign).
+- **Bexio-sync interlock:** while the `Review pending` tag is on the purchase, `/api/bexio-expense-sync` silently skips it. Once the operator strips the tag in Moco's UI, the next `Purchase:update` webhook syncs to Bexio normally.
+- Moco 4xx is converted to a silent skip + Telegram alert (e.g. `POST /purchases 422 receipt_identifier: ist bereits vergeben` on a webhook replay) — the response stays 200 ok=true so Moco's delivery log doesn't go red on unrecoverable rejections.
+
+A dry-run / `--apply` CLI for validating against a real draft lives at [`scripts/test_ocr_moco.py`](scripts/test_ocr_moco.py).
+
 ## Architecture
 
 - [`api/index.py`](api/index.py) — FastAPI entrypoint. Parses the request, runs the auth pipeline, dispatches to the appropriate service. The three external-sink endpoints (two Bexio, one Brevo) share `_handle_moco_dispatch_webhook` so the auth/parse/error plumbing isn't duplicated.
@@ -101,6 +119,9 @@ Receives Moco `Contact` webhooks (`create` + `update`) and mirrors the contact i
 - [`api/brevo_api.py`](api/brevo_api.py) — `api-key`-auth Brevo (ex-Sendinblue) REST wrapper covering contact lookup/create/update and list-add. Maps 404 from the contact lookup to `None` so the service can branch without exceptions.
 - [`api/brevo_contact_sync_service.py`](api/brevo_contact_sync_service.py) — pure business logic for the Brevo flow (lookup → create-or-update → SMS → list add → optional cross-comment to Moco).
 - [`api/telegram_notifier.py`](api/telegram_notifier.py) — `TelegramNotifier`: best-effort `sendMessage` to a Telegram chat. Used for error/skip notifications; never raises (a Telegram outage won't change the HTTP response).
+- [`api/anthropic_ocr_client.py`](api/anthropic_ocr_client.py) — `AnthropicOcrClient`: thin wrapper around Anthropic's `POST /v1/messages` (Claude Sonnet 4.6 Vision). Sends a PDF as a base64 `document` content block, parses the JSON response into an `InvoiceData` dataclass. Robust parser tolerates `<think>`-style preamble (Sonnet sometimes reasons out loud when length-checked prompts fire); IBAN mod-97 validated; QR-Referenz strict 27-digit check.
+- [`api/moco_purchase_client.py`](api/moco_purchase_client.py) — `MocoPurchaseClient`: draft read + create real purchase + delete draft + list vat-code-purchases + comment on the source Moco account. Note the `drafts/` URL space — drafts live at `GET /purchases/drafts/{id}`, distinct from confirmed `GET /purchases/{id}`.
+- [`api/supplier_invoice_ocr_service.py`](api/supplier_invoice_ocr_service.py) — pure business logic for the OCR flow; orchestrates download → OCR → supplier lookup → VAT resolve → create → two comments → delete draft → confidence-routed Telegram.
 
 Everything uses `urllib` — no external HTTP client dependency.
 
@@ -177,6 +198,15 @@ Required environment variables (configure in the Vercel project, then `vercel en
 | `MOCO_SOURCE_API_KEY` | API token for the **source** Moco account (used to post the cross-link comment back) |
 | `BREVO_API_KEY` | Brevo API v3 key (sent as `api-key: …`) |
 | `BREVO_LIST_ID` | Numeric ID of the Brevo list every synced contact is added to |
+
+**Used by `/api/supplier-invoice-ocr`:**
+
+| Variable | Purpose |
+| --- | --- |
+| `MOCO_SOURCE_API_KEY` | API token for the **source** Moco account (read draft, list vat codes + suppliers, create the real purchase, post comments, delete draft) |
+| `ANTHROPIC_API_KEY` | Anthropic API key for the Claude Sonnet 4.6 Vision OCR call (`x-api-key` header) |
+
+The VAT code is resolved dynamically per invoice (OCR `vat_rate` → supplier company default → account-wide `default: true` flag in `/vat_code_purchases`), so there's no env-var default to configure.
 
 ## Author
 
