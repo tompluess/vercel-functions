@@ -152,6 +152,59 @@ def test_skips_when_no_company(service, bexio):
     assert bexio.calls == []  # no Bexio calls at all
 
 
+def test_skips_silently_when_purchase_carries_review_pending_tag(service, bexio,
+                                                                  source):
+    """Purchases tagged 'Review pending' come from the OCR auto-create
+    flow and aren't validated by a human yet. Sync would propagate OCR
+    mistakes (wrong supplier, wrong amount). Skip first thing, before
+    ANY Bexio or source-Moco I/O fires."""
+    body = {**load_fixture("purchase_with_iban.json"),
+            "tags": ["OCR", "Review pending"]}
+    result = service.sync(body)
+    assert result == {"skipped": "review_pending"}
+    assert bexio.calls == []
+    assert source.calls == []   # no source Moco reads either
+
+
+def test_review_pending_tag_match_is_case_insensitive(service, bexio):
+    """Operators might re-create the tag manually with different casing
+    ('review pending', 'REVIEW PENDING'). Match liberally so a hand-typed
+    variant still triggers the gate."""
+    for label in ["review pending", "Review Pending", "REVIEW PENDING",
+                  "  Review pending  "]:
+        body = {**load_fixture("purchase_with_iban.json"), "tags": [label]}
+        assert service.sync(body) == {"skipped": "review_pending"}, label
+        assert bexio.calls == []
+
+
+def test_other_tags_do_not_trigger_review_pending_skip(service, bexio, source):
+    """Only 'Review pending' is the gate — a purchase that's been
+    reviewed (tag stripped) but still carries the 'OCR' tag must sync
+    normally."""
+    body = {**load_fixture("purchase_with_iban.json"),
+            "tags": ["OCR", "Approved"]}
+    # Mirror the happy-path test's fakes so sync can proceed end-to-end.
+    bexio.contacts_by_name["FLYERALARM - RatePAY GmbH"] = [
+        {"id": 5001, "street_name": "Kasernenstrasse",
+         "house_number": "1", "postcode": "8004", "city": "Zürich"}
+    ]
+    bexio.accounts_by_no["6600"] = [{"id": 7700, "tax_id": 42}]
+    result = service.sync(body)
+    # Sync proceeds (no "skipped" key on success); a Bexio bill is created.
+    assert "skipped" not in result
+    assert any(c[0] == "create_bill" for c in bexio.calls)
+
+
+def test_review_pending_skip_works_when_tags_field_missing():
+    """Defensive: a Moco purchase without `tags` at all must NOT crash
+    the matcher (tags is optional in the API)."""
+    from api.bexio_expense_sync_service import _has_review_pending_tag
+    assert _has_review_pending_tag({}) is False
+    assert _has_review_pending_tag({"tags": None}) is False
+    assert _has_review_pending_tag({"tags": []}) is False
+    assert _has_review_pending_tag({"tags": "Review pending"}) is False  # not a list
+
+
 def test_skips_when_no_account(service, bexio):
     """The Moco expense must carry items[0].category.credit_account (or
     supplier_credit_number) to know which Bexio account to book against."""

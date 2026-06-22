@@ -58,6 +58,17 @@ class BexioExpenseSyncService:
         self._telegram = telegram
 
     def sync(self, body: dict) -> dict[str, Any]:
+        # "Review pending" is the marker the /api/supplier-invoice-ocr flow
+        # sets on auto-created purchases. Until a human strips the tag in
+        # Moco's UI, the data is unreviewed — sync to Bexio would propagate
+        # OCR mistakes (wrong supplier, wrong amount, wrong IBAN). Skip
+        # silently: no Telegram alert, just an INFO log. Moco gets ok=true
+        # so it doesn't retry the webhook either.
+        if _has_review_pending_tag(body):
+            logger.info("expense sync: skipped (Review pending tag) "
+                        "source_id=%s", body.get("id"))
+            return {"skipped": "review_pending"}
+
         company = body.get("company") or {}
         company_name = company.get("name")
         if not company_name:
@@ -384,6 +395,27 @@ class BexioExpenseSyncService:
 
 
 # --- helpers ----------------------------------------------------------------
+
+def _has_review_pending_tag(body: dict) -> bool:
+    """True if the Moco purchase carries the 'Review pending' tag.
+
+    Used as the very first gate in expense sync: the supplier-invoice-OCR
+    flow stamps newly auto-created purchases with `["OCR", "Review pending"]`
+    so they're easy to find in Moco's UI for human review. While that tag
+    is on the purchase, we don't propagate to Bexio (OCR mistakes would
+    book to wrong supplier/amount/IBAN). The operator strips the tag in
+    Moco once they've validated the fields — a subsequent Purchase:update
+    webhook then has no "Review pending" tag and sync proceeds normally.
+    Match is case-insensitive + whitespace-trimmed to absorb hand-typed
+    variants the operator might create.
+    """
+    tags = body.get("tags") or []
+    if not isinstance(tags, list):
+        return False
+    return any(isinstance(t, str)
+               and t.strip().casefold() == "review pending"
+               for t in tags)
+
 
 def _moco_iban(body: dict) -> str:
     """Moco-supplied IBAN with whitespace and other non-alphanumeric chars

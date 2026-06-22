@@ -1,11 +1,12 @@
 """
 Vercel Functions entrypoint.
 
-  GET  /                         — health check
-  POST /api/moco-sync            — Moco Activity webhook receiver (Moco -> Moco)
-  POST /api/bexio-expense-sync   — Moco Purchase webhook receiver (Moco -> Bexio bill)
-  POST /api/bexio-invoice-sync   — Moco Invoice webhook receiver (Moco -> Bexio invoice)
-  POST /api/brevo-contact-sync   — Moco Contact webhook receiver (Moco -> Brevo)
+  GET  /                          — health check
+  POST /api/moco-sync             — Moco Activity webhook receiver (Moco -> Moco)
+  POST /api/bexio-expense-sync    — Moco Purchase webhook receiver (Moco -> Bexio bill)
+  POST /api/bexio-invoice-sync    — Moco Invoice webhook receiver (Moco -> Bexio invoice)
+  POST /api/brevo-contact-sync    — Moco Contact webhook receiver (Moco -> Brevo)
+  POST /api/supplier-invoice-ocr  — Moco Purchase webhook receiver (PDF OCR -> Moco draft patch)
 
 This file is intentionally thin: it parses the request, delegates auth to
 `MocoWebhookValidator`, and hands the parsed body to the appropriate service.
@@ -19,15 +20,18 @@ from urllib import error as urlerror
 
 from fastapi import FastAPI, HTTPException, Request
 
+from api.anthropic_ocr_client import AnthropicOcrClient, AnthropicOcrError
 from api.bexio_api import BexioAPI
 from api.bexio_expense_sync_service import BexioExpenseSyncService
 from api.bexio_invoice_sync_service import BexioInvoiceSyncService
 from api.brevo_api import BrevoAPI
 from api.brevo_contact_sync_service import BrevoContactSyncService
 from api.moco_api import MocoAPI
+from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_sync_service import MocoSyncService, TargetNotFoundError
 from api.moco_webhook_validator import MocoWebhookValidator
 from api.source_moco_client import SourceMocoClient
+from api.supplier_invoice_ocr_service import SupplierInvoiceOcrService
 from api.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger("moco_sync")
@@ -55,6 +59,19 @@ REQUIRED_ENV_BEXIO_SYNC = [
 REQUIRED_ENV_BREVO_SYNC = [
     "MOCO_WEBHOOK_SECRET", "MOCO_SOURCE_ACCOUNT_URL",
     "MOCO_SOURCE_API_KEY", "BREVO_API_KEY", "BREVO_LIST_ID",
+    *REQUIRED_ENV_TELEGRAM,
+]
+
+# Supplier-invoice OCR is a Moco-only flow (no Bexio/Brevo). It needs:
+#   - the usual Moco auth (webhook secret + source-account creds),
+#   - the Anthropic key for the OCR call.
+# The VAT code is resolved dynamically per invoice (OCR vat_rate matched
+# against GET /vat_code_purchases, falling back to the supplier's default),
+# so there's no env-var default. MOCO_SOURCE_ACCOUNT_URL doubles as the
+# source subdomain (same value used by all the Moco-side clients).
+REQUIRED_ENV_SUPPLIER_INVOICE_OCR = [
+    "MOCO_WEBHOOK_SECRET", "MOCO_SOURCE_ACCOUNT_URL",
+    "MOCO_SOURCE_API_KEY", "ANTHROPIC_API_KEY",
     *REQUIRED_ENV_TELEGRAM,
 ]
 
@@ -197,6 +214,88 @@ async def brevo_contact_sync_webhook(request: Request) -> dict[str, Any]:
             list_id=int(cfg["BREVO_LIST_ID"]),
         ),
     )
+
+
+@app.post("/api/supplier-invoice-ocr")
+async def supplier_invoice_ocr_webhook(request: Request) -> dict[str, Any]:
+    """Enrich a Moco draft purchase with Claude-Vision OCR'd PDF fields.
+
+    Separate handler instead of reusing `_handle_moco_dispatch_webhook`
+    because this flow has its own error-mapping shape: an
+    `AnthropicOcrError` carries a `status_code` that splits the same way
+    as a `urlerror.HTTPError` (4xx → app error, 5xx → infra). Inlining
+    the auth/parse plumbing here keeps the OCR control flow self-contained
+    and avoids growing the shared helper a fourth axis of customization.
+    """
+    cfg = _require_env(REQUIRED_ENV_SUPPLIER_INVOICE_OCR)
+    raw = await _read_body(request)
+    _verify_moco_auth(cfg, request, raw)
+
+    target = request.headers.get("x-moco-target")
+    event = request.headers.get("x-moco-event")
+    # Moco sets `x-moco-target` to the entity class — `Purchase::Draft`
+    # for draft-purchase events (distinct from `Purchase` which the
+    # bexio-expense-sync webhook listens to). So the two endpoints
+    # disambiguate naturally on the target header without needing a
+    # custom override on the webhook config.
+    if target != "Purchase::Draft":
+        logger.warning("rejecting: unexpected target=%s expected=Purchase::Draft",
+                       target)
+        raise HTTPException(422, f"unexpected_target: {target}")
+    if event not in ("create", "update"):
+        logger.warning("rejecting: event_not_handled event=%s", event)
+        raise HTTPException(422, f"event_not_handled: {event}")
+
+    parsed = _parse_json(raw)
+    body = parsed.get("body") if isinstance(parsed.get("body"), dict) else parsed
+
+    notifier = _build_notifier(cfg)
+    service = SupplierInvoiceOcrService(
+        source_moco=SourceMocoClient(
+            subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+            api_key=cfg["MOCO_SOURCE_API_KEY"],
+        ),
+        purchase_client=MocoPurchaseClient(
+            subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+            api_key=cfg["MOCO_SOURCE_API_KEY"],
+        ),
+        ocr=AnthropicOcrClient(api_key=cfg["ANTHROPIC_API_KEY"]),
+        source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+        telegram=notifier,
+    )
+
+    try:
+        result = service.process(event, body)
+    except AnthropicOcrError as e:
+        # 4xx from Anthropic (invalid request, bad PDF, auth) → application
+        # error, alert + 200 ok=false so Moco doesn't retry. 5xx (overloaded,
+        # transient outage) → 502 so Moco retries; no Telegram to avoid
+        # spamming on flapping upstream. status_code=None means the model
+        # produced unparseable output — also app error (retry won't help).
+        detail = f"ocr_error: {e}"
+        if e.status_code is not None and e.status_code >= 500:
+            logger.error("anthropic 5xx: %s", e)
+            raise HTTPException(502, detail)
+        logger.error("anthropic error: %s", e)
+        return _app_error(notifier, request, event, body, detail)
+    except urlerror.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace")[:500]
+        logger.error("moco API error: %s %s", e.code, err_body)
+        detail = f"moco_error: {e.code} {err_body}"
+        if e.code >= 500:
+            raise HTTPException(502, detail)
+        return _app_error(notifier, request, event, body, detail)
+    except urlerror.URLError as e:
+        # Moco or signed-URL host unreachable — infrastructure, let Moco retry.
+        logger.error("upstream unreachable: %s", e)
+        raise HTTPException(502, "upstream_unreachable")
+    except Exception as e:
+        logger.exception("Exception: %s, body=%s", e, body)
+        return _app_error(notifier, request, event, body, f"internal_error: {e}")
+
+    logger.info("ocr sync event=%s source=%s result=%s",
+                event, body.get("id"), result)
+    return {"ok": True, "event": event, **result}
 
 
 async def _handle_moco_dispatch_webhook(

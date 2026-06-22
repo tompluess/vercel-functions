@@ -9,6 +9,8 @@ each class single-purpose (see CLAUDE.md).
 """
 
 import json
+from urllib import error as urlerror
+from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 
@@ -27,6 +29,46 @@ class SourceMocoClient:
                                  headers=self._auth_headers)
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
+
+    def search_suppliers(self, name: str) -> list[dict]:
+        """GET /companies?type=supplier&term=<name> — find candidate suppliers.
+
+        Server-side narrowing via `term`: Moco's company list supports a
+        `term` query that filters by name substring. We additionally
+        constrain `type=supplier` so customers can't accidentally be
+        linked as suppliers, then apply a client-side case-insensitive
+        **exact** match — `term` returns broader matches (substring /
+        prefix) and we don't want to auto-link `company_id` on a fuzzy
+        hit (a misassignment would silently skew supplier reporting).
+        Ambiguity (multiple exact matches) is left for the human reviewer.
+
+        Returns an empty list when nothing matches; 4xx/5xx propagate as
+        HTTPError so the caller can map them to the right retry semantics
+        (a 404 from `term=...` with no results is mapped to empty too).
+        """
+        if not name or not name.strip():
+            return []
+        term = name.strip()
+        # Moco's `type` filter is singular per the API docs
+        # (https://docs.mocoapp.com/api/docs/v1#tag/companies/GET/companies);
+        # `type=suppliers` silently returns the full list (no filter
+        # applied), `type=supplier` is what actually narrows it.
+        params = urlparse.urlencode({"type": "supplier", "term": term})
+        url = f"{self._base_url}/companies?{params}"
+        req = urlrequest.Request(url, headers=self._auth_headers)
+        try:
+            with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
+                data = json.loads(resp.read())
+        except urlerror.HTTPError as e:
+            if e.code == 404:
+                return []
+            raise
+        if not isinstance(data, list):
+            return []
+        target = term.casefold()
+        return [c for c in data
+                if isinstance(c, dict)
+                and (c.get("name") or "").strip().casefold() == target]
 
     def get_project(self, project_id: int) -> dict:
         req = urlrequest.Request(f"{self._base_url}/projects/{project_id}",
