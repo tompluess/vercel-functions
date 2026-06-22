@@ -903,16 +903,97 @@ def test_network_error_during_download_propagates():
         s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
 
 
-def test_create_purchase_error_propagates():
-    """If POST /purchases itself fails, the sync can't recover — surface
-    the error so the handler maps it to alert/retry."""
+def test_create_purchase_5xx_propagates():
+    """A 5xx from POST /purchases is infrastructure — propagate so the
+    endpoint maps it to HTTP 502 and Moco retries the webhook later."""
     purchases = FakePurchaseClient()
     purchases.create_error = urlerror.HTTPError(
-        "https://x", 422, "missing vat_code_id", {}, fp=None,
+        "https://x", 503, "moco down", {}, fp=None,
     )
     s = build_service(purchases=purchases)
     with pytest.raises(urlerror.HTTPError):
         s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+
+def test_create_purchase_4xx_is_silent_skip_with_telegram_alert():
+    """Regression: observed `POST /purchases 422 {"receipt_identifier":
+    ["ist bereits vergeben"]}` on webhook replays of an already-OCR'd
+    draft. A retry can't fix this — Moco itself enforces the unique
+    constraint. Convert to a silent skip: HTTP 200 ok=true so Moco's
+    webhook log stays clean, but a Telegram alert surfaces the
+    rejection to the operator with the draft deep-link."""
+    import io
+    purchases = FakePurchaseClient()
+    purchases.create_error = urlerror.HTTPError(
+        "https://x", 422, "Unprocessable Entity", {},
+        fp=io.BytesIO(b'{"receipt_identifier":["ist bereits vergeben"]}'),
+    )
+    tg = FakeTelegram()
+    s = build_service(purchases=purchases, telegram=tg)
+    result = s.process("create", {"id": 3001069,
+                                  "file_url": "https://x/y.pdf"})
+    assert result["skipped"] == "moco_rejected"
+    assert result["draft_id"] == 3001069
+    assert result["moco_status"] == 422
+    assert "ist bereits vergeben" in result["moco_error"]
+    # Telegram alert includes status, Moco's error body, and the
+    # draft URL so the operator can jump to it.
+    assert len(tg.messages) == 1
+    assert "HTTP 422" in tg.messages[0]
+    assert "ist bereits vergeben" in tg.messages[0]
+    assert "purchases/drafts/3001069" in tg.messages[0]
+    # No follow-up success comment / OCR-outcome alert fired — the
+    # purchase wasn't created.
+    assert purchases.comments == []
+
+
+def test_moco_4xx_during_supplier_search_is_silent_skip():
+    """4xx isn't only POST /purchases — a malformed `term` could also
+    422 the supplier search. Same silent-skip treatment so the whole
+    flow doesn't go down because of one Moco rejection."""
+    source = FakeSourceMoco()
+    source.search_error = urlerror.HTTPError(
+        "https://x", 400, "Bad Request", {}, fp=None,
+    )
+    tg = FakeTelegram()
+    purchases = FakePurchaseClient()
+    s = build_service(source_moco=source, purchases=purchases, telegram=tg)
+    # _lookup_supplier_company swallows the HTTPError internally → returns
+    # None → process continues to POST /purchases which succeeds. So this
+    # particular path actually does NOT 4xx-skip; document the boundary.
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert "skipped" not in result   # supplier-lookup failure is best-effort
+    assert len(purchases.creates) == 1
+
+
+def test_moco_4xx_during_pdf_download_is_silent_skip():
+    """A 4xx on the signed PDF download (expired link, auth glitch) is
+    also unfixable-by-retry within the webhook lifetime — same
+    silent-skip + Telegram pattern."""
+    source = FakeSourceMoco()
+    source.download_error = urlerror.HTTPError(
+        "https://x", 403, "Forbidden", {}, fp=None,
+    )
+    tg = FakeTelegram()
+    s = build_service(source_moco=source, telegram=tg)
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert result["skipped"] == "moco_rejected"
+    assert result["moco_status"] == 403
+    assert len(tg.messages) == 1
+    assert "HTTP 403" in tg.messages[0]
+
+
+def test_moco_4xx_skip_without_telegram_does_not_crash():
+    """Telegram is optional on the service. The 4xx-skip branch must
+    still return cleanly when telegram=None (unit-test convenience)."""
+    import io
+    purchases = FakePurchaseClient()
+    purchases.create_error = urlerror.HTTPError(
+        "https://x", 422, "boom", {}, fp=io.BytesIO(b"detail"),
+    )
+    s = build_service(purchases=purchases, telegram=None)
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert result["skipped"] == "moco_rejected"
 
 
 def test_comment_failure_does_not_undo_create():

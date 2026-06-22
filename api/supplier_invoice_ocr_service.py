@@ -48,6 +48,7 @@ import logging
 from dataclasses import replace
 from html import escape
 from typing import Any
+from urllib import error as urlerror
 
 from api.anthropic_ocr_client import (
     AnthropicOcrClient,
@@ -105,27 +106,45 @@ class SupplierInvoiceOcrService:
             )
             return {"skipped": "no_file_url", "draft_id": draft_id}
 
-        pdf_bytes = self._source_moco.download_file(file_url)
-        logger.info("ocr: downloaded PDF draft_id=%s bytes=%d",
-                    draft_id, len(pdf_bytes))
+        try:
+            pdf_bytes = self._source_moco.download_file(file_url)
+            logger.info("ocr: downloaded PDF draft_id=%s bytes=%d",
+                        draft_id, len(pdf_bytes))
 
-        invoice = self._ocr.extract(pdf_bytes)
-        logger.info("ocr: extracted draft_id=%s confidence=%.2f "
-                    "supplier=%r number=%r",
-                    draft_id, invoice.confidence,
-                    invoice.supplier_name, invoice.invoice_number)
-        invoice = _prefer_draft_payment_fields(invoice, body)
+            invoice = self._ocr.extract(pdf_bytes)
+            logger.info("ocr: extracted draft_id=%s confidence=%.2f "
+                        "supplier=%r number=%r",
+                        draft_id, invoice.confidence,
+                        invoice.supplier_name, invoice.invoice_number)
+            invoice = _prefer_draft_payment_fields(invoice, body)
 
-        company_id = self._lookup_supplier_company(invoice.supplier_name)
-        vat_code_id = self._resolve_vat_code_id(invoice, company_id)
+            company_id = self._lookup_supplier_company(invoice.supplier_name)
+            vat_code_id = self._resolve_vat_code_id(invoice, company_id)
 
-        payload = _build_create_payload(
-            invoice, pdf_bytes,
-            vat_code_id=vat_code_id,
-            company_id=company_id,
-            draft_id=draft_id,
-        )
-        created = self._purchases.create_purchase(payload)
+            payload = _build_create_payload(
+                invoice, pdf_bytes,
+                vat_code_id=vat_code_id,
+                company_id=company_id,
+                draft_id=draft_id,
+            )
+            created = self._purchases.create_purchase(payload)
+        except urlerror.HTTPError as e:
+            # 4xx from any Moco call (most commonly POST /purchases 422 for
+            # `receipt_identifier: ["ist bereits vergeben"]` on a duplicate)
+            # is an unfixable-by-retry condition. Treat as a silent skip:
+            # the OCR purchase isn't created, the operator gets a Telegram
+            # alert with the Moco error body, and Moco's webhook delivery
+            # log shows 200 ok=true so it doesn't keep retrying. 5xx still
+            # propagates so the endpoint maps it to 502 (Moco retries).
+            if not (400 <= e.code < 500):
+                raise
+            err_body = e.read().decode("utf-8", errors="replace")[:500]
+            logger.warning("ocr: Moco rejected request: %s %s",
+                           e.code, err_body)
+            self._notify_moco_4xx(draft_id, e.code, err_body)
+            return {"skipped": "moco_rejected", "draft_id": draft_id,
+                    "moco_status": e.code, "moco_error": err_body}
+
         new_purchase_id = created.get("id")
         logger.info("ocr: created purchase id=%s from draft=%s",
                     new_purchase_id, draft_id)
@@ -324,6 +343,25 @@ class SupplierInvoiceOcrService:
     def _notify(self, text: str) -> None:
         if self._telegram:
             self._telegram.notify(text)
+
+    def _notify_moco_4xx(self, draft_id: int, status_code: int,
+                         err_body: str) -> None:
+        """Telegram alert for a Moco 4xx that the silent-skip swallowed.
+
+        Without this the operator has no signal that the OCR purchase
+        didn't get created (the webhook response is 200 ok=true, and
+        Vercel logs are only checked when something feels off). The
+        message includes the deep-link back to the draft so the operator
+        can investigate from one click.
+        """
+        if not self._telegram:
+            return
+        self._telegram.notify(
+            "❌ OCR-Purchase nicht erstellt — Moco hat die Anfrage "
+            f"abgelehnt (HTTP {status_code})\n"
+            f"Draft: {self._draft_url(draft_id)}\n"
+            f"Detail: {err_body}"
+        )
 
     def _purchase_url(self, purchase_id: int) -> str:
         return (f"https://{self._source_account_url}.mocoapp.com"
