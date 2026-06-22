@@ -777,6 +777,10 @@ def test_comment_text_includes_displayed_fields_and_draft_backlink():
     _, text = purchases.comments[0]
     assert "Konfidenz: 92%" in text
     assert "FLYERALARM" in text
+    # Supplier address surfaces in the OCR comment (no dedicated Moco
+    # column for it on the purchase — the comment is the only place
+    # the reviewer sees what the model thought the address was).
+    assert "Alfred-Nobel-Str. 18, 97080 Würzburg" in text
     assert "CHF 1234.50" in text
     assert "R-2026-042" in text
     assert "Bauvorhaben Müller" in text

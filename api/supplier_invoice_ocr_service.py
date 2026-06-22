@@ -707,7 +707,9 @@ def _format_ocr_comment(invoice: InvoiceData) -> str:
         )
 
     fields: list[str] = []
+    fields.append(_li("Kommission", invoice.commission))
     fields.append(_li("Lieferant", invoice.supplier_name))
+    fields.append(_li("Adresse", invoice.supplier_address))
     fields.append(_li(
         "Betrag",
         (f"{invoice.currency or 'CHF'} {invoice.total_amount:.2f}"
@@ -718,7 +720,6 @@ def _format_ocr_comment(invoice: InvoiceData) -> str:
     fields.append(_li("Rechnungs-Nr", invoice.invoice_number))
     fields.append(_li("IBAN", invoice.iban))
     fields.append(_li("QR-Ref", invoice.qr_reference))
-    fields.append(_li("Kommission", invoice.commission))
     fields = [li for li in fields if li]
     if fields:
         parts.append("<ul>" + "".join(fields) + "</ul>")
