@@ -76,6 +76,33 @@ class SourceMocoClient:
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
 
+    def list_projects(self, *, limit: int = 200) -> list[dict]:
+        """GET /projects — list **active** projects on the source account.
+
+        Used by the batch validation script to build a Kommission-index for
+        `MocoProjectResolver`. Moco's listing is active-only by default; we
+        do not pass `include_archived` (the spec restricts matching to
+        active projects). Paginates with `per_page=100` until the last page
+        or `limit` is reached.
+        """
+        projects: list[dict] = []
+        page = 1
+        per_page = 100
+        while len(projects) < limit:
+            url = (f"{self._base_url}/projects"
+                   f"?per_page={per_page}&page={page}")
+            req = urlrequest.Request(url, headers=self._auth_headers)
+            with urlrequest.urlopen(req,
+                                    timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
+                batch = json.loads(resp.read())
+            if not isinstance(batch, list) or not batch:
+                break
+            projects.extend(batch)
+            if len(batch) < per_page:
+                break
+            page += 1
+        return projects[:limit]
+
     def post_comment(self, *, commentable_id: int, commentable_type: str,
                      text: str) -> dict:
         headers = {**self._auth_headers, "Content-Type": "application/json"}
