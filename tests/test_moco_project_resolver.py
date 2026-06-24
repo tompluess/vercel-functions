@@ -74,6 +74,17 @@ def test_resolve_matches_across_punctuation_and_descriptive_prefix():
     assert m.project["id"] == 1
 
 
+def test_resolve_noisy_ocr_result_substring_match():
+    """Regression: Noisy OCR Kommission should match a lengthy project name by substring.
+    """
+    projects = [_proj(1, "P25031 PVA & Batteriespeicher, Stroppelstrasse19, Untersiggenthal", None)]
+    r = MocoProjectResolver(projects)
+    m = r.resolve("Gutschrift zur AB 2025-2013338, Stroppelstrasse19_Untersiggenthal")
+    assert m.status == "matched"
+    assert m.tier == "token-overlap"
+    assert m.project["id"] == 1
+
+
 def test_resolve_exact_match_normalizes_whitespace(projects):
     r = MocoProjectResolver(projects)
     # The Garage Bühler kommission is " 2025-042 " (stored with padding);
