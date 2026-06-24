@@ -164,6 +164,60 @@ def test_create_purchase_propagates_422_for_invalid_payload(client, calls):
         client.create_purchase({"date": "2026-01-01"})
 
 
+# --- assign_item_to_project -------------------------------------------------
+
+def test_assign_item_to_project_posts_per_item_payload(client, calls):
+    """POST /purchases/{id}/assign_to_project with the documented body."""
+    calls["next_response"] = json.dumps({"id": 7655423}).encode()
+    result = client.assign_item_to_project(
+        4001234, 311936153, project_id=23345545,
+        notify_project_leader=False, billable=True, budget_relevant=True,
+        surcharge=True,
+    )
+    assert result == {"id": 7655423}
+    call = calls["calls"][0]
+    assert call["url"] == ("https://solar.mocoapp.com/api/v1/purchases/"
+                            "4001234/assign_to_project")
+    assert call["method"] == "POST"
+    assert call["payload"] == {
+        "item_id": 311936153,
+        "project_id": 23345545,
+        "notify_project_leader": False,
+        "billable": True,
+        "budget_relevant": True,
+        "surcharge": True,
+    }
+
+
+def test_assign_item_to_project_omits_expense_id_by_default(client, calls):
+    """When `expense_id` is not given, the field is omitted (Moco creates
+    a fresh expense on the project instead of linking to an existing one)."""
+    calls["next_response"] = b"{}"
+    client.assign_item_to_project(1, 2, project_id=3,
+                                   notify_project_leader=False,
+                                   billable=True, budget_relevant=True,
+                                   surcharge=True)
+    assert "expense_id" not in calls["calls"][0]["payload"]
+
+
+def test_assign_item_to_project_includes_expense_id_when_passed(client, calls):
+    calls["next_response"] = b"{}"
+    client.assign_item_to_project(1, 2, project_id=3,
+                                   notify_project_leader=False,
+                                   billable=True, budget_relevant=True,
+                                   surcharge=True, expense_id=42)
+    assert calls["calls"][0]["payload"]["expense_id"] == 42
+
+
+def test_assign_item_to_project_propagates_http_errors(client, calls):
+    calls["next_status"] = 422
+    with pytest.raises(urlerror.HTTPError):
+        client.assign_item_to_project(1, 2, project_id=3,
+                                       notify_project_leader=False,
+                                       billable=True, budget_relevant=True,
+                                       surcharge=True)
+
+
 # --- post_comment -----------------------------------------------------------
 
 def test_post_comment_uses_comments_endpoint_with_purchase_type(client, calls):

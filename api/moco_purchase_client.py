@@ -138,6 +138,40 @@ class MocoPurchaseClient:
             raw = resp.read()
         return json.loads(raw) if raw else {}
 
+    def assign_item_to_project(self, purchase_id: int, item_id: int,
+                                *, project_id: int,
+                                notify_project_leader: bool,
+                                billable: bool, budget_relevant: bool,
+                                surcharge: bool,
+                                expense_id: int | None = None) -> dict:
+        """POST /purchases/{id}/assign_to_project — link one line item.
+
+        Moco's docs require the assignment to be made per line item, so
+        callers loop. When `expense_id` is omitted Moco creates a fresh
+        expense on the project; passing one links to an existing expense
+        (we don't need that path yet).
+
+        Returns the assignment response (caller can ignore — the side
+        effect is the project link).
+        """
+        url = f"{self._base_url}/purchases/{purchase_id}/assign_to_project"
+        headers = {**self._auth_headers, "Content-Type": "application/json"}
+        payload: dict = {
+            "item_id": item_id,
+            "project_id": project_id,
+            "notify_project_leader": notify_project_leader,
+            "billable": billable,
+            "budget_relevant": budget_relevant,
+            "surcharge": surcharge,
+        }
+        if expense_id is not None:
+            payload["expense_id"] = expense_id
+        data = json.dumps(payload).encode()
+        req = urlrequest.Request(url, data=data, method="POST", headers=headers)
+        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
+            raw = resp.read()
+        return json.loads(raw) if raw else {}
+
     def post_comment(self, purchase_id: int, text: str) -> dict:
         """POST /comments — attach a comment to a purchase.
 

@@ -27,6 +27,7 @@ from api.bexio_invoice_sync_service import BexioInvoiceSyncService
 from api.brevo_api import BrevoAPI
 from api.brevo_contact_sync_service import BrevoContactSyncService
 from api.moco_api import MocoAPI
+from api.moco_project_resolver import MocoProjectResolver
 from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_sync_service import MocoSyncService, TargetNotFoundError
 from api.moco_webhook_validator import MocoWebhookValidator
@@ -250,11 +251,26 @@ async def supplier_invoice_ocr_webhook(request: Request) -> dict[str, Any]:
     body = parsed.get("body") if isinstance(parsed.get("body"), dict) else parsed
 
     notifier = _build_notifier(cfg)
+    source_moco = SourceMocoClient(
+        subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+        api_key=cfg["MOCO_SOURCE_API_KEY"],
+    )
+    # Build the Kommission→project resolver per request. One extra
+    # `GET /projects` call (~100ms) is acceptable to keep the resolver
+    # fresh: a project added in Moco between webhook fires would
+    # otherwise be invisible until the next deploy. A failed projects
+    # listing degrades gracefully — the resolver gets an empty index,
+    # every assignment becomes a no-op (no_match), but the OCR pipeline
+    # still produces the purchase.
+    try:
+        projects = source_moco.list_projects()
+    except Exception:
+        logger.exception("ocr: list_projects failed; project assignment "
+                         "disabled for this webhook")
+        projects = []
+    project_resolver = MocoProjectResolver(projects)
     service = SupplierInvoiceOcrService(
-        source_moco=SourceMocoClient(
-            subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
-            api_key=cfg["MOCO_SOURCE_API_KEY"],
-        ),
+        source_moco=source_moco,
         purchase_client=MocoPurchaseClient(
             subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
             api_key=cfg["MOCO_SOURCE_API_KEY"],
@@ -262,6 +278,7 @@ async def supplier_invoice_ocr_webhook(request: Request) -> dict[str, Any]:
         ocr=AnthropicOcrClient(api_key=cfg["ANTHROPIC_API_KEY"]),
         source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
         telegram=notifier,
+        project_resolver=project_resolver,
     )
 
     try:

@@ -348,6 +348,10 @@ def _process_draft(draft: dict, *,
         # than re-implementing) keeps batch and webhook in lockstep.
         service._post_summary_comments(new_purchase_id, invoice,
                                         draft_id, draft)
+        _, assign_warnings = service._assign_resolved_project(created, invoice)
+        if assign_warnings:
+            for w in assign_warnings:
+                _step(f"assign warning: {w}")
         service._delete_draft_after_create(draft_id, new_purchase_id)
         _step(f"created purchase id={new_purchase_id}")
     return Row(draft_id, new_purchase_id, invoice.supplier_name, matched,
@@ -545,7 +549,8 @@ def main() -> int:
     # usual.
     service = SupplierInvoiceOcrService(
         source_moco=source_moco, purchase_client=purchases, ocr=ocr,
-        source_account_url=subdomain, telegram=None)
+        source_account_url=subdomain, telegram=None,
+        project_resolver=resolver)
 
     rows: list[Row] = []
     for i, draft in enumerate(drafts, start=1):

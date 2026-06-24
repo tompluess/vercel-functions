@@ -8,6 +8,7 @@ from urllib import error as urlerror
 import pytest
 
 from api.anthropic_ocr_client import AnthropicOcrError, InvoiceData
+from api.moco_project_resolver import MocoProjectResolver
 from api.supplier_invoice_ocr_service import (
     CONFIDENCE_THRESHOLD,
     OCR_TAGS,
@@ -82,11 +83,19 @@ class FakePurchaseClient:
     def __init__(self):
         self.creates: list[dict] = []
         self.next_create_id: int = 4001234
+        self.next_item_id: int = 311936153
         self.create_error: Exception | None = None
         self.comments: list[tuple[int, str]] = []
         self.comment_error: Exception | None = None
         self.deleted_drafts: list[int] = []
         self.delete_draft_error: Exception | None = None
+        # Each entry: dict of kwargs passed to assign_item_to_project.
+        self.assigns: list[dict] = []
+        # When set, the assign call raises this. Use a list so individual
+        # per-item assignments can fail independently (one entry per call,
+        # consumed in order; None means succeed). When the list is empty
+        # every call succeeds.
+        self.assign_errors: list[Exception | None] = []
         # Default vat-code list covers the typical Swiss rates so most
         # tests don't need to override it. Shape mirrors the real Moco
         # /vat_code_purchases response: id, tax (in percent), code, active.
@@ -106,7 +115,17 @@ class FakePurchaseClient:
         if self.create_error:
             raise self.create_error
         self.creates.append(payload)
-        return {"id": self.next_create_id, **payload}
+        # Moco returns each item with a server-assigned id. Mirror that:
+        # the service's project-assign step iterates `items` and reads
+        # `item.id`, so the fake has to supply realistic ids on create.
+        echoed_items: list[dict] = []
+        for raw_item in payload.get("items") or []:
+            echoed = dict(raw_item)
+            echoed["id"] = self.next_item_id
+            self.next_item_id += 1
+            echoed_items.append(echoed)
+        echo = {**payload, "items": echoed_items}
+        return {"id": self.next_create_id, **echo}
 
     def delete_purchase_draft(self, draft_id: int) -> None:
         if self.delete_draft_error:
@@ -118,6 +137,25 @@ class FakePurchaseClient:
             raise self.comment_error
         self.comments.append((purchase_id, text))
         return {"id": 1}
+
+    def assign_item_to_project(self, purchase_id: int, item_id: int, *,
+                                project_id: int, notify_project_leader: bool,
+                                billable: bool, budget_relevant: bool,
+                                surcharge: bool,
+                                expense_id: int | None = None) -> dict:
+        # Pop one error (if any) from the queue per call so tests can fail
+        # individual items selectively. An empty queue → all succeed.
+        err = self.assign_errors.pop(0) if self.assign_errors else None
+        self.assigns.append({
+            "purchase_id": purchase_id, "item_id": item_id,
+            "project_id": project_id,
+            "notify_project_leader": notify_project_leader,
+            "billable": billable, "budget_relevant": budget_relevant,
+            "surcharge": surcharge, "expense_id": expense_id,
+        })
+        if err is not None:
+            raise err
+        return {"id": 7655423}
 
 
 class FakeOcr:
@@ -144,13 +182,15 @@ class FakeTelegram:
 
 
 def build_service(*, source_moco=None, purchases=None, ocr=None,
-                  telegram=None, source_account_url="solar"):
+                  telegram=None, source_account_url="solar",
+                  project_resolver=None):
     return SupplierInvoiceOcrService(
         source_moco=source_moco or FakeSourceMoco(),
         purchase_client=purchases or FakePurchaseClient(),
         ocr=ocr or FakeOcr(result=make_invoice()),
         source_account_url=source_account_url,
         telegram=telegram,
+        project_resolver=project_resolver,
     )
 
 
@@ -1573,3 +1613,112 @@ def test_comment_failure_does_not_undo_create():
     assert len(purchases.creates) == 1
     assert "purchase_id" in result
     assert tg.messages
+
+
+# --- project assignment (Kommission -> project) -----------------------------
+
+PROJECT_HALDENWEG = {"id": 23345545, "name": "Sanierung Haldenweg",
+                     "custom_properties": {"Kommission":
+                                            "#Haldenweg12_Jegensdorf"}}
+
+
+def _resolver_with(*projects):
+    return MocoProjectResolver(list(projects))
+
+
+def test_assign_runs_with_fixed_params_when_resolver_matches():
+    """Single-item purchase + Kommission resolves uniquely → one
+    assign_to_project call with the fixed param contract."""
+    ocr = FakeOcr(result=make_invoice(commission="PVA Haldenweg 12_Jegensdorf"))
+    purchases = FakePurchaseClient()
+    s = build_service(
+        purchases=purchases, ocr=ocr,
+        project_resolver=_resolver_with(PROJECT_HALDENWEG),
+    )
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert len(purchases.assigns) == 1
+    call = purchases.assigns[0]
+    assert call["purchase_id"] == purchases.next_create_id - 0  # the one just created
+    assert call["project_id"] == 23345545
+    assert call["notify_project_leader"] is False
+    assert call["billable"] is True
+    assert call["budget_relevant"] is True
+    assert call["surcharge"] is True
+    assert call["expense_id"] is None
+    # And the response surfaces what we resolved to.
+    assert result["assigned_project_id"] == 23345545
+    assert result["assigned_project_name"] == "Sanierung Haldenweg"
+
+
+def test_assign_skipped_when_no_resolver_wired():
+    """No resolver → no assign call, no extra fields in the response."""
+    ocr = FakeOcr(result=make_invoice(commission="something"))
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases, ocr=ocr)  # no project_resolver
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.assigns == []
+    assert result["assigned_project_id"] is None
+
+
+def test_assign_skipped_when_commission_does_not_match():
+    """OCR'd commission resolves to no_match → no assign, response carries None."""
+    ocr = FakeOcr(result=make_invoice(commission="totally-different-string"))
+    purchases = FakePurchaseClient()
+    s = build_service(
+        purchases=purchases, ocr=ocr,
+        project_resolver=_resolver_with(PROJECT_HALDENWEG),
+    )
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.assigns == []
+    assert result["assigned_project_id"] is None
+
+
+def test_assign_skipped_when_commission_is_ambiguous():
+    """Two projects share the Kommission → ambiguous tier, do not assign."""
+    other = {"id": 99, "name": "Other",
+             "custom_properties": {"Kommission": "shared-key"}}
+    twin = {"id": 100, "name": "Other2",
+            "custom_properties": {"Kommission": "shared-key"}}
+    ocr = FakeOcr(result=make_invoice(commission="shared-key"))
+    purchases = FakePurchaseClient()
+    s = build_service(
+        purchases=purchases, ocr=ocr,
+        project_resolver=_resolver_with(other, twin),
+    )
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.assigns == []
+
+
+def test_assign_skipped_when_commission_is_empty():
+    """OCR returned no commission → resolver reports `empty` → no assign."""
+    ocr = FakeOcr(result=make_invoice(commission=None))
+    purchases = FakePurchaseClient()
+    s = build_service(
+        purchases=purchases, ocr=ocr,
+        project_resolver=_resolver_with(PROJECT_HALDENWEG),
+    )
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.assigns == []
+
+
+def test_assign_failure_soft_fails_and_enriches_telegram():
+    """A 422 on assign_to_project must NOT fail the sync; the warning is
+    appended to the OCR-outcome Telegram alert."""
+    ocr = FakeOcr(result=make_invoice(commission="PVA Haldenweg 12_Jegensdorf"))
+    purchases = FakePurchaseClient()
+    purchases.assign_errors = [urlerror.HTTPError(
+        "https://x", 422, "boom", {}, fp=None,
+    )]
+    tg = FakeTelegram()
+    s = build_service(
+        purchases=purchases, ocr=ocr, telegram=tg,
+        project_resolver=_resolver_with(PROJECT_HALDENWEG),
+    )
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    # Sync still ok; the purchase exists.
+    assert result["purchase_id"] is not None
+    # Outcome alert was sent and was enriched with the warning.
+    assert tg.messages, "expected an outcome alert"
+    last = tg.messages[-1]
+    assert "Projektzuweisung teilweise fehlgeschlagen" in last
+    assert "HTTP 422" in last
