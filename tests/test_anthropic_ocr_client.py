@@ -238,6 +238,68 @@ def test_extract_treats_null_optional_fields_as_none(client, calls):
     assert result.vat_amount is None
 
 
+def test_extract_normalizes_creditor_reference_strips_spaces(client, calls):
+    """ISO 11649 SCOR is printed with spacing on Swiss bills
+    (`RF87 R003 2202 6060 70000 00000`). Normalize to the canonical
+    space-free uppercase form before sending to Moco's reference field."""
+    payload = {**SAMPLE_OCR,
+               "qr_reference": None,
+               "creditor_reference": "rf43 r003 2202 6060 70"}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    result = client.extract(PDF_BYTES)
+    assert result.creditor_reference == "RF43R0032202606070"
+
+
+def test_extract_nulls_creditor_reference_with_invalid_checksum(client, calls):
+    """A SCOR that fails mod-97 (one OCR-misread digit) gets dropped, same
+    safety rule as IBAN — better no reference than a wrong one routed at
+    the bank."""
+    payload = {**SAMPLE_OCR, "qr_reference": None,
+               "creditor_reference": "RF44R0032202606070"}   # cd flipped
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    result = client.extract(PDF_BYTES)
+    assert result.creditor_reference is None
+
+
+def test_extract_nulls_creditor_reference_without_rf_prefix(client, calls):
+    """A reference value that doesn't start with `RF` is not a SCOR — the
+    field is dropped rather than silently accepting an arbitrary string."""
+    payload = {**SAMPLE_OCR, "qr_reference": None,
+               "creditor_reference": "12345678"}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    result = client.extract(PDF_BYTES)
+    assert result.creditor_reference is None
+
+
+def test_extract_lifts_scor_out_of_payment_purpose(client, calls):
+    """Safety net: if the model puts a SCOR string into payment_purpose
+    instead of the dedicated creditor_reference field (older runs / prompt
+    drift), the parser detects the ISO 11649 pattern, lifts it to the
+    creditor_reference, and strips it out of payment_purpose so the Moco
+    purchase's info field doesn't carry a duplicate."""
+    payload = {**SAMPLE_OCR,
+               "qr_reference": None,
+               "creditor_reference": None,
+               "payment_purpose": "RF43 R003 2202 6060 70 "
+                                  "Rechnung Mai 2026"}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    result = client.extract(PDF_BYTES)
+    assert result.creditor_reference == "RF43R0032202606070"
+    assert result.payment_purpose == "Rechnung Mai 2026"
+
+
+def test_extract_leaves_payment_purpose_unchanged_when_no_scor(client, calls):
+    """When the payment_purpose carries plain text with no embedded SCOR
+    the lift is a no-op."""
+    payload = {**SAMPLE_OCR, "qr_reference": None,
+               "creditor_reference": None,
+               "payment_purpose": "Rechnung Mai 2026"}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    result = client.extract(PDF_BYTES)
+    assert result.creditor_reference is None
+    assert result.payment_purpose == "Rechnung Mai 2026"
+
+
 def test_extract_treats_empty_strings_as_none(client, calls):
     """Some models emit '' instead of null for missing fields."""
     payload = {**SAMPLE_OCR, "iban": "", "qr_reference": "   "}

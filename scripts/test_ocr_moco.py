@@ -293,7 +293,7 @@ def main() -> int:
     if vat_code_id is None and company_id is not None:
         try:
             full_company = source_moco.get_company(company_id)
-            vat_code_id = _supplier_default_vat_code_id(full_company)
+            vat_code_id = _supplier_default_vat_code_id(full_company, vat_codes)
             if vat_code_id is not None:
                 print(f"  → using supplier-default vat_code_id={vat_code_id}")
         except Exception as e:
