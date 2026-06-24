@@ -286,6 +286,11 @@ def _process_draft(draft: dict, *,
 
 SUPPLIER_MAX_CHARS = 32   # ample for typical Swiss supplier names, fits 80-col
 
+# Upper bound on how many drafts we fetch from Moco before sorting + applying
+# --max N. Fixed (not configurable) because 100 covers the realistic backlog
+# and keeps a single pagination request enough.
+DRAFT_FETCH_CAP = 100
+
 
 def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
     """Aligned five-column table on stdout.
@@ -388,15 +393,20 @@ def main() -> int:
     purchases = MocoPurchaseClient(subdomain=subdomain, api_key=moco_key)
     ocr = AnthropicOcrClient(api_key=anthropic_key, model=args.model)
 
-    print(f"Listing up to {args.max_drafts} drafts from "
+    # Always fetch the full draft pool (up to 100) so the --max N cap is
+    # applied to the freshest N AFTER newest-first sorting. Limiting the
+    # API call directly would just take whatever order Moco returns the
+    # first N in, which isn't guaranteed to be newest-first.
+    print(f"Listing drafts from "
           f"https://{subdomain}.mocoapp.com/api/v1/purchases/drafts …")
     try:
-        drafts = purchases.list_purchase_drafts(limit=args.max_drafts)
+        drafts = purchases.list_purchase_drafts(limit=DRAFT_FETCH_CAP)
     except Exception as e:
         print(f"Failed to list drafts: {e}", file=sys.stderr)
         return 3
-    drafts = _newest_first(drafts)
-    print(f"Got {len(drafts)} draft(s). "
+    drafts = _newest_first(drafts)[:args.max_drafts]
+    print(f"Got {len(drafts)} draft(s) (newest first, capped at --max="
+          f"{args.max_drafts}). "
           f"Mode: {'APPLY (real writes)' if args.apply else 'DRY-RUN'}")
 
     # Telegram intentionally NOT wired in. Batch runs touch dozens of drafts
