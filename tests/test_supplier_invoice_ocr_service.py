@@ -32,6 +32,7 @@ def make_invoice(**overrides) -> InvoiceData:
         # method branch fires. Non-QR-IBANs are exercised in dedicated tests.
         iban="CH4431999123000889012",
         qr_reference="210000000003139471430009017",
+        creditor_reference=None,
         payment_purpose="Rechnung Mai 2026",
         description="Solarmodule und Montage",
         is_credit_note=False,
@@ -284,6 +285,80 @@ def test_payment_method_falls_back_when_iban_is_not_qr_iban():
     assert payload["payment_method"] == "bank_transfer"
     assert payload["iban"] == "CH9300762011623852957"
     assert "reference" not in payload   # dropped — would 422 otherwise
+
+
+def test_creditor_reference_lands_in_purchase_reference_field():
+    """ISO 11649 SCOR (RF…) gets routed to the purchase's `reference` field
+    even on plain bank_transfer — Moco's reference column accepts both QR
+    and SCOR formats. Previously the SCOR ended up echoed in the info
+    column because the QR-only branch dropped it."""
+    invoice = make_invoice(
+        # Non-QR IBAN — plain bank_transfer path.
+        iban="CH9300762011623852957",
+        qr_reference=None,
+        creditor_reference="RF87R0032202606070000000",
+        payment_purpose="Rechnung Mai 2026",
+    )
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    payload = purchases.creates[0]
+    assert payload["payment_method"] == "bank_transfer"
+    assert payload["reference"] == "RF87R0032202606070000000"
+    # info still carries the human-readable Zahlungszweck, untouched.
+    assert payload["info"] == "Rechnung Mai 2026"
+
+
+def test_creditor_reference_in_payment_purpose_is_stripped_from_info():
+    """If the SCOR slipped into payment_purpose (older OCR runs) AND a
+    creditor_reference was independently extracted, the info field is
+    cleaned so the reviewer doesn't see the reference twice (once in the
+    dedicated reference field, once in info)."""
+    invoice = make_invoice(
+        iban="CH9300762011623852957",
+        qr_reference=None,
+        creditor_reference="RF87R0032202606070000000",
+        payment_purpose="RF87 R003 2202 6060 7000 0000 Rechnung Mai",
+    )
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    payload = purchases.creates[0]
+    assert payload["reference"] == "RF87R0032202606070000000"
+    assert payload["info"] == "Rechnung Mai"
+
+
+def test_qr_reference_takes_priority_over_creditor_reference_on_qr_iban():
+    """When both are extracted, the QR-bill path wins — QR-IBAN + 27-digit
+    reference is the canonical Swiss QR-bill signal."""
+    invoice = make_invoice(
+        # QR-IBAN from the happy-path fixture.
+        creditor_reference="RF87R0032202606070000000",
+    )
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    payload = purchases.creates[0]
+    assert payload["payment_method"] == "bank_transfer_swiss_qr_esr"
+    assert payload["reference"] == "210000000003139471430009017"
+
+
+def test_draft_reference_with_scor_overrides_ocr_creditor_reference():
+    """Same precedence rule as the QR-reference override: Moco's email-import
+    parser is authoritative for the Zahlteil. A SCOR string sitting in the
+    draft's `reference` field replaces whatever OCR guessed."""
+    invoice = make_invoice(
+        iban="CH9300762011623852957",
+        qr_reference=None,
+        # OCR guessed a different valid SCOR — should get overridden.
+        creditor_reference="RF18539007547034",
+    )
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf",
+                          "reference": "RF87 R003 2202 6060 7000 0000"})
+    payload = purchases.creates[0]
+    assert payload["reference"] == "RF87R0032202606070000000"
 
 
 def test_qr_iban_with_qr_reference_uses_qr_esr_payment_method():
@@ -640,6 +715,61 @@ def test_vat_code_falls_back_to_supplier_default_when_rate_missing():
                       ocr=FakeOcr(result=invoice))
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
     assert purchases.creates[0]["items"][0]["vat_code_id"] == 77
+
+
+def test_vat_code_falls_back_to_supplier_vat_tax_via_lookup():
+    """Per Moco's company docs the supplier's default purchase VAT lives
+    under `supplier_vat.tax` (percentage) — there's NO direct `vat_code_id`
+    on the company. Resolve the rate against `/vat_code_purchases` the
+    same way OCR's vat_rate is resolved."""
+    invoice = make_invoice(vat_rate=None)
+    source = FakeSourceMoco()
+    source.search_result = [{"id": 555, "name": "FLYERALARM"}]
+    source.companies[555] = {
+        "id": 555, "name": "FLYERALARM",
+        "supplier_vat": {"tax": 2.6},   # percentage as Moco emits it
+    }
+    purchases = FakePurchaseClient()
+    # FakePurchaseClient.vat_codes defaults include id=12 with tax=2.6.
+    s = build_service(source_moco=source, purchases=purchases,
+                      ocr=FakeOcr(result=invoice))
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["items"][0]["vat_code_id"] == 12
+
+
+def test_vat_code_supplier_vat_tax_zero_resolves_to_zero_rate_code():
+    """A supplier marked `supplier_vat.tax = 0.0` (tax-free) must
+    resolve to the 0% vat_code, not silently fall through to the
+    account default."""
+    invoice = make_invoice(vat_rate=None)
+    source = FakeSourceMoco()
+    source.search_result = [{"id": 555, "name": "X"}]
+    source.companies[555] = {"id": 555, "supplier_vat": {"tax": 0.0}}
+    purchases = FakePurchaseClient()
+    # vat_codes defaults: id=13, tax=0.0.
+    s = build_service(source_moco=source, purchases=purchases,
+                      ocr=FakeOcr(result=invoice))
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["items"][0]["vat_code_id"] == 13
+
+
+def test_vat_code_supplier_vat_tax_with_no_matching_code_falls_through():
+    """If `supplier_vat.tax` has no matching code (e.g. a foreign rate
+    that's not in the Swiss account's `/vat_code_purchases` list), fall
+    through to the account-wide default rather than getting stuck."""
+    invoice = make_invoice(vat_rate=None)
+    source = FakeSourceMoco()
+    source.search_result = [{"id": 555, "name": "X"}]
+    source.companies[555] = {"id": 555, "supplier_vat": {"tax": 19.0}}  # DE
+    purchases = FakePurchaseClient()
+    purchases.vat_codes = [
+        {"id": 11, "tax": 8.1, "active": True},
+        {"id": 99, "tax": 0.0, "active": True, "default": True},
+    ]
+    s = build_service(source_moco=source, purchases=purchases,
+                      ocr=FakeOcr(result=invoice))
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["items"][0]["vat_code_id"] == 99
 
 
 def test_vat_code_supplier_lookup_uses_alternate_field_name():

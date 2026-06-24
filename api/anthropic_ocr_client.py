@@ -56,6 +56,11 @@ class InvoiceData:
     currency: str | None
     iban: str | None
     qr_reference: str | None
+    # ISO 11649 SCOR (Structured Creditor Reference) — `RF<2 check digits><up
+    # to 21 alphanumerics>`. Used on plain (non-QR) bank transfers where the
+    # supplier wants payments reconciled against an invoice id. Distinct from
+    # `qr_reference` (Swiss QR-bill, exactly 27 digits, requires a QR-IBAN).
+    creditor_reference: str | None
     payment_purpose: str | None
     description: str | None
     # Gutschrift / Rechnung discriminator. Defaults to False (the common
@@ -146,7 +151,16 @@ SYSTEM_PROMPT = (
     '  "currency": "string — ISO 4217 (usually CHF)",\n'
     '  "iban": "string — IBAN without spaces, exactly 21 chars for CH, or null",\n'
     '  "qr_reference": "string — QR-Referenznummer, exactly 27 digits, or null",\n'
-    '  "payment_purpose": "string — Zahlungszweck/Mitteilung or null",\n'
+    '  "creditor_reference": "string — ISO 11649 SCOR / Structured Creditor '
+    'Reference, starting with \\"RF\\" followed by 2 check digits and up to '
+    '21 alphanumeric characters (e.g. \\"RF37 R003 2202 6060 7\\"). Used on '
+    'plain bank transfers (non-QR-bill). DISTINCT from qr_reference — never '
+    'put an RF-reference in qr_reference, never put a 27-digit QR-reference '
+    'in creditor_reference. Also do NOT echo this value into '
+    'payment_purpose. null if not printed on the invoice.",\n'
+    '  "payment_purpose": "string — Zahlungszweck/Mitteilung or null. Do '
+    'NOT include the QR-reference or creditor_reference here — they go in '
+    'their own fields.",\n'
     '  "description": "string — brief description of goods/services in '
     'GERMAN (auf Deutsch), max 80 characters. Concise enough to fit on '
     'one line in Moco\'s purchase title column.",\n'
@@ -356,6 +370,18 @@ def _to_invoice_data(data: dict) -> InvoiceData:
     0.0 when missing so a slightly off-spec response still produces a
     usable result that triggers manual review downstream.
     """
+    creditor_reference = _normalize_creditor_reference(
+        data.get("creditor_reference"))
+    payment_purpose = _str_or_none(data.get("payment_purpose"))
+    # Defensive lift: if the model put a SCOR reference into payment_purpose
+    # (older runs, or any prompt-drift) and didn't populate creditor_reference,
+    # extract it. The reference belongs in the dedicated reference field, not
+    # duplicated in info text.
+    if creditor_reference is None and payment_purpose:
+        lifted, payment_purpose = _lift_creditor_reference_from_purpose(
+            payment_purpose)
+        if lifted:
+            creditor_reference = lifted
     return InvoiceData(
         supplier_name=_str_or_none(data.get("supplier_name")),
         supplier_address=_str_or_none(data.get("supplier_address")),
@@ -369,7 +395,8 @@ def _to_invoice_data(data: dict) -> InvoiceData:
         currency=_str_or_none(data.get("currency")),
         iban=_normalize_iban(data.get("iban")),
         qr_reference=_normalize_qr_reference(data.get("qr_reference")),
-        payment_purpose=_str_or_none(data.get("payment_purpose")),
+        creditor_reference=creditor_reference,
+        payment_purpose=payment_purpose,
         description=_str_or_none(data.get("description")),
         is_credit_note=_bool_or_false(data.get("is_credit_note")),
         commission=_str_or_none(data.get("commission")),
@@ -473,6 +500,71 @@ def _normalize_iban(value) -> str | None:
                        value, cleaned)
         return None
     return cleaned
+
+
+SCOR_PREFIX = "RF"
+SCOR_MIN_LENGTH = 5    # "RF" + 2 check digits + at least 1 ref char
+SCOR_MAX_LENGTH = 25   # "RF" + 2 check digits + up to 21 ref chars
+
+
+def _normalize_creditor_reference(value) -> str | None:
+    """ISO 11649 SCOR (Structured Creditor Reference) normalized + validated.
+
+    Format: `RF<2 check digits><1..21 alphanumeric chars>`, total 5..25
+    characters. Strips whitespace, uppercases, then checks mod-97 using the
+    same algorithm as IBAN (rearrange first 4 chars to end, map letters
+    A=10..Z=35, must be ≡ 1 mod 97). Invalid / wrong length → None.
+
+    The model occasionally returns the reference with the printed spacing
+    (`"RF37 R003 2202 6060 7"`); the alnum-strip handles that. Anything
+    that survives is safe to put in Moco's `reference` field.
+    """
+    if value is None:
+        return None
+    cleaned = "".join(c for c in str(value) if c.isalnum()).upper()
+    if not cleaned.startswith(SCOR_PREFIX):
+        return None
+    if not (SCOR_MIN_LENGTH <= len(cleaned) <= SCOR_MAX_LENGTH):
+        return None
+    if not cleaned[2:4].isdigit():
+        return None
+    if not _iban_checksum_valid(cleaned):
+        logger.warning("OCR returned creditor_reference with invalid mod-97 "
+                       "checksum, nulling field. raw=%r normalized=%r",
+                       value, cleaned)
+        return None
+    return cleaned
+
+
+def _lift_creditor_reference_from_purpose(purpose: str) -> tuple[str | None, str | None]:
+    """If `purpose` contains an ISO 11649 SCOR string, extract it.
+
+    Returns `(scor_or_None, remaining_purpose_or_None)`. The remaining
+    purpose has the SCOR substring removed (and surrounding whitespace
+    collapsed) — duplicating it in the `info` field would just clutter the
+    Moco purchase. Only validated SCORs (mod-97 ok) are lifted; an
+    unrelated string starting with "RF" is left alone.
+    """
+    if not purpose:
+        return None, purpose
+    import re as _re
+    # SCOR printed form: "RF" + 2 digits + groups of uppercase-alphanumerics,
+    # often space-separated. Case-sensitive so the regex stops at the first
+    # lowercase character (otherwise IGNORECASE would let it greedily eat
+    # trailing prose like "RF87 ... 0000 Rechnung Mai" as one match and the
+    # subsequent length check would discard the whole capture).
+    match = _re.search(
+        r"\bRF\d{2}(?:\s*[A-Z0-9]+)+\b",
+        purpose,
+    )
+    if not match:
+        return None, purpose
+    candidate = _normalize_creditor_reference(match.group(0))
+    if candidate is None:
+        return None, purpose
+    remaining = (purpose[:match.start()] + purpose[match.end():]).strip()
+    remaining = _re.sub(r"\s{2,}", " ", remaining)
+    return candidate, (remaining or None)
 
 
 def _iban_checksum_valid(iban: str) -> bool:

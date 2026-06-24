@@ -55,6 +55,8 @@ from urllib import error as urlerror
 from api.anthropic_ocr_client import (
     AnthropicOcrClient,
     InvoiceData,
+    _lift_creditor_reference_from_purpose,
+    _normalize_creditor_reference,
     _normalize_iban,
     _normalize_qr_reference,
 )
@@ -217,7 +219,9 @@ class SupplierInvoiceOcrService:
                                  "id=%s", supplier_company_id)
                 company = None
             if company:
-                supplier_default = _supplier_default_vat_code_id(company)
+                supplier_default = _supplier_default_vat_code_id(
+                    company, vat_codes,
+                )
                 if supplier_default is not None:
                     logger.info("ocr: using supplier default vat_code_id=%s "
                                 "(company_id=%s)",
@@ -460,6 +464,8 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
         item["vat_code_id"] = vat_code_id
 
     payment_method = _payment_method_for(invoice)
+    reference_value, info_value = _resolve_reference_and_info(
+        invoice, payment_method)
     # "Gutschrift" alongside the standard OCR markers when the model
     # identified a credit note — easy to filter in Moco's UI and a
     # second visual cue for the reviewer (on top of the negative total
@@ -487,21 +493,58 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
         payload["receipt_identifier"] = invoice.invoice_number
     if invoice.iban:
         payload["iban"] = invoice.iban
-    # Reference is QR-bill-only: a 27-digit QR-reference under
-    # bank_transfer (no QR-IBAN) would either be rejected by Moco or
-    # interpreted as something else. Skip it on the non-QR-ESR branch.
-    if invoice.qr_reference and payment_method == "bank_transfer_swiss_qr_esr":
-        payload["reference"] = invoice.qr_reference
-    elif invoice.qr_reference and not _is_qr_iban(invoice.iban):
-        logger.warning("ocr: extracted qr_reference=%r but iban=%r is not a "
-                       "QR-IBAN — falling back to bank_transfer and dropping "
-                       "the reference", invoice.qr_reference, invoice.iban)
-    if invoice.payment_purpose:
-        payload["info"] = invoice.payment_purpose
+    if reference_value:
+        payload["reference"] = reference_value
+    if info_value:
+        payload["info"] = info_value
     if company_id is not None:
         payload["company_id"] = company_id
 
     return payload
+
+
+def _resolve_reference_and_info(invoice: InvoiceData,
+                                payment_method: str) -> tuple[str | None, str | None]:
+    """Pick the value for Moco's `reference` field and adjust `info` to match.
+
+    Moco's purchase `reference` field accepts two distinct creditor-reference
+    formats, each tied to a payment method:
+      - QR-bill (Swiss): 27-digit numeric `qr_reference`, only valid alongside
+        a QR-IBAN and `payment_method=bank_transfer_swiss_qr_esr`.
+      - Plain bank transfer (any IBAN): ISO 11649 SCOR / structured creditor
+        reference, `RF<dd><alnum>`.
+
+    Selection priority:
+      1. QR-reference when paired with a QR-IBAN — Swiss QR-bill path.
+      2. SCOR creditor reference — works with any IBAN. The model sometimes
+         echoes the SCOR into `payment_purpose` even after the prompt update;
+         strip it from the resulting `info` so the reviewer doesn't see the
+         same string twice.
+      3. None — leave the reference field unset; the human reviewer can fill
+         it during approval.
+
+    A QR-reference present alongside a non-QR-IBAN is dropped (no `reference`
+    set) because Moco would 422 the QR-ESR path. The SCOR fallback can still
+    fire on the same invoice if the model also extracted one.
+    """
+    info = invoice.payment_purpose
+    if invoice.qr_reference and payment_method == "bank_transfer_swiss_qr_esr":
+        return invoice.qr_reference, info
+    if invoice.qr_reference and not _is_qr_iban(invoice.iban):
+        logger.warning("ocr: extracted qr_reference=%r but iban=%r is not a "
+                       "QR-IBAN — dropping the QR-reference; will try a SCOR "
+                       "fallback", invoice.qr_reference, invoice.iban)
+    if invoice.creditor_reference:
+        # Double-strip defense: `_to_invoice_data` already lifts SCOR out of
+        # `payment_purpose` on the OCR layer, but a draft-override path
+        # (`_prefer_draft_payment_fields`) can populate creditor_reference
+        # after that lift ran, leaving the SCOR text in the OCR's
+        # payment_purpose untouched. Re-run the lift here as a safety net so
+        # the info field never duplicates what's already in `reference`.
+        if info:
+            _, info = _lift_creditor_reference_from_purpose(info)
+        return invoice.creditor_reference, info
+    return None, info
 
 
 def _find_vat_code_by_rate(vat_codes: list[dict], rate: float) -> dict | None:
@@ -565,13 +608,30 @@ def _account_default_vat_code(vat_codes: list[dict]) -> dict | None:
     return None
 
 
-def _supplier_default_vat_code_id(company: dict) -> int | None:
-    """Pull the supplier's default vat-code id from a Moco company.
+def _supplier_default_vat_code_id(company: dict,
+                                  vat_codes: list[dict]) -> int | None:
+    """Resolve the supplier's default vat_code_id.
 
-    Moco's exact field name isn't fully documented for the supplier case;
-    observed candidates are `default_vat_code_purchase_id` and the older
-    `vat_code_purchase_id`. Try both, prefer the more specific one.
+    Per Moco's company docs the relevant field is `supplier_vat`, a nested
+    object with a `tax` percentage (e.g. `{"supplier_vat": {"tax": 8.1}}`).
+    There's no direct `vat_code_id` on the company — we have to translate
+    the rate by looking it up in the same `/vat_code_purchases` list used
+    for OCR's `vat_rate` match.
+
+    Defensive fallback: a couple of older / alternate field names
+    (`default_vat_code_purchase_id`, `vat_code_purchase_id`) are also
+    tried in case some accounts return a direct id. The first hit wins.
     """
+    supplier_vat = company.get("supplier_vat")
+    if isinstance(supplier_vat, dict) and supplier_vat.get("tax") is not None:
+        try:
+            rate = float(supplier_vat["tax"])
+        except (TypeError, ValueError):
+            rate = None
+        if rate is not None:
+            match = _find_vat_code_by_rate(vat_codes, rate)
+            if match is not None:
+                return match.get("id")
     for key in ("default_vat_code_purchase_id", "vat_code_purchase_id"):
         value = company.get(key)
         if isinstance(value, int):
@@ -608,12 +668,26 @@ def _prefer_draft_payment_fields(invoice: InvoiceData, draft: dict) -> InvoiceDa
                         "Zahlteil)", invoice.iban, draft_iban)
         updates["iban"] = draft_iban
 
-    draft_reference = _normalize_qr_reference(draft.get("reference"))
-    if draft_reference:
-        if invoice.qr_reference and invoice.qr_reference != draft_reference:
+    raw_reference = draft.get("reference")
+    draft_qr_reference = _normalize_qr_reference(raw_reference)
+    if draft_qr_reference:
+        if invoice.qr_reference and invoice.qr_reference != draft_qr_reference:
             logger.info("ocr: overriding OCR qr_reference=%s with draft "
-                        "reference=%s", invoice.qr_reference, draft_reference)
-        updates["qr_reference"] = draft_reference
+                        "reference=%s",
+                        invoice.qr_reference, draft_qr_reference)
+        updates["qr_reference"] = draft_qr_reference
+    else:
+        # Same field, different shape — Moco's email-import puts whatever it
+        # parsed from the Zahlteil into `reference`, which for non-QR-bill
+        # invoices is the ISO 11649 SCOR string.
+        draft_scor = _normalize_creditor_reference(raw_reference)
+        if draft_scor:
+            if (invoice.creditor_reference
+                    and invoice.creditor_reference != draft_scor):
+                logger.info("ocr: overriding OCR creditor_reference=%s with "
+                            "draft reference=%s",
+                            invoice.creditor_reference, draft_scor)
+            updates["creditor_reference"] = draft_scor
 
     return replace(invoice, **updates) if updates else invoice
 
@@ -760,6 +834,7 @@ def _format_ocr_comment(invoice: InvoiceData) -> str:
     fields.append(_li("Rechnungs-Nr", invoice.invoice_number))
     fields.append(_li("IBAN", invoice.iban))
     fields.append(_li("QR-Ref", invoice.qr_reference))
+    fields.append(_li("Referenz", invoice.creditor_reference))
     fields = [li for li in fields if li]
     if fields:
         parts.append("<ul>" + "".join(fields) + "</ul>")
