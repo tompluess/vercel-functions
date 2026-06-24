@@ -110,6 +110,12 @@ class SupplierInvoiceOcrService:
             )
             return {"skipped": "no_file_url", "draft_id": draft_id}
 
+        # Track OCR result outside the try so a Moco 4xx caught below can
+        # still surface what was extracted (used by the batch validation
+        # tool). Stays None when the 4xx fires before OCR (e.g. PDF
+        # download 403).
+        invoice: InvoiceData | None = None
+        company_id: int | None = None
         try:
             pdf_bytes = self._source_moco.download_file(file_url)
             logger.info("ocr: downloaded PDF draft_id=%s bytes=%d",
@@ -147,7 +153,15 @@ class SupplierInvoiceOcrService:
                            e.code, err_body)
             self._notify_moco_4xx(draft_id, e.code, err_body)
             return {"skipped": "moco_rejected", "draft_id": draft_id,
-                    "moco_status": e.code, "moco_error": err_body}
+                    "moco_status": e.code, "moco_error": err_body,
+                    # OCR fields are None when the 4xx fired before OCR
+                    # ran (e.g. PDF download 403). When OCR did succeed
+                    # batch tooling can show supplier/amount even on
+                    # rejected rows.
+                    "supplier_name": invoice.supplier_name if invoice else None,
+                    "total_amount": invoice.total_amount if invoice else None,
+                    "currency": invoice.currency if invoice else None,
+                    "company_id": company_id}
 
         new_purchase_id = created.get("id")
         logger.info("ocr: created purchase id=%s from draft=%s",
@@ -166,6 +180,9 @@ class SupplierInvoiceOcrService:
             "confidence": invoice.confidence,
             "company_id": company_id,
             "is_credit_note": invoice.is_credit_note,
+            "supplier_name": invoice.supplier_name,
+            "total_amount": invoice.total_amount,
+            "currency": invoice.currency,
         }
 
     # --- vat code resolution ------------------------------------------------
