@@ -15,9 +15,9 @@ Telegram is opt-in via --notify so accidental dry-runs don't ping.
 
 Usage (from the repo root):
     vercel env pull .env.local
-    .venv/bin/python scripts/test_ocr_moco.py 3001069                 # dry run
-    .venv/bin/python scripts/test_ocr_moco.py 3001069 --apply         # actually create
-    .venv/bin/python scripts/test_ocr_moco.py 3001069 --apply --notify  # + Telegram
+    .venv/bin/python scripts/test_ocr_create_purchase.py 3001069                 # dry run
+    .venv/bin/python scripts/test_ocr_create_purchase.py 3001069 --apply         # actually create
+    .venv/bin/python scripts/test_ocr_create_purchase.py 3001069 --apply --notify  # + Telegram
 
 Required env:
     MOCO_SOURCE_ACCOUNT_URL          source subdomain (e.g. "solar")
@@ -58,7 +58,7 @@ from api.telegram_notifier import TelegramNotifier
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
-log = logging.getLogger("test_ocr_moco")
+log = logging.getLogger("test_ocr_create_purchase")
 
 
 def _load_dotenv(path: Path) -> None:
