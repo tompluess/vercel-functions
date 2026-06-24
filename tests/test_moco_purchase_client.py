@@ -164,6 +164,32 @@ def test_create_purchase_propagates_422_for_invalid_payload(client, calls):
         client.create_purchase({"date": "2026-01-01"})
 
 
+# --- list_categories --------------------------------------------------------
+
+def test_list_categories_returns_array(client, calls):
+    calls["next_response"] = json.dumps([
+        {"id": 17, "credit_account": "4000", "label": "Wareneinkauf"},
+        {"id": 18, "credit_account": "4500", "label": "Materialaufwand"},
+    ]).encode()
+    result = client.list_categories()
+    assert len(result) == 2
+    assert result[0]["credit_account"] == "4000"
+    call = calls["calls"][0]
+    assert call["url"] == "https://solar.mocoapp.com/api/v1/purchases/categories"
+    assert call["method"] == "GET"
+
+
+def test_list_categories_handles_non_array_response(client, calls):
+    calls["next_response"] = b"{}"
+    assert client.list_categories() == []
+
+
+def test_list_categories_propagates_http_errors(client, calls):
+    calls["next_status"] = 500
+    with pytest.raises(urlerror.HTTPError):
+        client.list_categories()
+
+
 # --- assign_item_to_project -------------------------------------------------
 
 def test_assign_item_to_project_posts_per_item_payload(client, calls):

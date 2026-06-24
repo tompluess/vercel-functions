@@ -112,13 +112,64 @@ via `SourceMocoClient.list_projects()` (one extra GET per webhook). The
 batch validation script passes its already-built resolver into the
 service for `--apply` runs.
 
-### Stage 3 — Category from Project (deferred)
+---
 
-Choosing the `category_id` (Buchhaltungs-Konto) from the resolved
-project is the remaining piece. Mechanism TBD — fixed mapping by
-project label / project leader / a configured per-project table, same
-question class as `bexio_invoice_sync_service`'s revenue-account
-resolution. Stage 3 will get its own clarifying round.
+## Stage 3 — Category (Buchhaltungs-Konto) Resolution (in progress)
+
+### Goal
+
+Set the per-line-item `category_id` on `POST /purchases` so the new
+purchase books against the right expense account. Today this field is
+omitted and the operator picks it manually during review.
+
+### Resolution chain (decided)
+
+1. **Bills already paid via card / POS** (`invoice.already_paid_by_card`):
+   **OMIT** the category entirely. These bills mix personal and project
+   purchases and the operator must decide per receipt. Setting a default
+   would lull the reviewer into approving the wrong account.
+
+2. **Project-specified expense account**: if the resolver matched a Moco
+   project AND that project carries an `Aufwandkonto` custom-property:
+   - look up the category in `GET /purchases/categories` whose
+     `credit_account` equals the property value (string equality after
+     trim);
+   - **on match**: use that category's `id`;
+   - **on miss** (project says `"4500"` but no category has it): OMIT
+     the field. We do NOT fall back to the default in this branch —
+     the project explicitly said something other than the default, so
+     silently using `4000` would mis-route the booking. Operator must
+     either fix the project's `Aufwandkonto` or pick a category by hand.
+
+3. **Account-wide fallback**: otherwise (no project resolved, or project
+   has no `Aufwandkonto`), look up the category whose `credit_account`
+   is the hardcoded default `"4000"` (Wareneinkauf — Swiss SKR
+   convention).
+
+4. **Missing-fallback edge case**: if even `"4000"` doesn't match any
+   category in the catalog, OMIT the field rather than guessing — Moco
+   will accept the purchase with its own default and the operator can
+   set a category during review.
+
+No reasoning lines are added to the OCR comment for this stage —
+`category_id` itself is the audit trail (visible to the operator in
+Moco's purchase UI).
+
+### Data sources
+
+- `GET /api/v1/purchases/categories` returns the catalog. The matching
+  field is `credit_account` (a string like `"4000"`). Fetched once per
+  webhook (and once per batch run), same pattern as
+  `GET /vat_code_purchases` and `GET /projects`.
+- `project.custom_properties["Aufwandkonto"]` carries the per-project
+  override. Same shape as `Kommission` — string-valued custom field.
+
+### Out of scope for Stage 3
+
+- Per-line-item categories. The OCR pipeline always emits a single line
+  item, so this is effectively a per-purchase decision.
+- Editing the category after the fact (the operator does that in Moco's
+  UI during review).
 
 ---
 

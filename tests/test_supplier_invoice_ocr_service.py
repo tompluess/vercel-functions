@@ -8,6 +8,7 @@ from urllib import error as urlerror
 import pytest
 
 from api.anthropic_ocr_client import AnthropicOcrError, InvoiceData
+from api.moco_category_resolver import MocoCategoryResolver
 from api.moco_project_resolver import MocoProjectResolver
 from api.supplier_invoice_ocr_service import (
     CONFIDENCE_THRESHOLD,
@@ -183,7 +184,7 @@ class FakeTelegram:
 
 def build_service(*, source_moco=None, purchases=None, ocr=None,
                   telegram=None, source_account_url="solar",
-                  project_resolver=None):
+                  project_resolver=None, category_resolver=None):
     return SupplierInvoiceOcrService(
         source_moco=source_moco or FakeSourceMoco(),
         purchase_client=purchases or FakePurchaseClient(),
@@ -191,6 +192,7 @@ def build_service(*, source_moco=None, purchases=None, ocr=None,
         source_account_url=source_account_url,
         telegram=telegram,
         project_resolver=project_resolver,
+        category_resolver=category_resolver,
     )
 
 
@@ -1699,6 +1701,78 @@ def test_assign_skipped_when_commission_is_empty():
     )
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
     assert purchases.assigns == []
+
+
+CATEGORIES_FIXTURE = [
+    {"id": 17, "credit_account": "4000", "label": "Wareneinkauf"},
+    {"id": 18, "credit_account": "4500", "label": "Materialaufwand"},
+]
+
+
+def _category_resolver():
+    return MocoCategoryResolver(CATEGORIES_FIXTURE)
+
+
+def test_category_default_when_no_project_resolved():
+    """No project resolver wired → 4000 fallback (Wareneinkauf, id=17)."""
+    ocr = FakeOcr(result=make_invoice())
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases, ocr=ocr,
+                      category_resolver=_category_resolver())
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    item = purchases.creates[0]["items"][0]
+    assert item["category_id"] == 17
+
+
+def test_category_uses_project_aufwandkonto_when_set():
+    project = {"id": 99, "name": "Sanierung Haldenweg",
+               "custom_properties": {"Kommission": "#H12",
+                                     "Aufwandkonto": "4500"}}
+    ocr = FakeOcr(result=make_invoice(commission="H12"))
+    purchases = FakePurchaseClient()
+    s = build_service(
+        purchases=purchases, ocr=ocr,
+        project_resolver=MocoProjectResolver([project]),
+        category_resolver=_category_resolver(),
+    )
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["items"][0]["category_id"] == 18
+
+
+def test_category_omitted_when_project_aufwand_does_not_match_catalog():
+    """Project says 4999 but no category has that credit_account.
+    Must NOT silently fall back to 4000 — operator picks manually."""
+    project = {"id": 99, "name": "Project Foo",
+               "custom_properties": {"Kommission": "FOO",
+                                     "Aufwandkonto": "4999"}}
+    ocr = FakeOcr(result=make_invoice(commission="FOO"))
+    purchases = FakePurchaseClient()
+    s = build_service(
+        purchases=purchases, ocr=ocr,
+        project_resolver=MocoProjectResolver([project]),
+        category_resolver=_category_resolver(),
+    )
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert "category_id" not in purchases.creates[0]["items"][0]
+
+
+def test_category_omitted_when_already_paid_by_card():
+    """Card receipts must be manually triaged; no default at all."""
+    ocr = FakeOcr(result=make_invoice(already_paid_by_card=True))
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases, ocr=ocr,
+                      category_resolver=_category_resolver())
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert "category_id" not in purchases.creates[0]["items"][0]
+
+
+def test_category_omitted_when_no_resolver_wired():
+    """Service tests without a category resolver get no category_id."""
+    ocr = FakeOcr(result=make_invoice())
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases, ocr=ocr)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert "category_id" not in purchases.creates[0]["items"][0]
 
 
 def test_assign_failure_soft_fails_and_enriches_telegram():

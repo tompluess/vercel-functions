@@ -40,6 +40,7 @@ from urllib import error as urlerror
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from api.anthropic_ocr_client import AnthropicOcrClient, AnthropicOcrError
+from api.moco_category_resolver import MocoCategoryResolver
 from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
 from api.source_moco_client import SourceMocoClient
@@ -190,6 +191,7 @@ def _process_draft(draft: dict, *,
                    ocr: AnthropicOcrClient,
                    service: SupplierInvoiceOcrService,
                    resolver: MocoProjectResolver,
+                   category_resolver: MocoCategoryResolver,
                    apply: bool,
                    idx: int,
                    total: int) -> Row:
@@ -319,11 +321,24 @@ def _process_draft(draft: dict, *,
                    kommission_candidate_count,
                    f"Dry-run OK (would create, confidence={invoice.confidence:.0%})")
 
+    # --- category resolution ----------------------------------------------
+    # Mirrors the webhook flow: project's Aufwandkonto override first,
+    # then 4000 fallback, OMIT on already-paid or any miss.
+    matched_project = (kommission_match.project
+                       if kommission_match.status == "matched"
+                       else None)
+    category_decision = category_resolver.resolve(
+        already_paid_by_card=invoice.already_paid_by_card,
+        project=matched_project)
+    _step(f"category_id={category_decision.category_id} "
+          f"({category_decision.reason})")
+
     # --- apply: create + comments + delete draft --------------------------
     payload = _build_create_payload(
         invoice, pdf_bytes, vat_code_id=vat_code_id,
         company_id=company_id, draft_id=draft_id,
-        user_id=_user_id_from_draft(draft))
+        user_id=_user_id_from_draft(draft),
+        category_id=category_decision.category_id)
     try:
         created = purchases.create_purchase(payload)
     except urlerror.HTTPError as e:
@@ -348,7 +363,8 @@ def _process_draft(draft: dict, *,
         # than re-implementing) keeps batch and webhook in lockstep.
         service._post_summary_comments(new_purchase_id, invoice,
                                         draft_id, draft)
-        _, assign_warnings = service._assign_resolved_project(created, invoice)
+        assign_warnings = service._assign_resolved_project(
+            created, kommission_match)
         if assign_warnings:
             for w in assign_warnings:
                 _step(f"assign warning: {w}")
@@ -543,6 +559,21 @@ def main() -> int:
     print(f"  {len(all_projects)} project(s) returned, "
           f"{resolver.indexed_count()} indexed by Kommission.")
 
+    # Categories drive the per-item `category_id` (Buchhaltungs-Konto)
+    # resolution. Same per-run fetch + graceful-empty-on-failure pattern
+    # as projects above; an empty catalog means every category lookup
+    # OMITs the field and the operator picks during review.
+    print("Loading Moco purchase categories …")
+    try:
+        all_categories = purchases.list_categories()
+    except Exception as e:
+        print(f"  WARN: list_categories failed ({e}); category resolution "
+              "disabled.", file=sys.stderr)
+        all_categories = []
+    category_resolver = MocoCategoryResolver(all_categories)
+    print(f"  {len(all_categories)} category(s) returned, "
+          f"{category_resolver.indexed_count()} indexed by credit_account.")
+
     # Telegram intentionally NOT wired in. Batch runs touch dozens of drafts
     # at a time and would spam the chat with one alert per row; the table is
     # the audit surface here. Production webhook traffic still notifies as
@@ -550,14 +581,16 @@ def main() -> int:
     service = SupplierInvoiceOcrService(
         source_moco=source_moco, purchase_client=purchases, ocr=ocr,
         source_account_url=subdomain, telegram=None,
-        project_resolver=resolver)
+        project_resolver=resolver,
+        category_resolver=category_resolver)
 
     rows: list[Row] = []
     for i, draft in enumerate(drafts, start=1):
         rows.append(_process_draft(
             draft, source_moco=source_moco, purchases=purchases, ocr=ocr,
-            service=service, resolver=resolver, apply=args.apply, idx=i,
-            total=len(drafts)))
+            service=service, resolver=resolver,
+            category_resolver=category_resolver,
+            apply=args.apply, idx=i, total=len(drafts)))
 
     _print_table(rows)
     return 0

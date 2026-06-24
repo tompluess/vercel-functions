@@ -117,6 +117,23 @@ class MocoPurchaseClient:
             data = json.loads(resp.read())
         return data if isinstance(data, list) else []
 
+    def list_categories(self) -> list[dict]:
+        """GET /purchases/categories — the catalog of bookkeeping accounts.
+
+        Returns objects with at least `id` and `credit_account` (a string
+        like `"4000"`). The OCR service uses this to translate either a
+        project's `Aufwandkonto` custom-property or the hardcoded
+        Wareneinkauf default (`"4000"`) into the `category_id` Moco
+        requires on each purchase item. Re-fetched per request to keep
+        the resolver fresh; categories change rarely but adding one
+        shouldn't require a redeploy.
+        """
+        url = f"{self._base_url}/purchases/categories"
+        req = urlrequest.Request(url, headers=self._auth_headers)
+        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
+            data = json.loads(resp.read())
+        return data if isinstance(data, list) else []
+
     def create_purchase(self, payload: dict) -> dict:
         """POST /purchases — create a new (non-draft) purchase.
 

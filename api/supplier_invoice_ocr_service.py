@@ -60,6 +60,7 @@ from api.anthropic_ocr_client import (
     _normalize_iban,
     _normalize_qr_reference,
 )
+from api.moco_category_resolver import MocoCategoryResolver
 from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
 from api.source_moco_client import SourceMocoClient
@@ -77,7 +78,8 @@ class SupplierInvoiceOcrService:
                  ocr: AnthropicOcrClient,
                  source_account_url: str,
                  telegram: TelegramNotifier | None = None,
-                 project_resolver: MocoProjectResolver | None = None):
+                 project_resolver: MocoProjectResolver | None = None,
+                 category_resolver: MocoCategoryResolver | None = None):
         self._source_moco = source_moco
         self._purchases = purchase_client
         self._ocr = ocr
@@ -88,6 +90,10 @@ class SupplierInvoiceOcrService:
         # purchase is created. Optional so existing unit tests that don't
         # care about assignment can omit it without setup churn.
         self._project_resolver = project_resolver
+        # Optional — when set, the service picks `category_id` per the
+        # Stage-3 chain (already-paid → omit, project Aufwandkonto →
+        # match, else 4000 fallback). Same optional-collaborator pattern.
+        self._category_resolver = category_resolver
 
     def process(self, event: str, body: dict) -> dict[str, Any]:
         """Drive one Purchase webhook through OCR + new-purchase creation.
@@ -137,6 +143,12 @@ class SupplierInvoiceOcrService:
 
             company_id = self._lookup_supplier_company(invoice.supplier_name)
             vat_code_id = self._resolve_vat_code_id(invoice, company_id)
+            # Resolve the project first so the category lookup can use it
+            # (project's Aufwandkonto custom-property overrides the 4000
+            # default). The same match feeds the post-create
+            # `assign_to_project` loop so we don't resolve twice.
+            project_match = self._resolve_project_match(invoice)
+            category_id = self._resolve_category_id(invoice, project_match)
 
             payload = _build_create_payload(
                 invoice, pdf_bytes,
@@ -144,6 +156,7 @@ class SupplierInvoiceOcrService:
                 company_id=company_id,
                 draft_id=draft_id,
                 user_id=_user_id_from_draft(body),
+                category_id=category_id,
             )
             created = self._purchases.create_purchase(payload)
         except urlerror.HTTPError as e:
@@ -177,13 +190,12 @@ class SupplierInvoiceOcrService:
         logger.info("ocr: created purchase id=%s from draft=%s",
                     new_purchase_id, draft_id)
 
-        project_match: ProjectMatch | None = None
         assign_warnings: list[str] = []
         if new_purchase_id:
             self._post_summary_comments(new_purchase_id, invoice,
                                         draft_id, body)
-            project_match, assign_warnings = self._assign_resolved_project(
-                created, invoice)
+            assign_warnings = self._assign_resolved_project(
+                created, project_match)
             self._delete_draft_after_create(draft_id, new_purchase_id)
 
         self._notify_outcome(new_purchase_id, draft_id, invoice,
@@ -350,12 +362,45 @@ class SupplierInvoiceOcrService:
             logger.exception("ocr: OCR-summary comment failed "
                              "purchase_id=%s", purchase_id)
 
+    # --- project + category resolution --------------------------------------
+
+    def _resolve_project_match(self, invoice: InvoiceData
+                                ) -> ProjectMatch | None:
+        """Run the Kommission→project resolver if one is wired. Returns
+        None when no resolver was injected, otherwise the resolver's
+        ProjectMatch (which may report `matched` / `ambiguous` /
+        `no_match` / `empty`)."""
+        if self._project_resolver is None:
+            return None
+        return self._project_resolver.resolve(invoice.commission)
+
+    def _resolve_category_id(self, invoice: InvoiceData,
+                              project_match: ProjectMatch | None
+                              ) -> int | None:
+        """Decide which `category_id` to set on the purchase's line item.
+
+        Returns None whenever the caller should OMIT `category_id` from
+        the payload (already-paid bill, project-override miss, no
+        4000-fallback, or no resolver wired). The category resolver owns
+        the chain; this method just bridges to it.
+        """
+        if self._category_resolver is None:
+            return None
+        project = (project_match.project
+                   if project_match and project_match.status == "matched"
+                   else None)
+        decision = self._category_resolver.resolve(
+            already_paid_by_card=invoice.already_paid_by_card,
+            project=project)
+        logger.info("ocr: category_id=%s (%s)",
+                    decision.category_id, decision.reason)
+        return decision.category_id
+
     # --- project assignment -------------------------------------------------
 
-    def _assign_resolved_project(self, created: dict, invoice: InvoiceData
-                                  ) -> tuple[ProjectMatch | None, list[str]]:
-        """If the OCR'd Kommission resolves to a single Moco project,
-        link each line item to it via `POST /purchases/{id}/assign_to_project`.
+    def _assign_resolved_project(self, created: dict,
+                                  match: ProjectMatch | None) -> list[str]:
+        """Link each line item of `created` to the resolved Moco project.
 
         Best-effort: the created purchase is the authoritative side effect.
         On any per-item failure we collect a short warning string for the
@@ -363,28 +408,23 @@ class SupplierInvoiceOcrService:
         can finish the assignment manually during review.
 
         Skipped silently when:
-          - no resolver was injected (e.g. service tests without one);
-          - the OCR'd commission is empty / unresolved / ambiguous (we
-            prefer leaving the purchase project-less to mis-routing it).
-
-        Returns (project_match, warnings). The match is exposed so the
-        caller can include the resolved project in the response dict.
+          - no project resolver was injected (`match is None`);
+          - the resolver returned `empty` / `no_match` / `ambiguous` —
+            we prefer leaving the purchase project-less to mis-routing it.
         """
         warnings: list[str] = []
-        if self._project_resolver is None:
-            return None, warnings
-        match = self._project_resolver.resolve(invoice.commission)
+        if match is None:
+            return warnings
         if match.status != "matched":
-            logger.info("ocr: project assign skipped (commission=%r status=%s)",
-                        invoice.commission, match.status)
-            return match, warnings
+            logger.info("ocr: project assign skipped (status=%s)", match.status)
+            return warnings
 
         purchase_id = created.get("id")
         items = created.get("items") or []
         if not items:
             logger.warning("ocr: created purchase %s has no items — skipping "
                            "project assign", purchase_id)
-            return match, warnings
+            return warnings
 
         project_id = match.project.get("id")
         project_name = match.project.get("name")
@@ -418,7 +458,7 @@ class SupplierInvoiceOcrService:
                 logger.exception("ocr: assign_to_project error for "
                                  "purchase=%s item=%s", purchase_id, item_id)
                 warnings.append(f"Item {item_id}: {e}")
-        return match, warnings
+        return warnings
 
     # --- telegram routing ---------------------------------------------------
 
@@ -570,7 +610,8 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
                           vat_code_id: int | None,
                           company_id: int | None,
                           draft_id: int,
-                          user_id: int | None = None) -> dict[str, Any]:
+                          user_id: int | None = None,
+                          category_id: int | None = None) -> dict[str, Any]:
     """Construct the POST /purchases body.
 
     Moco requires: `date`, `currency`, `payment_method`, and `items` with
@@ -603,6 +644,12 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
     }
     if vat_code_id is not None:
         item["vat_code_id"] = vat_code_id
+    # `category_id` is the Buchhaltungs-Konto. Omitted when the resolver
+    # couldn't pick one (already-paid card receipt, project Aufwandkonto
+    # miss, missing 4000 fallback) — Moco accepts the purchase with its
+    # own default and the reviewer picks an account during approval.
+    if category_id is not None:
+        item["category_id"] = category_id
 
     payment_method = _payment_method_for(invoice)
     reference_value, info_value = _resolve_reference_and_info(
