@@ -52,6 +52,7 @@ from api.supplier_invoice_ocr_service import (
     _payment_method_for,
     _prefer_draft_payment_fields,
     _supplier_default_vat_code_id,
+    _user_id_from_draft,
 )
 
 logging.basicConfig(level=logging.WARNING,
@@ -269,7 +270,8 @@ def _process_draft(draft: dict, *,
     # --- apply: create + comments + delete draft --------------------------
     payload = _build_create_payload(
         invoice, pdf_bytes, vat_code_id=vat_code_id,
-        company_id=company_id, draft_id=draft_id)
+        company_id=company_id, draft_id=draft_id,
+        user_id=_user_id_from_draft(draft))
     try:
         created = purchases.create_purchase(payload)
     except urlerror.HTTPError as e:

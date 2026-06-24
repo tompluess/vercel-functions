@@ -136,6 +136,7 @@ class SupplierInvoiceOcrService:
                 vat_code_id=vat_code_id,
                 company_id=company_id,
                 draft_id=draft_id,
+                user_id=_user_id_from_draft(body),
             )
             created = self._purchases.create_purchase(payload)
         except urlerror.HTTPError as e:
@@ -444,12 +445,30 @@ class SupplierInvoiceOcrService:
                 f"/purchases/drafts/{draft_id}")
 
 
+def _user_id_from_draft(body: dict) -> int | None:
+    """Extract the Moco user id from a draft purchase body.
+
+    Webhook bodies carry the user as a nested object: `{"user": {"id":
+    933719334, "firstname": …}}` (same shape as Activity / Contact /
+    Invoice events — see fixtures). Returns None when absent or
+    malformed, so callers can omit the `user_id` field rather than push
+    a junk value into Moco.
+    """
+    user = body.get("user")
+    if isinstance(user, dict):
+        uid = user.get("id")
+        if isinstance(uid, int):
+            return uid
+    return None
+
+
 # --- payload construction ---------------------------------------------------
 
 def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
                           vat_code_id: int | None,
                           company_id: int | None,
-                          draft_id: int) -> dict[str, Any]:
+                          draft_id: int,
+                          user_id: int | None = None) -> dict[str, Any]:
     """Construct the POST /purchases body.
 
     Moco requires: `date`, `currency`, `payment_method`, and `items` with
@@ -523,6 +542,13 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
         payload["info"] = info_value
     if company_id is not None:
         payload["company_id"] = company_id
+    # Carry the draft's user across to the created purchase when present —
+    # email-imported drafts are usually associated with the inbox owner
+    # (or whoever forwarded the mail), and propagating that keeps Moco's
+    # "Mein Aufwand" filter and per-user reports correct. None falls back
+    # to whatever default Moco assigns to API-created purchases.
+    if user_id is not None:
+        payload["user_id"] = user_id
 
     return payload
 

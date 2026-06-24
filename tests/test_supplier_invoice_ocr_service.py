@@ -288,6 +288,27 @@ def test_payment_method_falls_back_when_iban_is_not_qr_iban():
     assert "reference" not in payload   # dropped — would 422 otherwise
 
 
+def test_draft_user_id_propagates_to_created_purchase():
+    """When the draft webhook body carries `{"user": {"id": N}}` (the
+    standard Moco shape), the created purchase's `user_id` is set to N
+    so per-user reports + 'Mein Aufwand' filtering stay correct."""
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases)
+    s.process("create", {"id": 3001069, "file_url": "https://x/y.pdf",
+                          "user": {"id": 933719334, "firstname": "Tom"}})
+    assert purchases.creates[0]["user_id"] == 933719334
+
+
+def test_draft_without_user_omits_user_id():
+    """No user object on the draft → omit the field entirely so Moco
+    falls back to whatever default it assigns to API-created purchases.
+    Sending `null` or a junk int would push wrong data."""
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases)
+    s.process("create", {"id": 3001069, "file_url": "https://x/y.pdf"})
+    assert "user_id" not in purchases.creates[0]
+
+
 def test_already_paid_by_card_sets_credit_card_and_drops_payment_fields():
     """OCR-detected card / POS payment routes to `payment_method=credit_card`
     and suppresses the open-bill payment fields (iban, reference, due_date)
