@@ -52,6 +52,7 @@ from api.supplier_invoice_ocr_service import (
     _build_create_payload,
     _format_email_source_comment,
     _format_ocr_comment,
+    _user_id_from_draft,
 )
 from api.telegram_notifier import TelegramNotifier
 
@@ -312,6 +313,7 @@ def main() -> int:
         vat_code_id=vat_code_id,
         company_id=company_id,
         draft_id=args.draft_id,
+        user_id=_user_id_from_draft(draft),
     )
     email_comment = _format_email_source_comment(
         email_from=draft.get("email_from"),

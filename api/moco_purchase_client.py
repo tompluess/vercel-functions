@@ -45,6 +45,37 @@ class MocoPurchaseClient:
             "Accept": "application/json",
         }
 
+    def list_purchase_drafts(self, *, limit: int = 100) -> list[dict]:
+        """GET /purchases/drafts — list draft purchases.
+
+        Used by the batch validation script (`scripts/batch_ocr_drafts.py`)
+        to enumerate every pending draft and run the OCR pipeline across
+        them. Production webhook flow does not need this — webhooks deliver
+        one draft at a time.
+
+        Paginates with `per_page=100` (Moco's typical max) until either the
+        last page is reached or the caller-supplied `limit` is hit. Returned
+        list is trimmed to `limit`; ordering is whatever Moco returns
+        (callers that care about ordering sort client-side).
+        """
+        drafts: list[dict] = []
+        page = 1
+        per_page = 100
+        while len(drafts) < limit:
+            url = (f"{self._base_url}/purchases/drafts"
+                   f"?per_page={per_page}&page={page}")
+            req = urlrequest.Request(url, headers=self._auth_headers)
+            with urlrequest.urlopen(req,
+                                    timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
+                batch = json.loads(resp.read())
+            if not isinstance(batch, list) or not batch:
+                break
+            drafts.extend(batch)
+            if len(batch) < per_page:
+                break
+            page += 1
+        return drafts[:limit]
+
     def get_purchase_draft(self, purchase_id: int) -> dict:
         """GET /purchases/drafts/{id} — read a draft purchase.
 

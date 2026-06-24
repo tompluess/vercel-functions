@@ -44,6 +44,7 @@ SAMPLE_OCR = {
     "is_credit_note": False,
     "commission": "PV-2026-014 Müller Wallisellen",
     "delivery_address": "Hauptstrasse 5, 8304 Wallisellen",
+    "already_paid_by_card": False,
     "confidence": 0.92,
 }
 
@@ -286,6 +287,24 @@ def test_extract_lifts_scor_out_of_payment_purpose(client, calls):
     result = client.extract(PDF_BYTES)
     assert result.creditor_reference == "RF43R0032202606070"
     assert result.payment_purpose == "Rechnung Mai 2026"
+
+
+def test_extract_returns_already_paid_by_card_when_true(client, calls):
+    """OCR detects a card-settled bill (Visa receipt etc.) — the flag
+    drives the service into `payment_method=credit_card`."""
+    payload = {**SAMPLE_OCR, "already_paid_by_card": True}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    result = client.extract(PDF_BYTES)
+    assert result.already_paid_by_card is True
+
+
+def test_extract_defaults_already_paid_by_card_to_false_when_missing(client, calls):
+    """When the model omits the field, default to False — open invoices
+    are the common case and "paid" must be an explicit signal."""
+    payload = {k: v for k, v in SAMPLE_OCR.items() if k != "already_paid_by_card"}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    result = client.extract(PDF_BYTES)
+    assert result.already_paid_by_card is False
 
 
 def test_extract_leaves_payment_purpose_unchanged_when_no_scor(client, calls):

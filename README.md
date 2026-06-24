@@ -105,7 +105,44 @@ Receives Moco `Purchase::Draft:create` webhooks (drafts from Moco's email-import
 - **Bexio-sync interlock:** while the `Review pending` tag is on the purchase, `/api/bexio-expense-sync` silently skips it. Once the operator strips the tag in Moco's UI, the next `Purchase:update` webhook syncs to Bexio normally.
 - Moco 4xx is converted to a silent skip + Telegram alert (e.g. `POST /purchases 422 receipt_identifier: ist bereits vergeben` on a webhook replay) — the response stays 200 ok=true so Moco's delivery log doesn't go red on unrecoverable rejections.
 
-A dry-run / `--apply` CLI for validating against a real draft lives at [`scripts/test_ocr_moco.py`](scripts/test_ocr_moco.py).
+Operator scripts for validating the OCR pipeline against real Moco drafts live under [`scripts/`](scripts/) — see [Scripts](#scripts) below.
+
+## Scripts
+
+Two CLIs drive the OCR pipeline directly against the source Moco account so you can validate behaviour without going through the webhook. Both default to **dry-run** (no Moco writes); pass `--apply` to actually create purchases. Both load env from `.env.local` (use `vercel env pull .env.local` first) and need `MOCO_SOURCE_ACCOUNT_URL`, `MOCO_SOURCE_API_KEY`, and `ANTHROPIC_API_KEY`.
+
+### `scripts/test_ocr_moco.py` — single draft
+
+Runs the full pipeline against one specific draft id and prints a detailed step-by-step view: the source draft fields, the OCR'd `InvoiceData`, the supplier-lookup outcome, the resolved VAT code, and the exact `POST /purchases` payload (with the PDF base64 elided) and rendered comment bodies that would be posted. Useful when iterating on the prompt or chasing a single weird invoice.
+
+```bash
+.venv/bin/python scripts/test_ocr_moco.py 3001069                 # dry-run
+.venv/bin/python scripts/test_ocr_moco.py 3001069 --apply         # create the real purchase
+.venv/bin/python scripts/test_ocr_moco.py 3001069 --apply --notify  # + Telegram alert
+.venv/bin/python scripts/test_ocr_moco.py 3001069 --model claude-sonnet-4-6  # model override
+```
+
+Flags: `--apply` (POST + comments + delete draft), `--notify` (Telegram on confidence/Gutschrift), `--model` (override the Claude model), `--env-file` (alternative dotenv path).
+
+Exit codes: `0` ok, `1` OCR error, `2` missing env / bad args, `3` Moco fetch error, `4` `POST /purchases` error.
+
+### `scripts/batch_ocr_drafts.py` — all drafts
+
+Lists `GET /purchases/drafts` (newest first), runs the same in-process pipeline against each draft, and prints a per-draft live log followed by a summary table.
+
+```bash
+.venv/bin/python scripts/batch_ocr_drafts.py --max 5            # dry-run, 5 newest
+.venv/bin/python scripts/batch_ocr_drafts.py --max 5 --apply    # actually create
+.venv/bin/python scripts/batch_ocr_drafts.py --max 20           # larger sweep
+```
+
+Per-draft live log (one block per draft) shows PDF size + OCR latency, confidence + Gutschrift flag, supplier lookup outcome (id + matched/ambiguous/no-match), VAT-code resolution tier (matched OCR rate / supplier default / account default / unresolved), and chosen payment method + IBAN tail (with `(QR-IBAN)` marker).
+
+Summary table columns: `DRAFT ID | PURCHASE ID | LIEFERANT | BETRAG | RESULT`. The `LIEFERANT` column carries a leading `✓` when the supplier was uniquely matched in Moco's company list — so company-less rows stand out. The footer counts `created / dry-run / skipped / failed / supplier-matched`.
+
+Flags: `--max N` (cap at N newest drafts, default 10), `--apply`, `--model`, `--env-file`.
+
+Telegram is intentionally **not** wired into the batch script (one alert per row would spam the chat); the table is the audit surface. Production webhook traffic still notifies as usual.
 
 ## Architecture
 

@@ -110,6 +110,12 @@ class SupplierInvoiceOcrService:
             )
             return {"skipped": "no_file_url", "draft_id": draft_id}
 
+        # Track OCR result outside the try so a Moco 4xx caught below can
+        # still surface what was extracted (used by the batch validation
+        # tool). Stays None when the 4xx fires before OCR (e.g. PDF
+        # download 403).
+        invoice: InvoiceData | None = None
+        company_id: int | None = None
         try:
             pdf_bytes = self._source_moco.download_file(file_url)
             logger.info("ocr: downloaded PDF draft_id=%s bytes=%d",
@@ -130,6 +136,7 @@ class SupplierInvoiceOcrService:
                 vat_code_id=vat_code_id,
                 company_id=company_id,
                 draft_id=draft_id,
+                user_id=_user_id_from_draft(body),
             )
             created = self._purchases.create_purchase(payload)
         except urlerror.HTTPError as e:
@@ -147,7 +154,17 @@ class SupplierInvoiceOcrService:
                            e.code, err_body)
             self._notify_moco_4xx(draft_id, e.code, err_body)
             return {"skipped": "moco_rejected", "draft_id": draft_id,
-                    "moco_status": e.code, "moco_error": err_body}
+                    "moco_status": e.code, "moco_error": err_body,
+                    # OCR fields are None when the 4xx fired before OCR
+                    # ran (e.g. PDF download 403). When OCR did succeed
+                    # batch tooling can show supplier/amount even on
+                    # rejected rows.
+                    "supplier_name": invoice.supplier_name if invoice else None,
+                    "total_amount": invoice.total_amount if invoice else None,
+                    "currency": invoice.currency if invoice else None,
+                    "already_paid_by_card": (invoice.already_paid_by_card
+                                              if invoice else False),
+                    "company_id": company_id}
 
         new_purchase_id = created.get("id")
         logger.info("ocr: created purchase id=%s from draft=%s",
@@ -166,6 +183,10 @@ class SupplierInvoiceOcrService:
             "confidence": invoice.confidence,
             "company_id": company_id,
             "is_credit_note": invoice.is_credit_note,
+            "supplier_name": invoice.supplier_name,
+            "total_amount": invoice.total_amount,
+            "currency": invoice.currency,
+            "already_paid_by_card": invoice.already_paid_by_card,
         }
 
     # --- vat code resolution ------------------------------------------------
@@ -424,12 +445,30 @@ class SupplierInvoiceOcrService:
                 f"/purchases/drafts/{draft_id}")
 
 
+def _user_id_from_draft(body: dict) -> int | None:
+    """Extract the Moco user id from a draft purchase body.
+
+    Webhook bodies carry the user as a nested object: `{"user": {"id":
+    933719334, "firstname": …}}` (same shape as Activity / Contact /
+    Invoice events — see fixtures). Returns None when absent or
+    malformed, so callers can omit the `user_id` field rather than push
+    a junk value into Moco.
+    """
+    user = body.get("user")
+    if isinstance(user, dict):
+        uid = user.get("id")
+        if isinstance(uid, int):
+            return uid
+    return None
+
+
 # --- payload construction ---------------------------------------------------
 
 def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
                           vat_code_id: int | None,
                           company_id: int | None,
-                          draft_id: int) -> dict[str, Any]:
+                          draft_id: int,
+                          user_id: int | None = None) -> dict[str, Any]:
     """Construct the POST /purchases body.
 
     Moco requires: `date`, `currency`, `payment_method`, and `items` with
@@ -486,12 +525,16 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
         },
     }
 
-    due_date = _resolve_due_date(payload["date"], invoice.due_date)
-    if due_date:
-        payload["due_date"] = due_date
+    # Already-paid card receipts: skip due_date + IBAN entirely. There's
+    # nothing to schedule and no transfer target — surfacing an IBAN on a
+    # closed bill would be misleading to anyone scanning the Moco UI.
+    if not invoice.already_paid_by_card:
+        due_date = _resolve_due_date(payload["date"], invoice.due_date)
+        if due_date:
+            payload["due_date"] = due_date
     if invoice.invoice_number:
         payload["receipt_identifier"] = invoice.invoice_number
-    if invoice.iban:
+    if invoice.iban and not invoice.already_paid_by_card:
         payload["iban"] = invoice.iban
     if reference_value:
         payload["reference"] = reference_value
@@ -499,6 +542,13 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
         payload["info"] = info_value
     if company_id is not None:
         payload["company_id"] = company_id
+    # Carry the draft's user across to the created purchase when present —
+    # email-imported drafts are usually associated with the inbox owner
+    # (or whoever forwarded the mail), and propagating that keeps Moco's
+    # "Mein Aufwand" filter and per-user reports correct. None falls back
+    # to whatever default Moco assigns to API-created purchases.
+    if user_id is not None:
+        payload["user_id"] = user_id
 
     return payload
 
@@ -528,6 +578,12 @@ def _resolve_reference_and_info(invoice: InvoiceData,
     fire on the same invoice if the model also extracted one.
     """
     info = invoice.payment_purpose
+    if payment_method == "credit_card":
+        # Bill is already settled — no outbound payment to reconcile, so
+        # neither the QR-reference nor the SCOR creditor reference belongs
+        # in the Moco purchase. The Zahlungszweck stays in `info` if the
+        # model extracted it (useful context for the reviewer).
+        return None, info
     if invoice.qr_reference and payment_method == "bank_transfer_swiss_qr_esr":
         return invoice.qr_reference, info
     if invoice.qr_reference and not _is_qr_iban(invoice.iban):
@@ -749,14 +805,19 @@ def _resolve_due_date(invoice_date: str | None,
 def _payment_method_for(invoice: InvoiceData) -> str:
     """Pick the Moco payment_method enum from what OCR found.
 
-    Swiss QR-ESR requires a QR-IBAN AND a QR-reference together — Moco
-    enforces both. A QR-reference with a regular (non-QR) IBAN is a
-    common OCR misread (the model recognises the numeric block but the
-    creditor is on a normal account) and would 422; fall through to
-    plain `bank_transfer` in that case rather than pushing a guaranteed
-    failure. The caller drops the `reference` field too so it doesn't
-    surface as a stray SCOR-shaped string on a plain transfer.
+    Priority:
+      1. `already_paid_by_card` → `credit_card`. The bill is closed; we
+         expose card-paid AND POS-terminal cases as the same enum (Moco
+         doesn't have a dedicated POS / EFT value and the operator only
+         cares that no outbound transfer is owed).
+      2. QR-ESR — requires a QR-IBAN AND a QR-reference together; Moco
+         enforces both. A QR-reference with a regular (non-QR) IBAN is a
+         common OCR misread and would 422; fall through to plain
+         `bank_transfer` rather than push a guaranteed failure.
+      3. Plain `bank_transfer` (default).
     """
+    if invoice.already_paid_by_card:
+        return "credit_card"
     if invoice.qr_reference and _is_qr_iban(invoice.iban):
         return "bank_transfer_swiss_qr_esr"
     return "bank_transfer"
@@ -819,16 +880,23 @@ def _format_ocr_comment(invoice: InvoiceData) -> str:
             "<strong>⚠️ Als Gutschrift erkannt — Vorzeichen prüfen!</strong>"
         )
 
+    # Build the Betrag cell so an already-paid card / POS bill carries the
+    # marker inline with the amount it modifies (rather than as a separate
+    # top-of-comment banner) — visually couples "what was paid" with "how
+    # it was paid", and keeps the reviewer's eye on a single field.
+    if invoice.total_amount is not None:
+        betrag = f"{invoice.currency or 'CHF'} {invoice.total_amount:.2f}"
+        if invoice.already_paid_by_card:
+            betrag += " — 💳 bereits bezahlt (Karte / Terminal)"
+    else:
+        betrag = None
+
     fields: list[str] = []
     fields.append(_li("Kommission", invoice.commission))
     fields.append(_li("Lieferadresse", invoice.delivery_address))
     fields.append(_li("Lieferant", invoice.supplier_name))
     fields.append(_li("Adresse", invoice.supplier_address))
-    fields.append(_li(
-        "Betrag",
-        (f"{invoice.currency or 'CHF'} {invoice.total_amount:.2f}"
-         if invoice.total_amount is not None else None),
-    ))
+    fields.append(_li("Betrag", betrag))
     fields.append(_li("Datum", invoice.invoice_date))
     fields.append(_li("Fällig", invoice.due_date))
     fields.append(_li("Rechnungs-Nr", invoice.invoice_number))
