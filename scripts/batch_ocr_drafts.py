@@ -81,14 +81,18 @@ class Row:
     no-attachment skip). `supplier_matched` is True when the supplier
     was uniquely resolved against Moco's company list — rendered with a
     ✓ in the Lieferant column so the operator can spot at a glance which
-    rows will land company-less. `result` is a short human-readable
-    summary; we truncate it at print time so the table stays readable.
+    rows will land company-less. `already_paid` mirrors the OCR's
+    `already_paid_by_card` flag — rendered with a ✓ in the Betrag column
+    so card/POS receipts stand out next to open invoices. `result` is a
+    short human-readable summary; we truncate it at print time so the
+    table stays readable.
     """
     draft_id: int
     purchase_id: int | None
     supplier: str | None
     supplier_matched: bool
     amount: str | None
+    already_paid: bool
     result: str
 
 
@@ -172,14 +176,15 @@ def _process_draft(draft: dict, *,
     print(f"  [{idx}/{total}] draft {draft_id}", flush=True)
     if not file_url:
         _step("Skipped: no file_url on draft")
-        return Row(draft_id, None, None, False, None, "Skipped: no_file_url")
+        return Row(draft_id, None, None, False, None, False,
+                   "Skipped: no_file_url")
 
     # --- download + OCR ----------------------------------------------------
     try:
         pdf_bytes = source_moco.download_file(file_url)
     except Exception as e:
         _step(f"PDF download failed: {e}")
-        return Row(draft_id, None, None, False, None,
+        return Row(draft_id, None, None, False, None, False,
                    f"PDF download failed: {e}")
 
     t0 = time.monotonic()
@@ -190,7 +195,7 @@ def _process_draft(draft: dict, *,
         _step(f"PDF {len(pdf_bytes) / 1024:.0f} KB, OCR failed after "
               f"{ocr_secs:.1f}s ({e})")
         status = e.status_code if e.status_code is not None else "parse"
-        return Row(draft_id, None, None, False, None,
+        return Row(draft_id, None, None, False, None, False,
                    f"OCR error {status}: {e}")
     ocr_secs = time.monotonic() - t0
     _step(f"PDF {len(pdf_bytes) / 1024:.0f} KB, OCR {ocr_secs:.1f}s")
@@ -242,14 +247,23 @@ def _process_draft(draft: dict, *,
 
     # --- payment method + IBAN tail ---------------------------------------
     method = _payment_method_for(invoice)
-    iban_tail = invoice.iban[-4:] if invoice.iban else "----"
-    qr_note = "  (QR-IBAN)" if _is_qr_iban(invoice.iban) else ""
-    _step(f"payment: {method}  IBAN …{iban_tail}{qr_note}")
+    if method == "credit_card":
+        # Bill already settled — the IBAN line would be misleading here
+        # since the service suppresses iban/reference/due_date on the
+        # credit_card branch. Surface the marker prominently instead.
+        _step(f"payment: {method}  💳 bereits bezahlt "
+              "(Karte / Terminal — IBAN & due_date suppressed)")
+    else:
+        iban_tail = invoice.iban[-4:] if invoice.iban else "----"
+        qr_note = "  (QR-IBAN)" if _is_qr_iban(invoice.iban) else ""
+        _step(f"payment: {method}  IBAN …{iban_tail}{qr_note}")
 
     amount_cell = _format_amount(invoice.currency, invoice.total_amount)
+    paid = invoice.already_paid_by_card
 
     if not apply:
         return Row(draft_id, None, invoice.supplier_name, matched, amount_cell,
+                   paid,
                    f"Dry-run OK (would create, confidence={invoice.confidence:.0%})")
 
     # --- apply: create + comments + delete draft --------------------------
@@ -262,12 +276,12 @@ def _process_draft(draft: dict, *,
         if not (400 <= e.code < 500):
             _step(f"POST failed: HTTP {e.code} {e.reason}")
             return Row(draft_id, None, invoice.supplier_name, matched,
-                       amount_cell, f"HTTP {e.code} {e.reason}")
+                       amount_cell, paid, f"HTTP {e.code} {e.reason}")
         err_body = e.read().decode("utf-8", errors="replace")[:500]
         err_body = err_body.replace("\n", " ")
         _step(f"Moco rejected: {e.code} {err_body}")
         return Row(draft_id, None, invoice.supplier_name, matched, amount_cell,
-                   f"Moco {e.code}: {err_body}")
+                   paid, f"Moco {e.code}: {err_body}")
 
     new_purchase_id = created.get("id")
     if new_purchase_id:
@@ -280,7 +294,7 @@ def _process_draft(draft: dict, *,
         service._delete_draft_after_create(draft_id, new_purchase_id)
         _step(f"created purchase id={new_purchase_id}")
     return Row(draft_id, new_purchase_id, invoice.supplier_name, matched,
-               amount_cell,
+               amount_cell, paid,
                f"Created (confidence={invoice.confidence:.0%})")
 
 
@@ -315,11 +329,21 @@ def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
             text = text[:SUPPLIER_MAX_CHARS - 1] + "…"
         return mark + text
 
+    def _amount_cell(r: Row) -> str:
+        # ✓ prefix mirrors the Lieferant column: marker = condition met,
+        # blank = condition absent. For Betrag the condition is "OCR
+        # detected this bill as already paid via card / POS" — visually
+        # flags receipts that won't be transferred from any bank account.
+        if not r.amount:
+            return "-"
+        mark = "✓ " if r.already_paid else "  "
+        return mark + r.amount
+
     def _trim(s: str) -> str:
         return s if len(s) <= result_width else s[:result_width - 1] + "…"
 
     supplier_cells = [_supplier_cell(r) for r in rows]
-    amount_cells = [r.amount or "-" for r in rows]
+    amount_cells = [_amount_cell(r) for r in rows]
 
     draft_w = max(len(headers[0]),
                   max((len(str(r.draft_id)) for r in rows), default=0))
@@ -354,10 +378,11 @@ def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
     skipped = sum(1 for r in rows if r.result.startswith("Skipped"))
     dry = sum(1 for r in rows if r.result.startswith("Dry-run"))
     matched = sum(1 for r in rows if r.supplier_matched)
+    paid = sum(1 for r in rows if r.already_paid)
     print()
     print(f"Total: {len(rows)}   created: {created}   "
           f"dry-run: {dry}   skipped: {skipped}   failed: {failed}   "
-          f"supplier-matched: {matched}")
+          f"supplier-matched: {matched}   already-paid: {paid}")
 
 
 def main() -> int:

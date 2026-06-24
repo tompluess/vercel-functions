@@ -161,6 +161,8 @@ class SupplierInvoiceOcrService:
                     "supplier_name": invoice.supplier_name if invoice else None,
                     "total_amount": invoice.total_amount if invoice else None,
                     "currency": invoice.currency if invoice else None,
+                    "already_paid_by_card": (invoice.already_paid_by_card
+                                              if invoice else False),
                     "company_id": company_id}
 
         new_purchase_id = created.get("id")
@@ -183,6 +185,7 @@ class SupplierInvoiceOcrService:
             "supplier_name": invoice.supplier_name,
             "total_amount": invoice.total_amount,
             "currency": invoice.currency,
+            "already_paid_by_card": invoice.already_paid_by_card,
         }
 
     # --- vat code resolution ------------------------------------------------
@@ -503,12 +506,16 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
         },
     }
 
-    due_date = _resolve_due_date(payload["date"], invoice.due_date)
-    if due_date:
-        payload["due_date"] = due_date
+    # Already-paid card receipts: skip due_date + IBAN entirely. There's
+    # nothing to schedule and no transfer target — surfacing an IBAN on a
+    # closed bill would be misleading to anyone scanning the Moco UI.
+    if not invoice.already_paid_by_card:
+        due_date = _resolve_due_date(payload["date"], invoice.due_date)
+        if due_date:
+            payload["due_date"] = due_date
     if invoice.invoice_number:
         payload["receipt_identifier"] = invoice.invoice_number
-    if invoice.iban:
+    if invoice.iban and not invoice.already_paid_by_card:
         payload["iban"] = invoice.iban
     if reference_value:
         payload["reference"] = reference_value
@@ -545,6 +552,12 @@ def _resolve_reference_and_info(invoice: InvoiceData,
     fire on the same invoice if the model also extracted one.
     """
     info = invoice.payment_purpose
+    if payment_method == "credit_card":
+        # Bill is already settled — no outbound payment to reconcile, so
+        # neither the QR-reference nor the SCOR creditor reference belongs
+        # in the Moco purchase. The Zahlungszweck stays in `info` if the
+        # model extracted it (useful context for the reviewer).
+        return None, info
     if invoice.qr_reference and payment_method == "bank_transfer_swiss_qr_esr":
         return invoice.qr_reference, info
     if invoice.qr_reference and not _is_qr_iban(invoice.iban):
@@ -766,14 +779,19 @@ def _resolve_due_date(invoice_date: str | None,
 def _payment_method_for(invoice: InvoiceData) -> str:
     """Pick the Moco payment_method enum from what OCR found.
 
-    Swiss QR-ESR requires a QR-IBAN AND a QR-reference together — Moco
-    enforces both. A QR-reference with a regular (non-QR) IBAN is a
-    common OCR misread (the model recognises the numeric block but the
-    creditor is on a normal account) and would 422; fall through to
-    plain `bank_transfer` in that case rather than pushing a guaranteed
-    failure. The caller drops the `reference` field too so it doesn't
-    surface as a stray SCOR-shaped string on a plain transfer.
+    Priority:
+      1. `already_paid_by_card` → `credit_card`. The bill is closed; we
+         expose card-paid AND POS-terminal cases as the same enum (Moco
+         doesn't have a dedicated POS / EFT value and the operator only
+         cares that no outbound transfer is owed).
+      2. QR-ESR — requires a QR-IBAN AND a QR-reference together; Moco
+         enforces both. A QR-reference with a regular (non-QR) IBAN is a
+         common OCR misread and would 422; fall through to plain
+         `bank_transfer` rather than push a guaranteed failure.
+      3. Plain `bank_transfer` (default).
     """
+    if invoice.already_paid_by_card:
+        return "credit_card"
     if invoice.qr_reference and _is_qr_iban(invoice.iban):
         return "bank_transfer_swiss_qr_esr"
     return "bank_transfer"
@@ -834,6 +852,11 @@ def _format_ocr_comment(invoice: InvoiceData) -> str:
     if invoice.is_credit_note:
         parts.append(
             "<strong>⚠️ Als Gutschrift erkannt — Vorzeichen prüfen!</strong>"
+        )
+    if invoice.already_paid_by_card:
+        parts.append(
+            "<strong>💳 Bereits bezahlt (Karte / Terminal) — "
+            "payment_method=credit_card</strong>"
         )
 
     fields: list[str] = []

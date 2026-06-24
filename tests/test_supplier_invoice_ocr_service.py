@@ -38,6 +38,7 @@ def make_invoice(**overrides) -> InvoiceData:
         is_credit_note=False,
         commission=None,
         delivery_address=None,
+        already_paid_by_card=False,
         confidence=0.92,
     )
     base.update(overrides)
@@ -285,6 +286,38 @@ def test_payment_method_falls_back_when_iban_is_not_qr_iban():
     assert payload["payment_method"] == "bank_transfer"
     assert payload["iban"] == "CH9300762011623852957"
     assert "reference" not in payload   # dropped — would 422 otherwise
+
+
+def test_already_paid_by_card_sets_credit_card_and_drops_payment_fields():
+    """OCR-detected card / POS payment routes to `payment_method=credit_card`
+    and suppresses the open-bill payment fields (iban, reference, due_date)
+    — the bill is settled, there's no outbound transfer to schedule, and
+    surfacing an IBAN on a closed bill would mislead anyone scanning the
+    Moco UI. The Zahlungszweck stays in `info` as reviewer context."""
+    invoice = make_invoice(
+        already_paid_by_card=True,
+        # All three of these would normally land on the payload — they
+        # MUST be suppressed on the credit_card branch.
+        iban="CH4431999123000889012",
+        qr_reference="210000000003139471430009017",
+        creditor_reference="RF43R0032202606070",
+        due_date="2026-06-11",
+        payment_purpose="Tankstelle / Visa",
+    )
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    payload = purchases.creates[0]
+
+    assert payload["payment_method"] == "credit_card"
+    assert "iban" not in payload
+    assert "reference" not in payload
+    assert "due_date" not in payload
+    # Zahlungszweck still useful as context for the reviewer.
+    assert payload["info"] == "Tankstelle / Visa"
+    # Other unrelated fields untouched.
+    assert payload["currency"] == "CHF"
+    assert payload["receipt_identifier"] == "R-2026-042"
 
 
 def test_creditor_reference_lands_in_purchase_reference_field():

@@ -79,6 +79,14 @@ class InvoiceData:
     # often the site address that pairs with the Kommission. Different
     # from `supplier_address` (which is the supplier's own HQ).
     delivery_address: str | None
+    # True when the document shows the bill was ALREADY settled via a
+    # card payment — credit card, debit card / EC-Karte, Maestro, Visa,
+    # Mastercard, TWINT, or a POS / EFT terminal slip. Drives the Moco
+    # `payment_method` to `credit_card` and suppresses the IBAN / reference
+    # / due_date payload fields (the bill is closed; there's no outbound
+    # transfer to schedule). Default False — a regular open invoice with
+    # an IBAN-and-QR Zahlteil is NOT "already paid".
+    already_paid_by_card: bool
     confidence: float
 
 
@@ -174,6 +182,18 @@ SYSTEM_PROMPT = (
     'site address printed on the invoice header or reference block (used '
     'downstream to assign the purchase to a Moco project). null if not '
     'explicitly present — do not infer from the supplier address.",\n'
+    '  "already_paid_by_card": "boolean — true if the document indicates '
+    'the bill was ALREADY SETTLED via a card payment: credit card, debit '
+    'card / EC-Karte, Maestro, Visa, Mastercard, TWINT, or a POS / EFT '
+    'terminal (Zahlungsterminal, Kassenbeleg, receipt-strip layout). '
+    'Telltale markers: \\"Bezahlt\\" / \\"Paid\\" near the total, '
+    '\\"Saldo: 0.00\\", \\"Zahlbetrag: 0.00\\", an explicit card-type / '
+    'last-four printed under the total (\\"Visa ****1234\\"), '
+    '\\"Quittung\\" / \\"Beleg\\" / \\"Kassenbon\\" header, or a thermal '
+    'receipt format. DO NOT set true just because the invoice has an '
+    'IBAN-and-QR Zahlteil — that is an OPEN invoice awaiting transfer. '
+    'When uncertain default to false. The default and most common case '
+    'is false.",\n'
     '  "delivery_address": "string — Lieferadresse / Liefer-/Versandadresse / '
     'Baustelle / Lieferort — the delivery or site address where the goods '
     'or services were delivered, distinct from the supplier_address. '
@@ -401,6 +421,7 @@ def _to_invoice_data(data: dict) -> InvoiceData:
         is_credit_note=_bool_or_false(data.get("is_credit_note")),
         commission=_str_or_none(data.get("commission")),
         delivery_address=_str_or_none(data.get("delivery_address")),
+        already_paid_by_card=_bool_or_false(data.get("already_paid_by_card")),
         confidence=_float_or_none(data.get("confidence")) or 0.0,
     )
 
