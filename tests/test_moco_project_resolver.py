@@ -31,10 +31,12 @@ def projects() -> list[dict]:
     ]
 
 
-def test_indexed_count_skips_missing_and_empty(projects):
+def test_indexed_count_includes_name_fallbacks(projects):
     r = MocoProjectResolver(projects)
-    # 1, 2, 3, 6 indexed; 4 (missing) and 5 (empty) skipped
-    assert r.indexed_count() == 4
+    # All six projects in the fixture have a name; the four with a
+    # Kommission are indexed by that value, the remaining two (#4, #5)
+    # fall back to their name. So all six get indexed.
+    assert r.indexed_count() == 6
 
 
 def test_resolve_empty_returns_empty_status():
@@ -157,13 +159,35 @@ def test_resolve_exact_wins_over_substring():
     assert m.project["id"] == 1
 
 
-def test_resolver_handles_projects_without_custom_properties_block():
-    # Defensive: Moco API may omit custom_properties entirely on projects
-    # that have no custom fields at all.
-    r = MocoProjectResolver([{"id": 99, "name": "no-props"}])
+def test_resolver_falls_back_to_name_when_kommission_missing():
+    # When the Kommission custom-field is missing/empty, the project name
+    # serves as the index key — both at exact and substring tiers.
+    r = MocoProjectResolver([{"id": 99, "name": "Sanierung Hauptstrasse"}])
+    assert r.indexed_count() == 1
+    m = r.resolve("Sanierung Hauptstrasse")
+    assert m.status == "matched"
+    assert m.tier == "exact"
+    assert m.project["id"] == 99
+
+
+def test_resolver_skips_projects_with_neither_kommission_nor_name():
+    # Defensive: nothing to index → not indexed, no_match on lookup.
+    r = MocoProjectResolver([{"id": 1}])
     assert r.indexed_count() == 0
-    m = r.resolve("anything")
-    assert m.status == "no_match"
+    assert r.resolve("anything").status == "no_match"
+
+
+def test_kommission_wins_over_name_when_both_present():
+    # Project has both a Kommission and a name; the Kommission value is
+    # what gets indexed (the name fallback only kicks in when Kommission
+    # is missing/empty), so a lookup against the name doesn't match.
+    projects = [{"id": 7, "name": "Bauvorhaben Müller",
+                 "custom_properties": {"Kommission": "K-99"}}]
+    r = MocoProjectResolver(projects)
+    assert r.resolve("K-99").status == "matched"
+    # The name is NOT indexed when Kommission is set — looking up the
+    # name returns no_match (no other project has it).
+    assert r.resolve("Bauvorhaben Müller").status == "no_match"
 
 
 def test_custom_field_label_override():

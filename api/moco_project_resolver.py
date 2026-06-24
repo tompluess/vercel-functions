@@ -81,26 +81,37 @@ class MocoProjectResolver:
         # than silently picking the first.
         self._index: dict[str, list[dict]] = {}
         for p in projects:
-            value = self._extract_kommission(p)
+            value = self._extract_index_key(p)
             if value is None:
                 continue
             self._index.setdefault(value, []).append(p)
 
-    def _extract_kommission(self, project: dict) -> str | None:
+    def _extract_index_key(self, project: dict) -> str | None:
+        """Return the normalized key under which the project is indexed.
+
+        Preference order: the `Kommission` custom-property value if set,
+        else fall back to `project.name`. Projects with neither are not
+        indexed (returns None). The name fallback makes the resolver
+        useful for projects where the operator hasn't filled in the
+        Kommission field yet, at the cost of every-project-indexed-by-name
+        being noisier on the substring tier.
+        """
         props = project.get("custom_properties")
-        if not isinstance(props, dict):
+        if isinstance(props, dict):
+            raw = props.get(self._custom_field_label)
+            # Moco may return non-string types (e.g. integers) on numeric
+            # custom fields. Coerce to str for normalization.
+            if raw is not None and raw != "":
+                return _normalize(str(raw))
+        name = project.get("name")
+        if name is None or name == "":
             return None
-        raw = props.get(self._custom_field_label)
-        # Moco may return non-string types (e.g. integers) on numeric
-        # custom fields. Coerce to str for normalization; truthy gate
-        # filters out None and ""
-        if raw is None or raw == "":
-            return None
-        return _normalize(str(raw))
+        return _normalize(str(name))
 
     def indexed_count(self) -> int:
-        """Number of distinct Kommission keys in the index (operator-facing
-        diagnostic for the batch script's startup log line)."""
+        """Number of distinct index keys (operator-facing diagnostic for
+        the batch script's startup log line). Counts both Kommission-keyed
+        and name-fallback-keyed projects."""
         return len(self._index)
 
     def resolve(self, raw: str | None) -> ProjectMatch:
