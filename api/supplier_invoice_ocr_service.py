@@ -853,22 +853,24 @@ def _format_ocr_comment(invoice: InvoiceData) -> str:
         parts.append(
             "<strong>⚠️ Als Gutschrift erkannt — Vorzeichen prüfen!</strong>"
         )
-    if invoice.already_paid_by_card:
-        parts.append(
-            "<strong>💳 Bereits bezahlt (Karte / Terminal) — "
-            "payment_method=credit_card</strong>"
-        )
+
+    # Build the Betrag cell so an already-paid card / POS bill carries the
+    # marker inline with the amount it modifies (rather than as a separate
+    # top-of-comment banner) — visually couples "what was paid" with "how
+    # it was paid", and keeps the reviewer's eye on a single field.
+    if invoice.total_amount is not None:
+        betrag = f"{invoice.currency or 'CHF'} {invoice.total_amount:.2f}"
+        if invoice.already_paid_by_card:
+            betrag += " — 💳 bereits bezahlt (Karte / Terminal)"
+    else:
+        betrag = None
 
     fields: list[str] = []
     fields.append(_li("Kommission", invoice.commission))
     fields.append(_li("Lieferadresse", invoice.delivery_address))
     fields.append(_li("Lieferant", invoice.supplier_name))
     fields.append(_li("Adresse", invoice.supplier_address))
-    fields.append(_li(
-        "Betrag",
-        (f"{invoice.currency or 'CHF'} {invoice.total_amount:.2f}"
-         if invoice.total_amount is not None else None),
-    ))
+    fields.append(_li("Betrag", betrag))
     fields.append(_li("Datum", invoice.invoice_date))
     fields.append(_li("Fällig", invoice.due_date))
     fields.append(_li("Rechnungs-Nr", invoice.invoice_number))
