@@ -113,13 +113,17 @@ class SupplierInvoiceOcrService:
         if not draft_id:
             logger.warning("ocr: skipped (no draft id) body_keys=%s",
                            sorted(body.keys()))
-            self._notify("⚠️ OCR übersprungen — Webhook ohne Draft-ID")
+            self._notify(
+                "⚠️ OCR übersprungen — Webhook ohne Draft-ID"
+                + _draft_context_suffix(body)
+            )
             return {"skipped": "no_purchase_id"}
         if not file_url:
             logger.warning("ocr: skipped (no file_url) draft_id=%s", draft_id)
             self._notify(
                 "⚠️ OCR übersprungen — Draft ohne Anhang: "
                 f"{self._draft_url(draft_id)}"
+                + _draft_context_suffix(body)
             )
             return {"skipped": "no_file_url", "draft_id": draft_id}
 
@@ -172,7 +176,7 @@ class SupplierInvoiceOcrService:
             err_body = e.read().decode("utf-8", errors="replace")[:500]
             logger.warning("ocr: Moco rejected request: %s %s",
                            e.code, err_body)
-            self._notify_moco_4xx(draft_id, e.code, err_body)
+            self._notify_moco_4xx(draft_id, e.code, err_body, body)
             return {"skipped": "moco_rejected", "draft_id": draft_id,
                     "moco_status": e.code, "moco_error": err_body,
                     # OCR fields are None when the 4xx fired before OCR
@@ -560,7 +564,7 @@ class SupplierInvoiceOcrService:
         )
 
     def _notify_moco_4xx(self, draft_id: int, status_code: int,
-                         err_body: str) -> None:
+                         err_body: str, body: dict) -> None:
         """Telegram alert for a Moco 4xx that the silent-skip swallowed.
 
         Without this the operator has no signal that the OCR purchase
@@ -574,8 +578,9 @@ class SupplierInvoiceOcrService:
         self._telegram.notify(
             "❌ OCR-Purchase nicht erstellt — Moco hat die Anfrage "
             f"abgelehnt (HTTP {status_code})\n"
-            f"Draft: {self._draft_url(draft_id)}\n"
-            f"Detail: {err_body}"
+            f"Draft: {self._draft_url(draft_id)}"
+            + _draft_context_suffix(body)
+            + f"\nDetail: {err_body}"
         )
 
     def _purchase_url(self, purchase_id: int) -> str:
@@ -585,6 +590,38 @@ class SupplierInvoiceOcrService:
     def _draft_url(self, draft_id: int) -> str:
         return (f"https://{self._source_account_url}.mocoapp.com"
                 f"/purchases/drafts/{draft_id}")
+
+
+_DRAFT_CONTEXT_FIELD_MAX = 120
+
+
+def _draft_context_suffix(body: dict) -> str:
+    """Format the Betreff/Absender lines appended to skip notifications.
+
+    Each line is omitted when its source field is empty/missing, so a
+    manually-uploaded draft with no email metadata produces an empty
+    suffix rather than `Betreff: —` noise. Long forwarded subject chains
+    are truncated to keep the Telegram message readable.
+    """
+    lines: list[str] = []
+    title = _clean_context_field(body.get("title"))
+    if title:
+        lines.append(f"Betreff: {title}")
+    sender = _clean_context_field(body.get("email_from"))
+    if sender:
+        lines.append(f"Absender: {sender}")
+    return "\n" + "\n".join(lines) if lines else ""
+
+
+def _clean_context_field(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = " ".join(value.split())
+    if not cleaned:
+        return None
+    if len(cleaned) > _DRAFT_CONTEXT_FIELD_MAX:
+        cleaned = cleaned[:_DRAFT_CONTEXT_FIELD_MAX - 1] + "…"
+    return cleaned
 
 
 def _user_id_from_draft(body: dict) -> int | None:

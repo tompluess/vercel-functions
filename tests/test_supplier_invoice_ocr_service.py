@@ -230,6 +230,47 @@ def test_process_skips_when_file_url_missing_and_telegram_alerts():
     assert "purchases/drafts/3001069" in tg.messages[0]
 
 
+def test_no_file_url_alert_includes_subject_and_sender():
+    """The ⚠️ skip notification carries Betreff + Absender so the
+    operator can recognize the draft without opening the deep-link."""
+    tg = FakeTelegram()
+    s = build_service(telegram=tg)
+    s.process("create", {
+        "id": 3001069,
+        "title": "Rechnung Nr. 80572997",
+        "email_from": "rechnung@sonepar.ch",
+    })
+    msg = tg.messages[0]
+    assert "Betreff: Rechnung Nr. 80572997" in msg
+    assert "Absender: rechnung@sonepar.ch" in msg
+
+
+def test_no_file_url_alert_omits_missing_context_lines():
+    """Manually-uploaded drafts with no email_from / no title produce
+    no Betreff/Absender lines (rather than `Betreff: —` noise)."""
+    tg = FakeTelegram()
+    s = build_service(telegram=tg)
+    s.process("create", {"id": 3001069})
+    msg = tg.messages[0]
+    assert "Betreff" not in msg
+    assert "Absender" not in msg
+
+
+def test_no_draft_id_alert_includes_context_when_present():
+    """Even on the malformed-webhook path (no id) the body may still
+    carry a title/email_from — surface them so a misconfigured
+    integration can be diagnosed without checking Vercel logs."""
+    tg = FakeTelegram()
+    s = build_service(telegram=tg)
+    s.process("create", {
+        "title": "Aircondition - Rechnung 80572997",
+        "email_from": "info@digitec.ch",
+    })
+    msg = tg.messages[0]
+    assert "Betreff: Aircondition - Rechnung 80572997" in msg
+    assert "Absender: info@digitec.ch" in msg
+
+
 def test_process_runs_when_no_telegram_configured():
     """Telegram is optional; service still creates the purchase."""
     purchases = FakePurchaseClient()
@@ -1586,6 +1627,30 @@ def test_moco_4xx_during_pdf_download_is_silent_skip():
     assert result["moco_status"] == 403
     assert len(tg.messages) == 1
     assert "HTTP 403" in tg.messages[0]
+
+
+def test_moco_4xx_alert_includes_subject_and_sender():
+    """❌ OCR-Purchase nicht erstellt also carries the draft Betreff +
+    Absender so the operator can triage from Telegram alone."""
+    import io
+    purchases = FakePurchaseClient()
+    purchases.create_error = urlerror.HTTPError(
+        "https://x", 422, "Unprocessable Entity", {},
+        fp=io.BytesIO(b'{"receipt_identifier":["ist bereits vergeben"]}'),
+    )
+    tg = FakeTelegram()
+    s = build_service(purchases=purchases, telegram=tg)
+    s.process("create", {
+        "id": 3001069,
+        "file_url": "https://x/y.pdf",
+        "title": "WG: Rechnung Müller GmbH",
+        "email_from": "buchhaltung@meier-ag.ch",
+    })
+    msg = tg.messages[0]
+    assert "Betreff: WG: Rechnung Müller GmbH" in msg
+    assert "Absender: buchhaltung@meier-ag.ch" in msg
+    # Detail line is preserved below the context lines.
+    assert "ist bereits vergeben" in msg
 
 
 def test_moco_4xx_skip_without_telegram_does_not_crash():
