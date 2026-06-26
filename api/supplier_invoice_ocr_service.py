@@ -60,6 +60,8 @@ from api.anthropic_ocr_client import (
     _normalize_iban,
     _normalize_qr_reference,
 )
+from api.moco_category_resolver import MocoCategoryResolver
+from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
 from api.source_moco_client import SourceMocoClient
 from api.telegram_notifier import TelegramNotifier
@@ -75,12 +77,23 @@ class SupplierInvoiceOcrService:
                  purchase_client: MocoPurchaseClient,
                  ocr: AnthropicOcrClient,
                  source_account_url: str,
-                 telegram: TelegramNotifier | None = None):
+                 telegram: TelegramNotifier | None = None,
+                 project_resolver: MocoProjectResolver | None = None,
+                 category_resolver: MocoCategoryResolver | None = None):
         self._source_moco = source_moco
         self._purchases = purchase_client
         self._ocr = ocr
         self._source_account_url = source_account_url
         self._telegram = telegram
+        # Optional — when set, the service resolves the OCR'd Kommission
+        # to a Moco project and assigns each line item to it after the
+        # purchase is created. Optional so existing unit tests that don't
+        # care about assignment can omit it without setup churn.
+        self._project_resolver = project_resolver
+        # Optional — when set, the service picks `category_id` per the
+        # Stage-3 chain (already-paid → omit, project Aufwandkonto →
+        # match, else 4000 fallback). Same optional-collaborator pattern.
+        self._category_resolver = category_resolver
 
     def process(self, event: str, body: dict) -> dict[str, Any]:
         """Drive one Purchase webhook through OCR + new-purchase creation.
@@ -130,6 +143,12 @@ class SupplierInvoiceOcrService:
 
             company_id = self._lookup_supplier_company(invoice.supplier_name)
             vat_code_id = self._resolve_vat_code_id(invoice, company_id)
+            # Resolve the project first so the category lookup can use it
+            # (project's Aufwandkonto custom-property overrides the 4000
+            # default). The same match feeds the post-create
+            # `assign_to_project` loop so we don't resolve twice.
+            project_match = self._resolve_project_match(invoice)
+            category_id = self._resolve_category_id(invoice, project_match)
 
             payload = _build_create_payload(
                 invoice, pdf_bytes,
@@ -137,6 +156,7 @@ class SupplierInvoiceOcrService:
                 company_id=company_id,
                 draft_id=draft_id,
                 user_id=_user_id_from_draft(body),
+                category_id=category_id,
             )
             created = self._purchases.create_purchase(payload)
         except urlerror.HTTPError as e:
@@ -170,13 +190,20 @@ class SupplierInvoiceOcrService:
         logger.info("ocr: created purchase id=%s from draft=%s",
                     new_purchase_id, draft_id)
 
+        assign_warnings: list[str] = []
         if new_purchase_id:
             self._post_summary_comments(new_purchase_id, invoice,
                                         draft_id, body)
+            assign_warnings = self._assign_resolved_project(
+                created, project_match)
             self._delete_draft_after_create(draft_id, new_purchase_id)
 
-        self._notify_outcome(new_purchase_id, draft_id, invoice)
+        self._notify_outcome(new_purchase_id, draft_id, invoice,
+                             assign_warnings)
 
+        assigned_project = (project_match.project
+                            if project_match and project_match.status == "matched"
+                            else None)
         return {
             "draft_id": draft_id,
             "purchase_id": new_purchase_id,
@@ -187,6 +214,10 @@ class SupplierInvoiceOcrService:
             "total_amount": invoice.total_amount,
             "currency": invoice.currency,
             "already_paid_by_card": invoice.already_paid_by_card,
+            "assigned_project_id": (assigned_project.get("id")
+                                    if assigned_project else None),
+            "assigned_project_name": (assigned_project.get("name")
+                                      if assigned_project else None),
         }
 
     # --- vat code resolution ------------------------------------------------
@@ -331,10 +362,109 @@ class SupplierInvoiceOcrService:
             logger.exception("ocr: OCR-summary comment failed "
                              "purchase_id=%s", purchase_id)
 
+    # --- project + category resolution --------------------------------------
+
+    def _resolve_project_match(self, invoice: InvoiceData
+                                ) -> ProjectMatch | None:
+        """Run the Kommission→project resolver if one is wired. Returns
+        None when no resolver was injected, otherwise the resolver's
+        ProjectMatch (which may report `matched` / `ambiguous` /
+        `no_match` / `empty`)."""
+        if self._project_resolver is None:
+            return None
+        return self._project_resolver.resolve(invoice.commission)
+
+    def _resolve_category_id(self, invoice: InvoiceData,
+                              project_match: ProjectMatch | None
+                              ) -> int | None:
+        """Decide which `category_id` to set on the purchase's line item.
+
+        Returns None whenever the caller should OMIT `category_id` from
+        the payload (already-paid bill, project-override miss, no
+        4000-fallback, or no resolver wired). The category resolver owns
+        the chain; this method just bridges to it.
+        """
+        if self._category_resolver is None:
+            return None
+        project = (project_match.project
+                   if project_match and project_match.status == "matched"
+                   else None)
+        decision = self._category_resolver.resolve(
+            already_paid_by_card=invoice.already_paid_by_card,
+            project=project)
+        logger.info("ocr: category_id=%s (%s)",
+                    decision.category_id, decision.reason)
+        return decision.category_id
+
+    # --- project assignment -------------------------------------------------
+
+    def _assign_resolved_project(self, created: dict,
+                                  match: ProjectMatch | None) -> list[str]:
+        """Link each line item of `created` to the resolved Moco project.
+
+        Best-effort: the created purchase is the authoritative side effect.
+        On any per-item failure we collect a short warning string for the
+        Telegram alert; the sync still reports ok=true and the operator
+        can finish the assignment manually during review.
+
+        Skipped silently when:
+          - no project resolver was injected (`match is None`);
+          - the resolver returned `empty` / `no_match` / `ambiguous` —
+            we prefer leaving the purchase project-less to mis-routing it.
+        """
+        warnings: list[str] = []
+        if match is None:
+            return warnings
+        if match.status != "matched":
+            logger.info("ocr: project assign skipped (status=%s)", match.status)
+            return warnings
+
+        purchase_id = created.get("id")
+        items = created.get("items") or []
+        if not items:
+            logger.warning("ocr: created purchase %s has no items — skipping "
+                           "project assign", purchase_id)
+            return warnings
+
+        project_id = match.project.get("id")
+        project_name = match.project.get("name")
+        for item in items:
+            item_id = item.get("id") if isinstance(item, dict) else None
+            if item_id is None:
+                continue
+            try:
+                self._purchases.assign_item_to_project(
+                    purchase_id, item_id,
+                    project_id=project_id,
+                    notify_project_leader=False,
+                    billable=True,
+                    budget_relevant=True,
+                    surcharge=True,
+                )
+                logger.info("ocr: assigned purchase=%s item=%s to "
+                            "project=%s (%r)",
+                            purchase_id, item_id, project_id, project_name)
+            except urlerror.HTTPError as e:
+                err_body = "<unreadable>"
+                try:
+                    err_body = e.read().decode("utf-8", errors="replace")[:200]
+                except Exception:
+                    pass
+                logger.warning("ocr: assign_to_project failed for "
+                               "purchase=%s item=%s: HTTP %s %s",
+                               purchase_id, item_id, e.code, err_body)
+                warnings.append(f"Item {item_id}: HTTP {e.code} {err_body}")
+            except Exception as e:
+                logger.exception("ocr: assign_to_project error for "
+                                 "purchase=%s item=%s", purchase_id, item_id)
+                warnings.append(f"Item {item_id}: {e}")
+        return warnings
+
     # --- telegram routing ---------------------------------------------------
 
     def _notify_outcome(self, purchase_id: int | None, draft_id: int,
-                        invoice: InvoiceData) -> None:
+                        invoice: InvoiceData,
+                        assign_warnings: list[str] | None = None) -> None:
         if not self._telegram:
             return
         link = (self._purchase_url(purchase_id) if purchase_id
@@ -342,6 +472,15 @@ class SupplierInvoiceOcrService:
         supplier = invoice.supplier_name or "Unbekannt"
         amount = (f"{invoice.currency or 'CHF'} {invoice.total_amount:.2f}"
                   if invoice.total_amount is not None else "Betrag ?")
+        # Append a warning block when one or more `assign_to_project` calls
+        # failed after a successful create. The purchase exists, so this is
+        # informational rather than a separate error alert — operator can
+        # finish the assignment by hand from the same purchase link.
+        suffix = ""
+        if assign_warnings:
+            suffix = ("\n⚠️ Projektzuweisung teilweise fehlgeschlagen "
+                      f"({len(assign_warnings)}): "
+                      + "; ".join(assign_warnings[:3]))
         if invoice.is_credit_note:
             # Gutschrift always triggers the alert regardless of confidence:
             # the reviewer must flip the sign on the total before approving.
@@ -349,6 +488,7 @@ class SupplierInvoiceOcrService:
                 f"⚠️ Gutschrift erkannt ({invoice.confidence:.0%}) — "
                 f"{supplier} {amount}\n"
                 f"Moco-Purchase erstellt, Vorzeichen prüfen: {link}"
+                f"{suffix}"
             )
             return
         if invoice.confidence >= CONFIDENCE_THRESHOLD:
@@ -356,12 +496,14 @@ class SupplierInvoiceOcrService:
                 f"✅ OCR erfolgreich ({invoice.confidence:.0%}) — "
                 f"{supplier} {amount}\n"
                 f"Moco-Purchase erstellt, bitte prüfen: {link}"
+                f"{suffix}"
             )
         else:
             self._telegram.notify(
                 f"⚠️ OCR unsicher ({invoice.confidence:.0%}) — "
                 f"{supplier} {amount}\n"
                 f"Moco-Purchase erstellt, bitte manuell prüfen: {link}"
+                f"{suffix}"
             )
 
     def _notify(self, text: str) -> None:
@@ -468,7 +610,8 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
                           vat_code_id: int | None,
                           company_id: int | None,
                           draft_id: int,
-                          user_id: int | None = None) -> dict[str, Any]:
+                          user_id: int | None = None,
+                          category_id: int | None = None) -> dict[str, Any]:
     """Construct the POST /purchases body.
 
     Moco requires: `date`, `currency`, `payment_method`, and `items` with
@@ -501,6 +644,12 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
     }
     if vat_code_id is not None:
         item["vat_code_id"] = vat_code_id
+    # `category_id` is the Buchhaltungs-Konto. Omitted when the resolver
+    # couldn't pick one (already-paid card receipt, project Aufwandkonto
+    # miss, missing 4000 fallback) — Moco accepts the purchase with its
+    # own default and the reviewer picks an account during approval.
+    if category_id is not None:
+        item["category_id"] = category_id
 
     payment_method = _payment_method_for(invoice)
     reference_value, info_value = _resolve_reference_and_info(

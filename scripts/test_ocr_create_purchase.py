@@ -15,9 +15,9 @@ Telegram is opt-in via --notify so accidental dry-runs don't ping.
 
 Usage (from the repo root):
     vercel env pull .env.local
-    .venv/bin/python scripts/test_ocr_moco.py 3001069                 # dry run
-    .venv/bin/python scripts/test_ocr_moco.py 3001069 --apply         # actually create
-    .venv/bin/python scripts/test_ocr_moco.py 3001069 --apply --notify  # + Telegram
+    .venv/bin/python scripts/test_ocr_create_purchase.py 3001069                 # dry run
+    .venv/bin/python scripts/test_ocr_create_purchase.py 3001069 --apply         # actually create
+    .venv/bin/python scripts/test_ocr_create_purchase.py 3001069 --apply --notify  # + Telegram
 
 Required env:
     MOCO_SOURCE_ACCOUNT_URL          source subdomain (e.g. "solar")
@@ -28,6 +28,12 @@ Optional env (only with --notify):
 
 The VAT code is resolved per invoice from `GET /vat_code_purchases`
 (OCR vat_rate match → supplier company default → account default).
+
+The Moco project (from `commission` → `Kommission`/`Aufwandkonto` custom-
+properties on `GET /projects`) and the booking category (from
+`GET /purchases/categories` keyed by `credit_account`) are resolved the
+same way the production webhook does. Dry-run shows both — including
+the `POST /purchases/{id}/assign_to_project` preview body.
 
 Exit codes: 0 ok, 1 OCR error, 2 missing env / bad args, 3 Moco fetch error,
 4 POST /purchases error.
@@ -45,6 +51,8 @@ from urllib import error as urlerror
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from api.anthropic_ocr_client import AnthropicOcrClient, AnthropicOcrError
+from api.moco_category_resolver import MocoCategoryResolver
+from api.moco_project_resolver import MocoProjectResolver
 from api.moco_purchase_client import MocoPurchaseClient
 from api.source_moco_client import SourceMocoClient
 from api.supplier_invoice_ocr_service import (
@@ -58,7 +66,7 @@ from api.telegram_notifier import TelegramNotifier
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
-log = logging.getLogger("test_ocr_moco")
+log = logging.getLogger("test_ocr_create_purchase")
 
 
 def _load_dotenv(path: Path) -> None:
@@ -307,13 +315,60 @@ def main() -> int:
     if vat_code_id is None:
         print("  → no vat_code_id resolved (Moco will reject the POST)")
 
-    # 5. show what would be POSTed
+    # 5. resolve Moco project from the OCR'd Kommission
+    _print_section("Project (Kommission) resolution")
+    log.info("listing Moco projects for Kommission resolution")
+    try:
+        all_projects = source_moco.list_projects()
+    except Exception as e:
+        log.warning("list_projects failed: %s — resolver will be empty", e)
+        all_projects = []
+    project_resolver = MocoProjectResolver(all_projects)
+    print(f"  {len(all_projects)} project(s) returned, "
+          f"{project_resolver.indexed_count()} indexed.")
+    kommission_match = project_resolver.resolve(invoice.commission)
+    if invoice.commission is None or invoice.commission == "":
+        print("  OCR returned no commission — nothing to resolve.")
+    elif kommission_match.status == "matched":
+        proj = kommission_match.project
+        print(f"  Kommission {invoice.commission!r} → project id={proj.get('id')}"
+              f" name={proj.get('name')!r} (tier={kommission_match.tier})")
+    elif kommission_match.status == "ambiguous":
+        print(f"  Kommission {invoice.commission!r} → AMBIGUOUS "
+              f"({kommission_match.candidate_count} candidates, "
+              f"tier={kommission_match.tier}) — purchase will NOT be assigned")
+    else:
+        print(f"  Kommission {invoice.commission!r} → no_match — "
+              "purchase will NOT be assigned")
+
+    # 6. resolve category (Buchhaltungs-Konto) from project's Aufwandkonto
+    #    or the hardcoded 4000 fallback
+    _print_section("Category (Buchhaltungs-Konto) resolution")
+    log.info("listing Moco purchase categories")
+    try:
+        all_categories = purchases.list_categories()
+    except Exception as e:
+        log.warning("list_categories failed: %s — resolver will be empty", e)
+        all_categories = []
+    category_resolver = MocoCategoryResolver(all_categories)
+    print(f"  {len(all_categories)} category(s) returned, "
+          f"{category_resolver.indexed_count()} indexed by credit_account.")
+    matched_project = (kommission_match.project
+                       if kommission_match.status == "matched" else None)
+    category_decision = category_resolver.resolve(
+        already_paid_by_card=invoice.already_paid_by_card,
+        project=matched_project)
+    print(f"  category_id={category_decision.category_id} "
+          f"({category_decision.reason})")
+
+    # 7. show what would be POSTed
     payload = _build_create_payload(
         invoice, pdf_bytes,
         vat_code_id=vat_code_id,
         company_id=company_id,
         draft_id=args.draft_id,
         user_id=_user_id_from_draft(draft),
+        category_id=category_decision.category_id,
     )
     email_comment = _format_email_source_comment(
         email_from=draft.get("email_from"),
@@ -332,11 +387,34 @@ def main() -> int:
     _print_section("Comment 2: 🤖 OCR-Extraktion (rendered)")
     print(_render_html_for_console(ocr_comment))
 
+    # Preview the assign_to_project call(s) the service would make after
+    # create. Skipped silently when no project resolved (no call would
+    # fire). Purchase id and item id are placeholders — the real ones
+    # come back from Moco's create response in --apply mode.
+    _print_section("POST /purchases/{id}/assign_to_project (preview)")
+    if matched_project is None:
+        print("  — skipped (no project resolved)")
+    else:
+        preview_assign = {
+            "item_id": "<assigned by Moco>",
+            "project_id": matched_project.get("id"),
+            "notify_project_leader": False,
+            "billable": True,
+            "budget_relevant": True,
+            "surcharge": True,
+        }
+        print(f"  for each created line item, would POST to "
+              f"/purchases/<new-id>/assign_to_project with:")
+        print(json.dumps(preview_assign, indent=2, ensure_ascii=False))
+        print(f"  → links the new purchase to "
+              f"project id={matched_project.get('id')} "
+              f"name={matched_project.get('name')!r}")
+
     if not args.apply:
         print("\n[dry run — no purchase created. Re-run with --apply.]")
         return 0
 
-    # 6. actually go through the service so production behavior is exercised
+    # 8. actually go through the service so production behavior is exercised
     _print_section("Apply with production behavior")
 
     service = SupplierInvoiceOcrService(
@@ -345,6 +423,13 @@ def main() -> int:
         ocr=ocr,
         source_account_url=subdomain,
         telegram=telegram,
+        # Reuse the same resolvers built above — service will re-resolve
+        # internally during process() but the index data is the same, so
+        # the chosen project and category match what the dry-run preview
+        # showed (modulo any /projects or /categories changes in the
+        # seconds between this call and the service's own list).
+        project_resolver=project_resolver,
+        category_resolver=category_resolver,
     )
     log.info("creating real Moco purchase from draft %s", args.draft_id)
     try:

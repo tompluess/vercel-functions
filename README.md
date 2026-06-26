@@ -111,15 +111,15 @@ Operator scripts for validating the OCR pipeline against real Moco drafts live u
 
 Two CLIs drive the OCR pipeline directly against the source Moco account so you can validate behaviour without going through the webhook. Both default to **dry-run** (no Moco writes); pass `--apply` to actually create purchases. Both load env from `.env.local` (use `vercel env pull .env.local` first) and need `MOCO_SOURCE_ACCOUNT_URL`, `MOCO_SOURCE_API_KEY`, and `ANTHROPIC_API_KEY`.
 
-### `scripts/test_ocr_moco.py` — single draft
+### `scripts/test_ocr_create_purchase.py` — single draft
 
 Runs the full pipeline against one specific draft id and prints a detailed step-by-step view: the source draft fields, the OCR'd `InvoiceData`, the supplier-lookup outcome, the resolved VAT code, and the exact `POST /purchases` payload (with the PDF base64 elided) and rendered comment bodies that would be posted. Useful when iterating on the prompt or chasing a single weird invoice.
 
 ```bash
-.venv/bin/python scripts/test_ocr_moco.py 3001069                 # dry-run
-.venv/bin/python scripts/test_ocr_moco.py 3001069 --apply         # create the real purchase
-.venv/bin/python scripts/test_ocr_moco.py 3001069 --apply --notify  # + Telegram alert
-.venv/bin/python scripts/test_ocr_moco.py 3001069 --model claude-sonnet-4-6  # model override
+.venv/bin/python scripts/test_ocr_create_purchase.py 3001069                 # dry-run
+.venv/bin/python scripts/test_ocr_create_purchase.py 3001069 --apply         # create the real purchase
+.venv/bin/python scripts/test_ocr_create_purchase.py 3001069 --apply --notify  # + Telegram alert
+.venv/bin/python scripts/test_ocr_create_purchase.py 3001069 --model claude-sonnet-4-6  # model override
 ```
 
 Flags: `--apply` (POST + comments + delete draft), `--notify` (Telegram on confidence/Gutschrift), `--model` (override the Claude model), `--env-file` (alternative dotenv path).

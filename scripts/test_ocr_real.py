@@ -6,7 +6,7 @@ wiring up the `supplier-invoice-ocr` endpoint (SPEC Implementation Order
 step 1). Exercises the same code path production will use; no test fakes.
 
 Flow:
-  1. GET /api/v1/purchases/{id} on the source Moco account → get `file_url`.
+  1. GET /api/v1/purchases/drafts/{id} on the source Moco account → get `file_url`.
   2. Download the pre-signed `file_url` → raw PDF bytes.
   3. AnthropicOcrClient.extract(pdf_bytes) → InvoiceData.
   4. Pretty-print the result so the operator can eyeball field accuracy.
@@ -66,7 +66,7 @@ def _load_dotenv(path: Path) -> None:
 
 
 def _get_purchase(moco: SourceMocoClient, purchase_id: int) -> dict:
-    """GET /purchases/{id} on the source Moco account.
+    """GET /purchases/drafts/{id} on the source Moco account.
 
     SourceMocoClient doesn't expose this directly (it was written for
     /companies and /projects only), so we reach in to its base URL + auth
