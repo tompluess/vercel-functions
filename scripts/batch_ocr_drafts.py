@@ -12,7 +12,10 @@ even prints.
 Default mode is dry-run: OCR runs against each draft's PDF, but NO Moco
 purchase is created and NO draft is deleted. `--apply` switches to
 production behavior — POST /purchases + comments + draft-delete for
-every draft, exactly like the webhook handler.
+every draft, exactly like the webhook handler. Attachment-less drafts
+whose subject marks a notification email ("Sicherheitshinweis" /
+"Zustellungshinweis") are deleted in apply mode (webhook parity); in
+dry-run the row only reports that the draft would be deleted.
 
 Usage (from the repo root):
     vercel env pull .env.local
@@ -50,6 +53,7 @@ from api.supplier_invoice_ocr_service import (
     _account_default_vat_code,
     _build_create_payload,
     _find_vat_code_by_rate,
+    _is_notification_subject,
     _is_qr_iban,
     _payment_method_for,
     _prefer_draft_payment_fields,
@@ -215,6 +219,23 @@ def _process_draft(draft: dict, *,
     kommission_status: str = "empty"
     kommission_candidate_count: int = 0
     if not file_url:
+        # Same rule as the webhook flow: attachment-less drafts whose
+        # subject marks a notification email ("Sicherheitshinweis" /
+        # "Zustellungshinweis") get deleted rather than reported as a
+        # broken import. Dry-run only announces the would-be delete.
+        if _is_notification_subject(draft.get("title")):
+            title = draft.get("title")
+            if apply:
+                _step(f"notification email ({title!r}) — deleting draft")
+                service._delete_notification_draft(draft_id)
+                result = "Skipped: notification email (draft deleted)"
+            else:
+                _step(f"notification email ({title!r}) — would delete "
+                      "draft (dry-run)")
+                result = "Skipped: notification email (would delete draft)"
+            return Row(draft_id, None, None, False, None, False,
+                       kommission_raw, kommission_status,
+                       kommission_candidate_count, result)
         _step("Skipped: no file_url on draft")
         return Row(draft_id, None, None, False, None, False,
                    kommission_raw, kommission_status,

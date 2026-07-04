@@ -256,6 +256,63 @@ def test_no_file_url_alert_omits_missing_context_lines():
     assert "Absender" not in msg
 
 
+@pytest.mark.parametrize("title", [
+    "Sicherheitshinweis zu Ihrem Konto",
+    "WG: Zustellungshinweis Paket 4711",
+    "ZUSTELLUNGSHINWEIS",
+])
+def test_no_file_url_notification_subject_deletes_draft_silently(title):
+    """Attachment-less drafts whose subject marks a notification email
+    are deleted without any Telegram message."""
+    tg = FakeTelegram()
+    purchases = FakePurchaseClient()
+    s = build_service(telegram=tg, purchases=purchases)
+    result = s.process("create", {"id": 3001069, "title": title})
+    assert result == {"skipped": "notification_draft_deleted",
+                      "draft_id": 3001069}
+    assert purchases.deleted_drafts == [3001069]
+    assert purchases.creates == []
+    assert tg.messages == []
+
+
+def test_no_file_url_notification_delete_failure_stays_silent():
+    """A failed delete logs a warning but never reaches Telegram — the
+    stale draft is self-surfacing in Moco's draft list."""
+    tg = FakeTelegram()
+    purchases = FakePurchaseClient()
+    purchases.delete_draft_error = urlerror.HTTPError(
+        "https://x", 500, "boom", None, None)
+    s = build_service(telegram=tg, purchases=purchases)
+    result = s.process("create",
+                       {"id": 3001069, "title": "Sicherheitshinweis"})
+    assert result == {"skipped": "notification_draft_deleted",
+                      "draft_id": 3001069}
+    assert tg.messages == []
+
+
+def test_no_file_url_without_notification_subject_still_alerts():
+    """A normal invoice subject keeps the existing no-attachment path:
+    Telegram alert, draft NOT deleted."""
+    tg = FakeTelegram()
+    purchases = FakePurchaseClient()
+    s = build_service(telegram=tg, purchases=purchases)
+    result = s.process("create",
+                       {"id": 3001069, "title": "Rechnung Nr. 80572997"})
+    assert result == {"skipped": "no_file_url", "draft_id": 3001069}
+    assert purchases.deleted_drafts == []
+    assert len(tg.messages) == 1
+
+
+def test_notification_subject_with_attachment_is_processed_normally():
+    """The keyword check only guards the no-attachment branch — a draft
+    WITH a file_url goes through OCR even if the subject matches."""
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases)
+    s.process("create", {"id": 42, "title": "Sicherheitshinweis",
+                         "file_url": "https://x/y.pdf"})
+    assert len(purchases.creates) == 1
+
+
 def test_no_draft_id_alert_includes_context_when_present():
     """Even on the malformed-webhook path (no id) the body may still
     carry a title/email_from — surface them so a misconfigured
