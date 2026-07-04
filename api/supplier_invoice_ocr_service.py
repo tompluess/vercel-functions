@@ -24,10 +24,10 @@ purchases, but those drafts can't be patched via the API (PATCH
   6. Sends a Telegram alert (confidence-routed; Gutschrift always
      triggers the Vorzeichen-prüf warning).
 
-The original draft is left untouched — the operator can delete it
-manually after verifying the new real purchase. The webhook payload
-itself is the draft; we only use its `id` (for the back-reference in
-the comment text) and its `file_url`.
+The original draft is auto-deleted once the new purchase landed
+(best-effort — see `_delete_draft_after_create`). The webhook payload
+itself is the draft; we only use its `id`, `title` (notification-email
+detection on the no-attachment path) and its `file_url`.
 
 VAT-code resolution: Moco's POST /purchases requires `vat_code_id` on
 every item. The service resolves it dynamically — `GET /vat_code_purchases`
@@ -70,6 +70,12 @@ logger = logging.getLogger("supplier_invoice_ocr_service")
 
 CONFIDENCE_THRESHOLD = 0.85
 OCR_TAGS = ["OCR", "Review pending"]
+
+# Attachment-less drafts whose subject contains one of these are
+# notification emails misrouted into the invoice inbox (e.g. a bank's
+# "Sicherheitshinweis" or a delivery portal's "Zustellungshinweis") —
+# they get deleted silently instead of triggering the no-attachment alert.
+NOTIFICATION_SUBJECT_KEYWORDS = ("sicherheitshinweis", "zustellungshinweis")
 
 
 class SupplierInvoiceOcrService:
@@ -119,6 +125,17 @@ class SupplierInvoiceOcrService:
             )
             return {"skipped": "no_purchase_id"}
         if not file_url:
+            if _is_notification_subject(body.get("title")):
+                # Bank/portal notification mails ("Sicherheitshinweis",
+                # "Zustellungshinweis") land in the invoice inbox without
+                # an attachment. They're routine noise, not a broken
+                # import — delete the draft and stay off Telegram.
+                logger.info("ocr: draft %s is a notification email "
+                            "(title=%r) — deleting silently",
+                            draft_id, body.get("title"))
+                self._delete_notification_draft(draft_id)
+                return {"skipped": "notification_draft_deleted",
+                        "draft_id": draft_id}
             logger.warning("ocr: skipped (no file_url) draft_id=%s", draft_id)
             self._notify(
                 "⚠️ OCR übersprungen — Draft ohne Anhang: "
@@ -514,6 +531,34 @@ class SupplierInvoiceOcrService:
         if self._telegram:
             self._telegram.notify(text)
 
+    def _delete_notification_draft(self, draft_id: int) -> None:
+        """Delete an attachment-less notification-email draft, silently.
+
+        Deliberately quieter than `_delete_draft_after_create`: these
+        drafts carry no invoice, so a failed delete just leaves a stale
+        entry in Moco's draft list where the operator will see it anyway.
+        404 counts as "already gone" (webhook replay); every other
+        failure logs a warning — no Telegram in any case.
+        """
+        try:
+            self._purchases.delete_purchase_draft(draft_id)
+            logger.info("ocr: deleted notification draft %s", draft_id)
+        except urlerror.HTTPError as e:
+            if e.code == 404:
+                logger.info("ocr: notification draft %s already gone "
+                            "(delete idempotent)", draft_id)
+                return
+            err_body = "<unreadable>"
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            logger.warning("ocr: failed to delete notification draft %s: "
+                           "%s %s", draft_id, e.code, err_body)
+        except Exception as e:
+            logger.warning("ocr: failed to delete notification draft %s: %s",
+                           draft_id, e)
+
     def _delete_draft_after_create(self, draft_id: int,
                                    new_purchase_id: int) -> None:
         """Remove the original draft once a real purchase has been created.
@@ -590,6 +635,18 @@ class SupplierInvoiceOcrService:
     def _draft_url(self, draft_id: int) -> str:
         return (f"https://{self._source_account_url}.mocoapp.com"
                 f"/purchases/drafts/{draft_id}")
+
+
+def _is_notification_subject(title: object) -> bool:
+    """True when the draft subject marks a notification email.
+
+    Case-insensitive substring match so forwarded-subject prefixes
+    ("WG: Sicherheitshinweis …") and all-caps variants still hit.
+    """
+    if not isinstance(title, str):
+        return False
+    lowered = title.lower()
+    return any(kw in lowered for kw in NOTIFICATION_SUBJECT_KEYWORDS)
 
 
 _DRAFT_CONTEXT_FIELD_MAX = 120
