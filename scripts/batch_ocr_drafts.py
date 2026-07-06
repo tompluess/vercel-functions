@@ -47,6 +47,7 @@ from api.moco_category_resolver import MocoCategoryResolver
 from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_client import MocoClient
+from api.moco_supplier_matcher import MocoSupplierMatcher
 from api.supplier_invoice_ocr_service import (
     CONFIDENCE_THRESHOLD,
     SupplierInvoiceOcrService,
@@ -196,6 +197,7 @@ def _process_draft(draft: dict, *,
                    service: SupplierInvoiceOcrService,
                    resolver: MocoProjectResolver,
                    category_resolver: MocoCategoryResolver,
+                   supplier_matcher: MocoSupplierMatcher,
                    apply: bool,
                    idx: int,
                    total: int) -> Row:
@@ -277,25 +279,26 @@ def _process_draft(draft: dict, *,
     invoice = _prefer_draft_payment_fields(invoice, draft)
 
     # --- supplier lookup ---------------------------------------------------
+    # Same three-tier matcher as the webhook flow (exact → substring →
+    # normalized token-set), built once per run against the full supplier
+    # list. The live log names the winning tier so the operator can see
+    # how "close" the OCR'd name was.
     company_id: int | None = None
     matched = False
     if invoice.supplier_name:
-        try:
-            matches = moco.search_suppliers(invoice.supplier_name)
-        except Exception as e:
-            matches = []
-            _step(f"supplier '{invoice.supplier_name}' → lookup failed: {e}")
+        m = supplier_matcher.match(invoice.supplier_name)
+        if m.status == "matched":
+            company_id = m.company.get("id")
+            matched = True
+            _step(f"supplier '{invoice.supplier_name}' → id={company_id} "
+                  f"'{m.company.get('name')}' ({m.tier} tier)")
+        elif m.status == "ambiguous":
+            names = ", ".join(repr(c.get("name")) for c in m.candidates[:4])
+            _step(f"supplier '{invoice.supplier_name}' → ambiguous "
+                  f"({m.candidate_count} hits at {m.tier} tier: {names} — "
+                  "leaving company empty)")
         else:
-            if len(matches) == 1:
-                company_id = matches[0].get("id")
-                matched = True
-                _step(f"supplier '{invoice.supplier_name}' → id={company_id} "
-                      f"(matched)")
-            elif matches:
-                _step(f"supplier '{invoice.supplier_name}' → ambiguous "
-                      f"({len(matches)} hits, leaving company empty)")
-            else:
-                _step(f"supplier '{invoice.supplier_name}' → no match")
+            _step(f"supplier '{invoice.supplier_name}' → no match")
     else:
         _step("supplier: OCR returned no supplier_name")
 
@@ -595,6 +598,21 @@ def main() -> int:
     print(f"  {len(all_categories)} category(s) returned, "
           f"{category_resolver.indexed_count()} indexed by credit_account.")
 
+    # Supplier list feeds the three-tier name matcher (exact → substring
+    # → normalized). Same per-run fetch + graceful-empty-on-failure
+    # pattern as projects/categories; an empty matcher means every draft
+    # reports "no match" and lands company-less.
+    print("Loading Moco suppliers for company matching …")
+    try:
+        all_suppliers = moco.list_suppliers()
+    except Exception as e:
+        print(f"  WARN: list_suppliers failed ({e}); matching against an "
+              "empty supplier list.", file=sys.stderr)
+        all_suppliers = []
+    supplier_matcher = MocoSupplierMatcher(all_suppliers)
+    print(f"  {len(all_suppliers)} supplier(s) returned, "
+          f"{supplier_matcher.indexed_count()} matchable by name.")
+
     # Telegram intentionally NOT wired in. Batch runs touch dozens of drafts
     # at a time and would spam the chat with one alert per row; the table is
     # the audit surface here. Production webhook traffic still notifies as
@@ -611,6 +629,7 @@ def main() -> int:
             draft, moco=moco, purchases=purchases, ocr=ocr,
             service=service, resolver=resolver,
             category_resolver=category_resolver,
+            supplier_matcher=supplier_matcher,
             apply=args.apply, idx=i, total=len(drafts)))
 
     _print_table(rows)

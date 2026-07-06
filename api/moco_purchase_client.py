@@ -18,8 +18,8 @@ Endpoints used:
 
 Auth: `Authorization: Token token={MOCO_API_KEY}`.
 
-Supplier company lookup (`GET /companies?type=supplier`) lives in
-`MocoClient.search_suppliers` rather than here — it's a generic
+Supplier company listing (`GET /companies?type=supplier`) lives in
+`MocoClient.list_suppliers` rather than here — it's a generic
 company-list operation on the Moco account that sits next to
 `get_company(id)`, not something purchase-specific.
 

@@ -9,7 +9,6 @@ collaborator to keep each class single-purpose (see CLAUDE.md).
 """
 
 import json
-from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
@@ -30,45 +29,42 @@ class MocoClient:
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
 
-    def search_suppliers(self, name: str) -> list[dict]:
-        """GET /companies?type=supplier&term=<name> — find candidate suppliers.
+    def list_suppliers(self, *, limit: int = 1000) -> list[dict]:
+        """GET /companies?type=supplier — full supplier list, paginated.
 
-        Server-side narrowing via `term`: Moco's company list supports a
-        `term` query that filters by name substring. We additionally
-        constrain `type=supplier` so customers can't accidentally be
-        linked as suppliers, then apply a client-side case-insensitive
-        **exact** match — `term` returns broader matches (substring /
-        prefix) and we don't want to auto-link `company_id` on a fuzzy
-        hit (a misassignment would silently skew supplier reporting).
-        Ambiguity (multiple exact matches) is left for the human reviewer.
+        Feeds `MocoSupplierMatcher`, whose substring tier needs companies
+        whose name is a *substring* of the OCR'd supplier name — a
+        server-side `term=<ocr name>` search can never return those, so
+        the matching runs fully client-side against the complete list.
 
-        Returns an empty list when nothing matches; 4xx/5xx propagate as
-        HTTPError so the caller can map them to the right retry semantics
-        (a 404 from `term=...` with no results is mapped to empty too).
+        Moco's `type` filter is singular per the API docs
+        (https://docs.mocoapp.com/api/docs/v1#tag/companies/GET/companies);
+        `type=suppliers` silently returns the full list (no filter
+        applied), `type=supplier` is what actually narrows it — and it
+        also keeps customers from accidentally being linked as suppliers.
+        Paginates with `per_page=100` until the last page or `limit`.
+        4xx/5xx propagate as HTTPError so the caller can map them to the
+        right retry semantics.
         """
-        if not name or not name.strip():
-            return []
-        term = name.strip()
-        # Moco's `type` filter is singular per the API docs
-        # (https://docs.mocoapp.com/api/docs/v1#tag/companies/GET/companies);
-        # `type=suppliers` silently returns the full list (no filter
-        # applied), `type=supplier` is what actually narrows it.
-        params = urlparse.urlencode({"type": "supplier", "term": term})
-        url = f"{self._base_url}/companies?{params}"
-        req = urlrequest.Request(url, headers=self._auth_headers)
-        try:
-            with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
-                data = json.loads(resp.read())
-        except urlerror.HTTPError as e:
-            if e.code == 404:
-                return []
-            raise
-        if not isinstance(data, list):
-            return []
-        target = term.casefold()
-        return [c for c in data
-                if isinstance(c, dict)
-                and (c.get("name") or "").strip().casefold() == target]
+        suppliers: list[dict] = []
+        page = 1
+        per_page = 100
+        while len(suppliers) < limit:
+            params = urlparse.urlencode({"type": "supplier",
+                                         "per_page": per_page,
+                                         "page": page})
+            url = f"{self._base_url}/companies?{params}"
+            req = urlrequest.Request(url, headers=self._auth_headers)
+            with urlrequest.urlopen(req,
+                                    timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
+                batch = json.loads(resp.read())
+            if not isinstance(batch, list) or not batch:
+                break
+            suppliers.extend(batch)
+            if len(batch) < per_page:
+                break
+            page += 1
+        return suppliers[:limit]
 
     def get_project(self, project_id: int) -> dict:
         req = urlrequest.Request(f"{self._base_url}/projects/{project_id}",

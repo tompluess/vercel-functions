@@ -55,6 +55,7 @@ from api.moco_category_resolver import MocoCategoryResolver
 from api.moco_project_resolver import MocoProjectResolver
 from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_client import MocoClient
+from api.moco_supplier_matcher import MocoSupplierMatcher
 from api.supplier_invoice_ocr_service import (
     SupplierInvoiceOcrService,
     _build_create_payload,
@@ -249,22 +250,25 @@ def main() -> int:
 
     _print_invoice(invoice)
 
-    # 3. supplier lookup
+    # 3. supplier lookup — same three-tier matcher as the webhook flow
+    # (exact → substring → normalized token-set, unique hit required).
     log.info("looking up supplier company in Moco")
     try:
-        matches = moco.search_suppliers(invoice.supplier_name or "")
+        suppliers = moco.list_suppliers()
     except Exception as e:
-        log.warning("supplier lookup failed: %s", e)
-        matches = []
-    if len(matches) == 1:
-        company_id = matches[0].get("id")
-        print(f"\nSupplier match: id={company_id} name={matches[0].get('name')!r}")
-    elif matches:
+        log.warning("supplier list failed: %s", e)
+        suppliers = []
+    match = MocoSupplierMatcher(suppliers).match(invoice.supplier_name)
+    if match.status == "matched":
+        company_id = match.company.get("id")
+        print(f"\nSupplier match: id={company_id} "
+              f"name={match.company.get('name')!r} ({match.tier} tier)")
+    elif match.status == "ambiguous":
         company_id = None
-        print(f"\nSupplier ambiguous ({len(matches)} matches) — "
-              "leaving company_id empty:")
-        for m in matches:
-            print(f"  - id={m.get('id')} name={m.get('name')!r}")
+        print(f"\nSupplier ambiguous ({match.candidate_count} candidates "
+              f"at {match.tier} tier) — leaving company_id empty:")
+        for c in match.candidates:
+            print(f"  - id={c.get('id')} name={c.get('name')!r}")
     else:
         company_id = None
         print(f"\nNo supplier match for {invoice.supplier_name!r} — "

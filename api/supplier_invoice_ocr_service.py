@@ -7,9 +7,10 @@ purchases, but those drafts can't be patched via the API (PATCH
 
   1. Downloads the PDF attached to the draft.
   2. Runs OCR via `AnthropicOcrClient` → `InvoiceData`.
-  3. Looks up the supplier in Moco's companies list — if exactly one
-     supplier matches by name (case-insensitive exact), links its
-     `company_id`. Ambiguous / no match → leave empty for the human.
+  3. Looks up the supplier in Moco's companies list via
+     `MocoSupplierMatcher` (exact → substring → normalized token-set,
+     each linking only on a unique hit). Ambiguous / no match → leave
+     `company_id` empty for the human.
   4. Creates a NEW real purchase via `POST /purchases` containing:
        - the extracted fields (date, due_date, currency, totals, IBAN,
          QR-reference, payment note, title)
@@ -64,6 +65,7 @@ from api.moco_category_resolver import MocoCategoryResolver
 from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_client import MocoClient
+from api.moco_supplier_matcher import MocoSupplierMatcher
 from api.smartme_energy_expense_service import (
     SmartmeEnergyExpenseService,
     is_smartme_draft,
@@ -273,7 +275,7 @@ class SupplierInvoiceOcrService:
              `GET /vat_code_purchases`.
           2. The matched supplier's default vat code (requires fetching
              the full company via `get_company` — the company-list shape
-             from `search_suppliers` doesn't carry the default).
+             from `list_suppliers` doesn't carry the default).
           3. The vat_code from `GET /vat_code_purchases` marked as
              `default: true` (most Moco accounts have one designated
              default for purchases).
@@ -339,17 +341,20 @@ class SupplierInvoiceOcrService:
     # --- supplier lookup ----------------------------------------------------
 
     def _lookup_supplier_company(self, supplier_name: str | None) -> int | None:
-        """Return a Moco company_id only when there's exactly one match.
+        """Return a Moco company_id only on a unique tiered match.
 
-        Ambiguity (multiple matches) or no match → leave the purchase
-        company-less for the reviewer to assign. We prefer "no company"
-        over "wrong company" — a misassigned supplier would invisibly
-        skew downstream reporting.
+        `MocoSupplierMatcher` tries exact → substring → normalized
+        token-set matching against the full supplier list; each tier
+        links only when exactly one company hits. Ambiguity or no match
+        → leave the purchase company-less for the reviewer to assign.
+        We prefer "no company" over "wrong company" — a misassigned
+        supplier would invisibly skew downstream reporting.
         """
         if not supplier_name:
             return None
         try:
-            matches = self._moco.search_suppliers(supplier_name)
+            suppliers = self._moco.list_suppliers()
+            match = MocoSupplierMatcher(suppliers).match(supplier_name)
         except Exception:
             # Don't fail the whole sync just because supplier lookup
             # blew up — the purchase is the authoritative side effect;
@@ -357,17 +362,20 @@ class SupplierInvoiceOcrService:
             logger.exception("ocr: supplier lookup failed name=%r",
                              supplier_name)
             return None
-        if len(matches) != 1:
-            if matches:
-                logger.info("ocr: supplier_name=%r matched %d companies, "
-                            "leaving company_id empty (ambiguous)",
-                            supplier_name, len(matches))
-            else:
-                logger.info("ocr: supplier_name=%r had no Moco company match",
-                            supplier_name)
-            return None
-        company = matches[0]
-        return company.get("id")
+        if match.status == "matched":
+            logger.info("ocr: supplier_name=%r → company id=%s name=%r "
+                        "(%s tier)", supplier_name,
+                        match.company.get("id"), match.company.get("name"),
+                        match.tier)
+            return match.company.get("id")
+        if match.status == "ambiguous":
+            logger.info("ocr: supplier_name=%r matched %d companies at the "
+                        "%s tier, leaving company_id empty (ambiguous)",
+                        supplier_name, match.candidate_count, match.tier)
+        else:
+            logger.info("ocr: supplier_name=%r had no Moco company match",
+                        supplier_name)
+        return None
 
     # --- comment back to Moco -----------------------------------------------
 
