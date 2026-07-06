@@ -1,6 +1,6 @@
 """End-to-end tests for /api/brevo-contact-sync.
 
-Patches urlopen in both `api.brevo_api` and `api.source_moco_client` so the
+Patches urlopen in both `api.brevo_api` and `api.moco_client` so the
 full request pipeline runs without network. Asserts the HMAC pipeline,
 envelope unwrapping, target/event gating, and that Brevo receives the
 expected calls in the right order.
@@ -17,7 +17,7 @@ from tests.conftest import FakeUrlopenResponse, load_fixture, signed_headers
 
 @pytest.fixture
 def stub_pipeline(monkeypatch):
-    """Patches urlopen in api.brevo_api AND api.source_moco_client.
+    """Patches urlopen in api.brevo_api AND api.moco_client.
 
     Routes by hostname/path so the source-Moco `post_comment` call succeeds
     and Brevo returns realistic shapes. `state` lets individual tests override
@@ -68,7 +68,7 @@ def stub_pipeline(monkeypatch):
         raise AssertionError(f"unexpected request: {method} {url}")
 
     import api.brevo_api as brevo_mod
-    import api.source_moco_client as src_mod
+    import api.moco_client as src_mod
     monkeypatch.setattr(brevo_mod.urlrequest, "urlopen", fake_urlopen)
     monkeypatch.setattr(src_mod.urlrequest, "urlopen", fake_urlopen)
     return state
@@ -217,7 +217,7 @@ def test_brevo_500_surfaces_as_502(set_env, monkeypatch):
         return FakeUrlopenResponse(b"{}")
 
     import api.brevo_api as brevo_mod
-    import api.source_moco_client as src_mod
+    import api.moco_client as src_mod
     monkeypatch.setattr(brevo_mod.urlrequest, "urlopen", boom)
     monkeypatch.setattr(src_mod.urlrequest, "urlopen", boom)
 
@@ -247,7 +247,7 @@ def _run_with_brevo_status(set_env_unused, monkeypatch, status):
         return FakeUrlopenResponse(b"{}")
 
     import api.brevo_api as brevo_mod
-    import api.source_moco_client as src_mod
+    import api.moco_client as src_mod
     import api.telegram_notifier as tg_mod
     monkeypatch.setattr(brevo_mod.urlrequest, "urlopen", boom)
     monkeypatch.setattr(src_mod.urlrequest, "urlopen", boom)

@@ -23,8 +23,8 @@ Usage (from the repo root):
     .venv/bin/python scripts/batch_ocr_drafts.py --max 5 --apply  # real writes
 
 Required env (same as test_ocr_create_purchase.py):
-    MOCO_SOURCE_ACCOUNT_URL    source subdomain (e.g. "solar")
-    MOCO_SOURCE_API_KEY        token for the source Moco account
+    MOCO_SUBDOMAIN    source subdomain (e.g. "solar")
+    MOCO_API_KEY        token for the Moco account
     ANTHROPIC_API_KEY          Claude API key
 
 Exit codes: 0 — table printed (per-draft errors are recorded as rows,
@@ -46,7 +46,7 @@ from api.anthropic_ocr_client import AnthropicOcrClient, AnthropicOcrError
 from api.moco_category_resolver import MocoCategoryResolver
 from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
-from api.source_moco_client import SourceMocoClient
+from api.moco_client import MocoClient
 from api.supplier_invoice_ocr_service import (
     CONFIDENCE_THRESHOLD,
     SupplierInvoiceOcrService,
@@ -140,7 +140,7 @@ def _step(msg: str) -> None:
 
 def _resolve_vat_code_with_tier(invoice, company_id: int | None,
                                 vat_codes: list[dict],
-                                source_moco: SourceMocoClient
+                                moco: MocoClient
                                 ) -> tuple[int | None, str]:
     """Mirror of `SupplierInvoiceOcrService._resolve_vat_code_id` that
     additionally reports which tier of the 4-step chain won.
@@ -156,7 +156,7 @@ def _resolve_vat_code_with_tier(invoice, company_id: int | None,
             return match.get("id"), f"matched OCR rate {invoice.vat_rate*100:.1f}%"
     if company_id is not None:
         try:
-            company = source_moco.get_company(company_id)
+            company = moco.get_company(company_id)
         except Exception:
             company = None
         if company:
@@ -190,7 +190,7 @@ def _format_kommission_log(raw: str | None, match: ProjectMatch) -> str:
 
 
 def _process_draft(draft: dict, *,
-                   source_moco: SourceMocoClient,
+                   moco: MocoClient,
                    purchases: MocoPurchaseClient,
                    ocr: AnthropicOcrClient,
                    service: SupplierInvoiceOcrService,
@@ -243,7 +243,7 @@ def _process_draft(draft: dict, *,
 
     # --- download + OCR ----------------------------------------------------
     try:
-        pdf_bytes = source_moco.download_file(file_url)
+        pdf_bytes = moco.download_file(file_url)
     except Exception as e:
         _step(f"PDF download failed: {e}")
         return Row(draft_id, None, None, False, None, False,
@@ -281,7 +281,7 @@ def _process_draft(draft: dict, *,
     matched = False
     if invoice.supplier_name:
         try:
-            matches = source_moco.search_suppliers(invoice.supplier_name)
+            matches = moco.search_suppliers(invoice.supplier_name)
         except Exception as e:
             matches = []
             _step(f"supplier '{invoice.supplier_name}' → lookup failed: {e}")
@@ -317,7 +317,7 @@ def _process_draft(draft: dict, *,
         vat_codes = []
         log.warning("list_vat_codes failed: %s", e)
     vat_code_id, vat_tier = _resolve_vat_code_with_tier(
-        invoice, company_id, vat_codes, source_moco)
+        invoice, company_id, vat_codes, moco)
     _step(f"vat_code {vat_code_id if vat_code_id else '?'} ({vat_tier})")
 
     # --- payment method + IBAN tail ---------------------------------------
@@ -530,19 +530,19 @@ def main() -> int:
 
     _load_dotenv(args.env_file)
 
-    subdomain = os.environ.get("MOCO_SOURCE_ACCOUNT_URL")
-    moco_key = os.environ.get("MOCO_SOURCE_API_KEY")
+    subdomain = os.environ.get("MOCO_SUBDOMAIN")
+    moco_key = os.environ.get("MOCO_API_KEY")
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     missing = [k for k, v in {
-        "MOCO_SOURCE_ACCOUNT_URL": subdomain,
-        "MOCO_SOURCE_API_KEY": moco_key,
+        "MOCO_SUBDOMAIN": subdomain,
+        "MOCO_API_KEY": moco_key,
         "ANTHROPIC_API_KEY": anthropic_key,
     }.items() if not v]
     if missing:
         print(f"Missing env vars: {', '.join(missing)}", file=sys.stderr)
         return 2
 
-    source_moco = SourceMocoClient(subdomain=subdomain, api_key=moco_key)
+    moco = MocoClient(subdomain=subdomain, api_key=moco_key)
     purchases = MocoPurchaseClient(subdomain=subdomain, api_key=moco_key)
     ocr = AnthropicOcrClient(api_key=anthropic_key, model=args.model)
 
@@ -568,7 +568,7 @@ def main() -> int:
     # fine for a short-lived batch script.
     print("Loading active Moco projects for Kommission resolution …")
     try:
-        all_projects = source_moco.list_projects()
+        all_projects = moco.list_projects()
     except Exception as e:
         # A failed project list shouldn't kill the batch — fall back to an
         # empty resolver so every draft reports "no project match" but the
@@ -600,15 +600,15 @@ def main() -> int:
     # the audit surface here. Production webhook traffic still notifies as
     # usual.
     service = SupplierInvoiceOcrService(
-        source_moco=source_moco, purchase_client=purchases, ocr=ocr,
-        source_account_url=subdomain, telegram=None,
+        moco=moco, purchase_client=purchases, ocr=ocr,
+        subdomain=subdomain, telegram=None,
         project_resolver=resolver,
         category_resolver=category_resolver)
 
     rows: list[Row] = []
     for i, draft in enumerate(drafts, start=1):
         rows.append(_process_draft(
-            draft, source_moco=source_moco, purchases=purchases, ocr=ocr,
+            draft, moco=moco, purchases=purchases, ocr=ocr,
             service=service, resolver=resolver,
             category_resolver=category_resolver,
             apply=args.apply, idx=i, total=len(drafts)))

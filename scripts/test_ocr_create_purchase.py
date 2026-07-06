@@ -20,8 +20,8 @@ Usage (from the repo root):
     .venv/bin/python scripts/test_ocr_create_purchase.py 3001069 --apply --notify  # + Telegram
 
 Required env:
-    MOCO_SOURCE_ACCOUNT_URL          source subdomain (e.g. "solar")
-    MOCO_SOURCE_API_KEY              token for the source Moco account
+    MOCO_SUBDOMAIN          source subdomain (e.g. "solar")
+    MOCO_API_KEY              token for the Moco account
     ANTHROPIC_API_KEY                Claude API key
 Optional env (only with --notify):
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -54,7 +54,7 @@ from api.anthropic_ocr_client import AnthropicOcrClient, AnthropicOcrError
 from api.moco_category_resolver import MocoCategoryResolver
 from api.moco_project_resolver import MocoProjectResolver
 from api.moco_purchase_client import MocoPurchaseClient
-from api.source_moco_client import SourceMocoClient
+from api.moco_client import MocoClient
 from api.supplier_invoice_ocr_service import (
     SupplierInvoiceOcrService,
     _build_create_payload,
@@ -179,12 +179,12 @@ def main() -> int:
 
     _load_dotenv(args.env_file)
 
-    subdomain = os.environ.get("MOCO_SOURCE_ACCOUNT_URL")
-    moco_key = os.environ.get("MOCO_SOURCE_API_KEY")
+    subdomain = os.environ.get("MOCO_SUBDOMAIN")
+    moco_key = os.environ.get("MOCO_API_KEY")
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     missing = [k for k, v in {
-        "MOCO_SOURCE_ACCOUNT_URL": subdomain,
-        "MOCO_SOURCE_API_KEY": moco_key,
+        "MOCO_SUBDOMAIN": subdomain,
+        "MOCO_API_KEY": moco_key,
         "ANTHROPIC_API_KEY": anthropic_key,
     }.items() if not v]
     if missing:
@@ -201,7 +201,7 @@ def main() -> int:
             return 2
         telegram = TelegramNotifier(bot_token=tg_token, chat_id=tg_chat)
 
-    source_moco = SourceMocoClient(subdomain=subdomain, api_key=moco_key)
+    moco = MocoClient(subdomain=subdomain, api_key=moco_key)
     purchases = MocoPurchaseClient(subdomain=subdomain, api_key=moco_key)
     ocr = AnthropicOcrClient(api_key=anthropic_key, model=args.model)
 
@@ -240,7 +240,7 @@ def main() -> int:
     # 2. OCR
     log.info("downloading PDF and running OCR via %s", ocr._model)
     try:
-        pdf_bytes = source_moco.download_file(file_url)
+        pdf_bytes = moco.download_file(file_url)
         invoice = ocr.extract(pdf_bytes)
     except AnthropicOcrError as e:
         print(f"\nOCR failed: {e} (status_code={e.status_code})",
@@ -252,7 +252,7 @@ def main() -> int:
     # 3. supplier lookup
     log.info("looking up supplier company in Moco")
     try:
-        matches = source_moco.search_suppliers(invoice.supplier_name or "")
+        matches = moco.search_suppliers(invoice.supplier_name or "")
     except Exception as e:
         log.warning("supplier lookup failed: %s", e)
         matches = []
@@ -301,7 +301,7 @@ def main() -> int:
                   f"vat_code_id={vat_code_id}")
     if vat_code_id is None and company_id is not None:
         try:
-            full_company = source_moco.get_company(company_id)
+            full_company = moco.get_company(company_id)
             vat_code_id = _supplier_default_vat_code_id(full_company, vat_codes)
             if vat_code_id is not None:
                 print(f"  → using supplier-default vat_code_id={vat_code_id}")
@@ -319,7 +319,7 @@ def main() -> int:
     _print_section("Project (Kommission) resolution")
     log.info("listing Moco projects for Kommission resolution")
     try:
-        all_projects = source_moco.list_projects()
+        all_projects = moco.list_projects()
     except Exception as e:
         log.warning("list_projects failed: %s — resolver will be empty", e)
         all_projects = []
@@ -418,10 +418,10 @@ def main() -> int:
     _print_section("Apply with production behavior")
 
     service = SupplierInvoiceOcrService(
-        source_moco=source_moco,
+        moco=moco,
         purchase_client=purchases,
         ocr=ocr,
-        source_account_url=subdomain,
+        subdomain=subdomain,
         telegram=telegram,
         # Reuse the same resolvers built above — service will re-resolve
         # internally during process() but the index data is the same, so

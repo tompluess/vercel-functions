@@ -175,7 +175,7 @@ def stub_pipeline(monkeypatch):
     # module, but doing it per-module documents intent.
     import api.anthropic_ocr_client as ocr_mod
     import api.moco_purchase_client as mpc_mod
-    import api.source_moco_client as src_mod
+    import api.moco_client as src_mod
     import api.telegram_notifier as tg_mod
     for mod in (ocr_mod, mpc_mod, src_mod, tg_mod):
         monkeypatch.setattr(mod.urlrequest, "urlopen", fake_urlopen)

@@ -43,7 +43,7 @@ class FakeBrevoAPI:
         return {"contacts": {"success": emails, "failure": []}}
 
 
-class FakeSourceMoco:
+class FakeMoco:
     def __init__(self):
         self.comments: list[dict] = []
         self.calls: list[tuple] = []
@@ -62,13 +62,13 @@ def brevo():
 
 @pytest.fixture
 def source():
-    return FakeSourceMoco()
+    return FakeMoco()
 
 
 @pytest.fixture
 def service(brevo, source):
-    return BrevoContactSyncService(brevo=brevo, source_moco=source,
-                                   source_account_url="solar", list_id=5)
+    return BrevoContactSyncService(brevo=brevo, moco=source,
+                                   subdomain="solar", list_id=5)
 
 
 def test_skips_when_work_email_is_empty(service, brevo, source):

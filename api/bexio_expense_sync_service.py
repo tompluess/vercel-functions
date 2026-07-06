@@ -2,10 +2,10 @@
 
 Mirrors the n8n "Sync expenses from Moco to Bexio" workflow:
 
-  1. Skip if the source Purchase has no company.
+  1. Skip if the Moco Purchase has no company.
   2. Find the Bexio contact by company name; if missing, fetch full company
-     data from the source Moco account and create the contact.
-  3. Skip if the source Purchase carries no booking account (no
+     data from the Moco account and create the contact.
+  3. Skip if the Moco Purchase carries no booking account (no
      items[0].category.credit_account).
   4. Look up the Bexio booking account by account_no (falls back to defaults).
   5. Check Bexio for an existing bill (vendor + vendor_ref). If found and not
@@ -15,7 +15,7 @@ Mirrors the n8n "Sync expenses from Moco to Bexio" workflow:
   7. POST a comment back to Moco linking to the Bexio bill so users can
      follow the trail.
 
-HTTP transport is delegated to `BexioAPI` and `SourceMocoClient` so this class
+HTTP transport is delegated to `BexioAPI` and `MocoClient` so this class
 contains only business logic and is unit-tested with fakes (see
 `tests/test_bexio_expense_sync_service.py`).
 """
@@ -37,7 +37,7 @@ from api.bexio_config import (
     manual_bank_account_id,
     outgoing_payment_sender,
 )
-from api.source_moco_client import SourceMocoClient
+from api.moco_client import MocoClient
 from api.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger("bexio_expense_sync_service")
@@ -46,12 +46,12 @@ logger = logging.getLogger("bexio_expense_sync_service")
 class BexioExpenseSyncService:
     BEXIO_BILL_URL_TEMPLATE = "https://office.bexio.com/index.php/kb_bill/list#/show/{id}"
 
-    def __init__(self, *, bexio: BexioAPI, source_moco: SourceMocoClient,
-                 source_account_url: str,
+    def __init__(self, *, bexio: BexioAPI, moco: MocoClient,
+                 subdomain: str,
                  telegram: TelegramNotifier | None = None):
         self._bexio = bexio
-        self._source_moco = source_moco
-        self._source_account_url = source_account_url
+        self._moco = moco
+        self._subdomain = subdomain
         # Optional: when present, the skip branches below DM a Telegram chat
         # with entity context, mirroring the n8n "...Notification to Telegram"
         # nodes. Left optional so service unit tests can omit it.
@@ -137,7 +137,7 @@ class BexioExpenseSyncService:
                 "name_1": name, "country_id": COUNTRY_ID_CH,
                 "user_id": USER_ID, "owner_id": OWNER_ID,
             })
-        moco_company = self._source_moco.get_company(company_id)
+        moco_company = self._moco.get_company(company_id)
         return self._bexio.create_contact(_contact_payload_from_moco(moco_company))
 
     # --- account lookup -----------------------------------------------------
@@ -174,7 +174,7 @@ class BexioExpenseSyncService:
             return None
         if existing_bill and existing_bill.get("attachment_ids"):
             return None
-        content = self._source_moco.download_file(file_url)
+        content = self._moco.download_file(file_url)
         filename = _attachment_filename(body)
         uploaded = self._bexio.upload_file(filename=filename, content=content)
         # Bexio's POST /3.0/files returns a list of file records (one per
@@ -335,7 +335,7 @@ class BexioExpenseSyncService:
         text = ("Lieferantenrechnung in Bexio auf <strong>gebucht</strong> "
                 f"gesetzt und Zahlungsausgang erstellt{per}: {bill_url}")
         try:
-            self._source_moco.post_comment(commentable_id=source_id,
+            self._moco.post_comment(commentable_id=source_id,
                                            commentable_type="Purchase",
                                            text=text)
         except Exception:
@@ -345,7 +345,7 @@ class BexioExpenseSyncService:
     # --- telegram skip notifications ----------------------------------------
 
     def _purchase_url(self, source_id: int | None) -> str:
-        return (f"https://{self._source_account_url}.mocoapp.com"
+        return (f"https://{self._subdomain}.mocoapp.com"
                 f"/purchases/{source_id}")
 
     def _notify_skip_with_entity(self, reason: str, body: dict) -> None:
@@ -384,7 +384,7 @@ class BexioExpenseSyncService:
         text = (f"Lieferantenrechnung in Bexio {verb}: "
                 f"{self.BEXIO_BILL_URL_TEMPLATE.format(id=bill_id)}")
         try:
-            self._source_moco.post_comment(commentable_id=source_id,
+            self._moco.post_comment(commentable_id=source_id,
                                            commentable_type="Purchase",
                                            text=text)
         except Exception:

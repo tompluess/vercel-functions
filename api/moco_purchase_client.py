@@ -1,4 +1,4 @@
-"""MocoPurchaseClient — read draft purchases + create real purchases on the source Moco account.
+"""MocoPurchaseClient — read draft purchases + create real purchases on the Moco account.
 
 The OCR webhook fires on Moco's `Purchase:create` (the draft that email-import
 made), but drafts can't be patched: `PATCH /purchases/drafts/{id}` returns
@@ -8,7 +8,7 @@ extracted fields, the PDF base64-encoded as an attachment, and the tags
 `["OCR", "Review pending"]` so the human reviewer can find it in Moco's UI.
 
 Endpoints used:
-  - GET   /api/v1/purchases/drafts/{id}     — read the source draft
+  - GET   /api/v1/purchases/drafts/{id}     — read the draft
   - GET   /api/v1/vat_code_purchases        — list available VAT codes for
                                               purchase items (used by the
                                               OCR service to map `vat_rate`
@@ -16,14 +16,14 @@ Endpoints used:
   - POST  /api/v1/purchases                 — create the real purchase
   - POST  /api/v1/comments                  — comment with the OCR summary
 
-Auth: `Authorization: Token token={MOCO_SOURCE_API_KEY}`.
+Auth: `Authorization: Token token={MOCO_API_KEY}`.
 
 Supplier company lookup (`GET /companies?type=supplier`) lives in
-`SourceMocoClient.search_suppliers` rather than here — it's a generic
-company-list operation on the source account that sits next to
+`MocoClient.search_suppliers` rather than here — it's a generic
+company-list operation on the Moco account that sits next to
 `get_company(id)`, not something purchase-specific.
 
-Kept separate from `SourceMocoClient` for one-class-per-file (CLAUDE.md)
+Kept separate from `MocoClient` for one-class-per-file (CLAUDE.md)
 and because the draft URL space + the JSON-base64 attachment format are
 specific to the purchase-create flow.
 """

@@ -6,7 +6,7 @@ wiring up the `supplier-invoice-ocr` endpoint (SPEC Implementation Order
 step 1). Exercises the same code path production will use; no test fakes.
 
 Flow:
-  1. GET /api/v1/purchases/drafts/{id} on the source Moco account → get `file_url`.
+  1. GET /api/v1/purchases/drafts/{id} on the Moco account → get `file_url`.
   2. Download the pre-signed `file_url` → raw PDF bytes.
   3. AnthropicOcrClient.extract(pdf_bytes) → InvoiceData.
   4. Pretty-print the result so the operator can eyeball field accuracy.
@@ -21,8 +21,8 @@ Usage (from the repo root):
     python scripts/test_ocr_real.py 3001069 --save-pdf /tmp/inv.pdf   # also dump the PDF for inspection
 
 Required env (read from .env.local if present, else from the shell):
-    MOCO_SOURCE_SUBDOMAIN   — e.g. "solar"
-    MOCO_SOURCE_API_KEY     — token for the source Moco account
+    MOCO_SUBDOMAIN   — e.g. "solar"
+    MOCO_API_KEY     — token for the Moco account
     ANTHROPIC_API_KEY       — Claude API key
 
 Exits 0 on success, 1 on Anthropic OCR error, 2 on missing env / bad args, 3
@@ -41,7 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from api.anthropic_ocr_client import AnthropicOcrClient, AnthropicOcrError
-from api.source_moco_client import SourceMocoClient
+from api.moco_client import MocoClient
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -65,10 +65,10 @@ def _load_dotenv(path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
-def _get_purchase(moco: SourceMocoClient, purchase_id: int) -> dict:
-    """GET /purchases/drafts/{id} on the source Moco account.
+def _get_purchase(moco: MocoClient, purchase_id: int) -> dict:
+    """GET /purchases/drafts/{id} on the Moco account.
 
-    SourceMocoClient doesn't expose this directly (it was written for
+    MocoClient doesn't expose this directly (it was written for
     /companies and /projects only), so we reach in to its base URL + auth
     headers and reuse its urlopen. Acceptable for a one-off validation
     script — production reads go through a dedicated MocoPurchaseClient
@@ -97,12 +97,12 @@ def main() -> int:
 
     _load_dotenv(args.env_file)
 
-    subdomain = os.environ.get("MOCO_SOURCE_SUBDOMAIN")
-    moco_key = os.environ.get("MOCO_SOURCE_API_KEY")
+    subdomain = os.environ.get("MOCO_SUBDOMAIN")
+    moco_key = os.environ.get("MOCO_API_KEY")
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
     missing = [k for k, v in {
-        "MOCO_SOURCE_SUBDOMAIN": subdomain,
-        "MOCO_SOURCE_API_KEY": moco_key,
+        "MOCO_SUBDOMAIN": subdomain,
+        "MOCO_API_KEY": moco_key,
         "ANTHROPIC_API_KEY": anthropic_key,
     }.items() if not v]
     if missing:
@@ -111,7 +111,7 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    moco = SourceMocoClient(subdomain=subdomain, api_key=moco_key)
+    moco = MocoClient(subdomain=subdomain, api_key=moco_key)
     ocr = AnthropicOcrClient(api_key=anthropic_key, model=args.model)
 
     log.info("fetching Moco purchase %s from %s.mocoapp.com",

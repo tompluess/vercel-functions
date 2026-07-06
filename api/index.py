@@ -32,7 +32,7 @@ from api.moco_project_resolver import MocoProjectResolver
 from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_sync_service import MocoSyncService, TargetNotFoundError
 from api.moco_webhook_validator import MocoWebhookValidator
-from api.source_moco_client import SourceMocoClient
+from api.moco_client import MocoClient
 from api.supplier_invoice_ocr_service import SupplierInvoiceOcrService
 from api.telegram_notifier import TelegramNotifier
 
@@ -46,34 +46,34 @@ MAX_BODY_BYTES = 64 * 1024
 REQUIRED_ENV_TELEGRAM = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
 
 REQUIRED_ENV_MOCO_SYNC = [
-    "MOCO_WEBHOOK_SECRET", "MOCO_SOURCE_ACCOUNT_URL", "MOCO_USER_ID_FILTER",
+    "MOCO_WEBHOOK_SECRET", "MOCO_SUBDOMAIN", "MOCO_USER_ID_FILTER",
     "MOCO_TARGET_SUBDOMAIN", "MOCO_TARGET_API_KEY", "MOCO_TARGET_COMPANY_ID",
     "MOCO_TARGET_DEFAULT_PROJECT_ID", "MOCO_TARGET_DEFAULT_TASK_ID",
     *REQUIRED_ENV_TELEGRAM,
 ]
 
 REQUIRED_ENV_BEXIO_SYNC = [
-    "MOCO_WEBHOOK_SECRET", "MOCO_SOURCE_ACCOUNT_URL",
-    "MOCO_SOURCE_API_KEY", "BEXIO_API_TOKEN",
+    "MOCO_WEBHOOK_SECRET", "MOCO_SUBDOMAIN",
+    "MOCO_API_KEY", "BEXIO_API_TOKEN",
     *REQUIRED_ENV_TELEGRAM,
 ]
 
 REQUIRED_ENV_BREVO_SYNC = [
-    "MOCO_WEBHOOK_SECRET", "MOCO_SOURCE_ACCOUNT_URL",
-    "MOCO_SOURCE_API_KEY", "BREVO_API_KEY", "BREVO_LIST_ID",
+    "MOCO_WEBHOOK_SECRET", "MOCO_SUBDOMAIN",
+    "MOCO_API_KEY", "BREVO_API_KEY", "BREVO_LIST_ID",
     *REQUIRED_ENV_TELEGRAM,
 ]
 
 # Supplier-invoice OCR is a Moco-only flow (no Bexio/Brevo). It needs:
-#   - the usual Moco auth (webhook secret + source-account creds),
+#   - the usual Moco auth (webhook secret + account creds),
 #   - the Anthropic key for the OCR call.
 # The VAT code is resolved dynamically per invoice (OCR vat_rate matched
 # against GET /vat_code_purchases, falling back to the supplier's default),
-# so there's no env-var default. MOCO_SOURCE_ACCOUNT_URL doubles as the
-# source subdomain (same value used by all the Moco-side clients).
+# so there's no env-var default. MOCO_SUBDOMAIN is the same value used by
+# all the Moco-side clients.
 REQUIRED_ENV_SUPPLIER_INVOICE_OCR = [
-    "MOCO_WEBHOOK_SECRET", "MOCO_SOURCE_ACCOUNT_URL",
-    "MOCO_SOURCE_API_KEY", "ANTHROPIC_API_KEY",
+    "MOCO_WEBHOOK_SECRET", "MOCO_SUBDOMAIN",
+    "MOCO_API_KEY", "ANTHROPIC_API_KEY",
     *REQUIRED_ENV_TELEGRAM,
 ]
 
@@ -125,7 +125,7 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
         api=api,
         default_project_id=int(cfg["MOCO_TARGET_DEFAULT_PROJECT_ID"]),
         default_task_id=int(cfg["MOCO_TARGET_DEFAULT_TASK_ID"]),
-        source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+        source_account_url=cfg["MOCO_SUBDOMAIN"],
     )
     notifier = _build_notifier(cfg)
     dispatch = {"create": service.sync_create,
@@ -170,11 +170,11 @@ async def bexio_expense_sync_webhook(request: Request) -> dict[str, Any]:
         upstream_label="bexio",
         build_service=lambda cfg, notifier: BexioExpenseSyncService(
             bexio=BexioAPI(api_token=cfg["BEXIO_API_TOKEN"]),
-            source_moco=SourceMocoClient(
-                subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
-                api_key=cfg["MOCO_SOURCE_API_KEY"],
+            moco=MocoClient(
+                subdomain=cfg["MOCO_SUBDOMAIN"],
+                api_key=cfg["MOCO_API_KEY"],
             ),
-            source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+            subdomain=cfg["MOCO_SUBDOMAIN"],
             telegram=notifier,
         ),
     )
@@ -189,11 +189,11 @@ async def bexio_invoice_sync_webhook(request: Request) -> dict[str, Any]:
         upstream_label="bexio",
         build_service=lambda cfg, notifier: BexioInvoiceSyncService(
             bexio=BexioAPI(api_token=cfg["BEXIO_API_TOKEN"]),
-            source_moco=SourceMocoClient(
-                subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
-                api_key=cfg["MOCO_SOURCE_API_KEY"],
+            moco=MocoClient(
+                subdomain=cfg["MOCO_SUBDOMAIN"],
+                api_key=cfg["MOCO_API_KEY"],
             ),
-            source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+            subdomain=cfg["MOCO_SUBDOMAIN"],
             telegram=notifier,
         ),
     )
@@ -208,11 +208,11 @@ async def brevo_contact_sync_webhook(request: Request) -> dict[str, Any]:
         upstream_label="brevo",
         build_service=lambda cfg, notifier: BrevoContactSyncService(
             brevo=BrevoAPI(api_key=cfg["BREVO_API_KEY"]),
-            source_moco=SourceMocoClient(
-                subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
-                api_key=cfg["MOCO_SOURCE_API_KEY"],
+            moco=MocoClient(
+                subdomain=cfg["MOCO_SUBDOMAIN"],
+                api_key=cfg["MOCO_API_KEY"],
             ),
-            source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+            subdomain=cfg["MOCO_SUBDOMAIN"],
             list_id=int(cfg["BREVO_LIST_ID"]),
         ),
     )
@@ -252,13 +252,13 @@ async def supplier_invoice_ocr_webhook(request: Request) -> dict[str, Any]:
     body = parsed.get("body") if isinstance(parsed.get("body"), dict) else parsed
 
     notifier = _build_notifier(cfg)
-    source_moco = SourceMocoClient(
-        subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
-        api_key=cfg["MOCO_SOURCE_API_KEY"],
+    moco = MocoClient(
+        subdomain=cfg["MOCO_SUBDOMAIN"],
+        api_key=cfg["MOCO_API_KEY"],
     )
     purchase_client = MocoPurchaseClient(
-        subdomain=cfg["MOCO_SOURCE_ACCOUNT_URL"],
-        api_key=cfg["MOCO_SOURCE_API_KEY"],
+        subdomain=cfg["MOCO_SUBDOMAIN"],
+        api_key=cfg["MOCO_API_KEY"],
     )
     # Build the Kommission→project resolver per request. One extra
     # `GET /projects` call (~100ms) is acceptable to keep the resolver
@@ -268,7 +268,7 @@ async def supplier_invoice_ocr_webhook(request: Request) -> dict[str, Any]:
     # every assignment becomes a no-op (no_match), but the OCR pipeline
     # still produces the purchase.
     try:
-        projects = source_moco.list_projects()
+        projects = moco.list_projects()
     except Exception:
         logger.exception("ocr: list_projects failed; project assignment "
                          "disabled for this webhook")
@@ -286,10 +286,10 @@ async def supplier_invoice_ocr_webhook(request: Request) -> dict[str, Any]:
         categories = []
     category_resolver = MocoCategoryResolver(categories)
     service = SupplierInvoiceOcrService(
-        source_moco=source_moco,
+        moco=moco,
         purchase_client=purchase_client,
         ocr=AnthropicOcrClient(api_key=cfg["ANTHROPIC_API_KEY"]),
-        source_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+        subdomain=cfg["MOCO_SUBDOMAIN"],
         telegram=notifier,
         project_resolver=project_resolver,
         category_resolver=category_resolver,
@@ -440,7 +440,7 @@ async def _read_body(request: Request) -> bytes:
 def _verify_moco_auth(cfg: dict[str, str], request: Request, raw: bytes) -> None:
     validator = MocoWebhookValidator(
         secret=cfg["MOCO_WEBHOOK_SECRET"],
-        expected_account_url=cfg["MOCO_SOURCE_ACCOUNT_URL"],
+        expected_account_url=cfg["MOCO_SUBDOMAIN"],
     )
     if not validator.verify_signature(raw, request.headers.get("x-moco-signature", "")):
         logger.warning("signature mismatch")
@@ -449,8 +449,8 @@ def _verify_moco_auth(cfg: dict[str, str], request: Request, raw: bytes) -> None
         logger.warning("timestamp out of window")
         raise HTTPException(401, "timestamp_out_of_window")
     if not validator.account_matches(request.headers.get("x-moco-account-url", "")):
-        logger.warning("wrong source account")
-        raise HTTPException(401, "wrong_source_account")
+        logger.warning("wrong account")
+        raise HTTPException(401, "wrong_account")
 
 
 def _parse_json(raw: bytes) -> dict:

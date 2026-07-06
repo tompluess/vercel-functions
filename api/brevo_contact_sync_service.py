@@ -6,7 +6,7 @@ Mirrors the n8n "Add Moco contacts to Brevo" workflow:
      by email and there is nothing to sync without one.
   2. Lookup Brevo contact by work_email.
      - Not found: create with VORNAME, NACHNAME, ADDITIONAL_INFO (today's date
-       + the source Moco URL), then post a comment back to the Moco contact
+       + the Moco URL), then post a comment back to the Moco contact
        with the Brevo URL.
      - Found: update with VORNAME, NACHNAME, RESPONSIBLE_PERSON (Moco owner's
        full name), JOB_TITLE.
@@ -24,7 +24,7 @@ from typing import Any
 from urllib import error as urlerror
 
 from api.brevo_api import BrevoAPI
-from api.source_moco_client import SourceMocoClient
+from api.moco_client import MocoClient
 
 logger = logging.getLogger("brevo_contact_sync_service")
 
@@ -32,11 +32,11 @@ logger = logging.getLogger("brevo_contact_sync_service")
 class BrevoContactSyncService:
     BREVO_CONTACT_URL_TEMPLATE = "https://app.brevo.com/contact/index/{id}"
 
-    def __init__(self, *, brevo: BrevoAPI, source_moco: SourceMocoClient,
-                 source_account_url: str, list_id: int):
+    def __init__(self, *, brevo: BrevoAPI, moco: MocoClient,
+                 subdomain: str, list_id: int):
         self._brevo = brevo
-        self._source_moco = source_moco
-        self._source_account_url = source_account_url
+        self._moco = moco
+        self._subdomain = subdomain
         self._list_id = list_id
         # No Telegram notifier here: this service's only skip (no_work_email)
         # is a routine gate (many Moco contacts legitimately have no work
@@ -146,7 +146,7 @@ class BrevoContactSyncService:
 
     def _additional_info(self, body: dict) -> str:
         today = datetime.date.today().strftime("%-d.%-m.%Y")
-        moco_url = (f"https://{self._source_account_url}.mocoapp.com/contacts/"
+        moco_url = (f"https://{self._subdomain}.mocoapp.com/contacts/"
                     f"{body.get('id')}")
         return f"{today}, Added from Moco via vercel-functions.\n{moco_url}"
 
@@ -157,7 +157,7 @@ class BrevoContactSyncService:
         text = (f"Contact added to Brevo: "
                 f"{self.BREVO_CONTACT_URL_TEMPLATE.format(id=brevo_id)}")
         try:
-            self._source_moco.post_comment(commentable_id=source_id,
+            self._moco.post_comment(commentable_id=source_id,
                                            commentable_type="Contact",
                                            text=text)
         except Exception:

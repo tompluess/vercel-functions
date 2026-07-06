@@ -112,13 +112,13 @@ def test_stale_timestamp_returns_401(client, stub_target_api):
     assert r.json()["detail"] == "timestamp_out_of_window"
 
 
-def test_wrong_source_account_returns_401(client, stub_target_api):
+def test_wrong_account_returns_401(client, stub_target_api):
     body = (FIXTURES_DIR / "activity_create_matched.json").read_bytes()
     headers = signed_headers(body, account_url="not-solar")
 
     r = post(client, body, headers)
     assert r.status_code == 401
-    assert r.json()["detail"] == "wrong_source_account"
+    assert r.json()["detail"] == "wrong_account"
 
 
 def test_delete_event_removes_target_activity(client, stub_target_api):
