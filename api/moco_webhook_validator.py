@@ -7,7 +7,7 @@ import time
 
 class MocoWebhookValidator:
     """Validates Moco webhook authenticity: HMAC signature, timestamp freshness,
-    and that the event originated from the expected source account."""
+    and that the event originated from the expected account."""
 
     TIMESTAMP_WINDOW_SECONDS = 300
 

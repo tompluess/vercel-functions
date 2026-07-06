@@ -4,7 +4,7 @@ Mirrors the n8n "Sync invoices from Moco to Bexio" workflow:
 
   1. Skip unless `body.status == "sent"`. Moco fires Invoice:update on every
      edit (draft, sent, paid, …); we only sync once the invoice is sent.
-  2. Fetch the source project to read its labels and customer.
+  2. Fetch the Moco project to read its labels and customer.
   3. Find/create the Bexio contact for the customer.
   4. Resolve the revenue account from the project's labels.
   5. Pick a document template (first one returned by Bexio).
@@ -35,7 +35,7 @@ from api.bexio_config import (
     USER_ID,
     resolve_revenue_account_no,
 )
-from api.source_moco_client import SourceMocoClient
+from api.moco_client import MocoClient
 from api.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger("bexio_invoice_sync_service")
@@ -44,12 +44,12 @@ logger = logging.getLogger("bexio_invoice_sync_service")
 class BexioInvoiceSyncService:
     BEXIO_INVOICE_URL_TEMPLATE = "https://office.bexio.com/index.php/kb_invoice/show/id/{id}"
 
-    def __init__(self, *, bexio: BexioAPI, source_moco: SourceMocoClient,
-                 source_account_url: str,
+    def __init__(self, *, bexio: BexioAPI, moco: MocoClient,
+                 subdomain: str,
                  telegram: TelegramNotifier | None = None):
         self._bexio = bexio
-        self._source_moco = source_moco
-        self._source_account_url = source_account_url
+        self._moco = moco
+        self._subdomain = subdomain
         # Optional: the no_customer skip below DMs a Telegram chat with the
         # Moco invoice link, mirroring BexioExpenseSyncService's skip
         # notifications. status_not_sent stays silent — it fires on every draft
@@ -62,7 +62,7 @@ class BexioInvoiceSyncService:
                         body.get("status"), body.get("id"))
             return {"skipped": "status_not_sent", "status": body.get("status")}
 
-        project = self._source_moco.get_project(body["project_id"])
+        project = self._moco.get_project(body["project_id"])
         customer = project.get("customer") or {}
         customer_name = customer.get("name") or ""
         if not customer_name:
@@ -106,7 +106,7 @@ class BexioInvoiceSyncService:
         results = self._bexio.search_contact_by_name(name)
         if results:
             return results[0]
-        moco_company = self._source_moco.get_company(body["customer_id"])
+        moco_company = self._moco.get_company(body["customer_id"])
         billing_address = project.get("billing_address") or ""
         return self._bexio.create_contact(_contact_payload_from_moco(
             name=name, moco_company=moco_company,
@@ -173,7 +173,7 @@ class BexioInvoiceSyncService:
     # --- telegram skip notification -----------------------------------------
 
     def _invoice_url(self, source_id: int | None) -> str:
-        return (f"https://{self._source_account_url}.mocoapp.com"
+        return (f"https://{self._subdomain}.mocoapp.com"
                 f"/invoices/{source_id}")
 
     def _notify_no_customer(self, body: dict) -> None:
@@ -215,7 +215,7 @@ class BexioInvoiceSyncService:
         text = (f"Rechnung in Bexio erstellt: "
                 f"{self.BEXIO_INVOICE_URL_TEMPLATE.format(id=invoice_id)}")
         try:
-            self._source_moco.post_comment(commentable_id=source_id,
+            self._moco.post_comment(commentable_id=source_id,
                                            commentable_type="Invoice",
                                            text=text)
         except Exception:

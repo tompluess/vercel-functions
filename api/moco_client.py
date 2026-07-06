@@ -1,11 +1,11 @@
-"""SourceMocoClient — read-only/comment-only client for the *source* Moco account.
+"""MocoClient — read-only/comment-only client for the attached Moco account.
 
-The existing `MocoAPI` is scoped to a *target* Moco account and only owns the
-endpoints needed to replicate activities. The Bexio sync flows additionally
-need to read company data from the source account, fetch a webhook's
-attachment via a signed `file_url`, and post a comment back so the Bexio link
-is visible to the user inside Moco. Kept as a separate collaborator to keep
-each class single-purpose (see CLAUDE.md).
+`MocoAPI` is scoped to the *target* Moco account of the moco-sync replication
+flow and only owns the endpoints needed to replicate activities. The Bexio
+sync flows additionally need to read company data from the account, fetch a
+webhook's attachment via a signed `file_url`, and post a comment back so the
+Bexio link is visible to the user inside Moco. Kept as a separate
+collaborator to keep each class single-purpose (see CLAUDE.md).
 """
 
 import json
@@ -14,7 +14,7 @@ from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 
-class SourceMocoClient:
+class MocoClient:
     HTTP_TIMEOUT_SECONDS = 30  # attachment download may dominate
 
     def __init__(self, *, subdomain: str, api_key: str):
@@ -77,7 +77,7 @@ class SourceMocoClient:
             return json.loads(resp.read())
 
     def list_projects(self, *, limit: int = 200) -> list[dict]:
-        """GET /projects — list **active** projects on the source account.
+        """GET /projects — list **active** projects on the Moco account.
 
         Used by the batch validation script to build a Kommission-index for
         `MocoProjectResolver`. Moco's listing is active-only by default; we

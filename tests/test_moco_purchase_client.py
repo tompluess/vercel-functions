@@ -1,6 +1,6 @@
 """Unit tests for MocoPurchaseClient — draft read, create purchase (with
 base64 attachment), and comment posting. Supplier-company lookup lives on
-SourceMocoClient — see `test_source_moco_client.py`."""
+MocoClient — see `test_moco_client.py`."""
 
 import json
 from urllib import error as urlerror

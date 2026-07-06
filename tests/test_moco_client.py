@@ -1,6 +1,6 @@
-"""Unit tests for SourceMocoClient.search_suppliers.
+"""Unit tests for MocoClient.search_suppliers.
 
-The rest of SourceMocoClient (get_company / get_project / post_comment /
+The rest of MocoClient (get_company / get_project / post_comment /
 download_file) is exercised end-to-end via the Bexio and OCR endpoint tests
 — they stub urlopen so the wrappers are trivially covered by call-site
 assertions. The supplier search has non-trivial client-side logic
@@ -12,8 +12,8 @@ from urllib import error as urlerror
 
 import pytest
 
-import api.source_moco_client as src_mod
-from api.source_moco_client import SourceMocoClient
+import api.moco_client as src_mod
+from api.moco_client import MocoClient
 from tests.conftest import FakeUrlopenResponse
 
 
@@ -38,7 +38,7 @@ def calls(monkeypatch):
 
 @pytest.fixture
 def client():
-    return SourceMocoClient(subdomain="solar", api_key="test_source_key")
+    return MocoClient(subdomain="solar", api_key="test_source_key")
 
 
 def test_search_suppliers_uses_type_and_term_query_params(client, calls):

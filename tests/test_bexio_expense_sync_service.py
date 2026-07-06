@@ -1,6 +1,6 @@
 """Unit tests for BexioExpenseSyncService — payload shape, branches, idempotency.
 
-Injects FakeBexioAPI + FakeSourceMocoClient so no HTTP is touched.
+Injects FakeBexioAPI + FakeMocoClient so no HTTP is touched.
 """
 
 import json
@@ -90,7 +90,7 @@ class FakeBexioAPI:
         return self.next_outgoing_payment
 
 
-class FakeSourceMoco:
+class FakeMoco:
     def __init__(self):
         self.companies: dict[int, dict] = {}
         self.files: dict[str, bytes] = {}
@@ -136,13 +136,13 @@ def telegram():
 
 @pytest.fixture
 def source():
-    return FakeSourceMoco()
+    return FakeMoco()
 
 
 @pytest.fixture
 def service(bexio, source):
-    return BexioExpenseSyncService(bexio=bexio, source_moco=source,
-                                   source_account_url="solar")
+    return BexioExpenseSyncService(bexio=bexio, moco=source,
+                                   subdomain="solar")
 
 
 def test_skips_when_no_company(service, bexio):
@@ -464,8 +464,8 @@ def test_moco_comment_failure_does_not_fail_sync(service, bexio, source):
 
 @pytest.fixture
 def service_tg(bexio, source, telegram):
-    return BexioExpenseSyncService(bexio=bexio, source_moco=source,
-                                   source_account_url="solar",
+    return BexioExpenseSyncService(bexio=bexio, moco=source,
+                                   subdomain="solar",
                                    telegram=telegram)
 
 

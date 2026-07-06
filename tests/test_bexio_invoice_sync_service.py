@@ -46,7 +46,7 @@ class FakeBexioAPI:
         return {}
 
 
-class FakeSourceMoco:
+class FakeMoco:
     def __init__(self):
         self.companies: dict[int, dict] = {}
         self.projects: dict[int, dict] = {}
@@ -79,7 +79,7 @@ def bexio():
 
 @pytest.fixture
 def source():
-    src = FakeSourceMoco()
+    src = FakeMoco()
     src.projects[947168988] = {
         "id": 947168988,
         "customer": {"id": 762286146, "name": "Muster AG"},
@@ -109,14 +109,14 @@ def telegram():
 
 @pytest.fixture
 def service(bexio, source):
-    return BexioInvoiceSyncService(bexio=bexio, source_moco=source,
-                                   source_account_url="solar")
+    return BexioInvoiceSyncService(bexio=bexio, moco=source,
+                                   subdomain="solar")
 
 
 @pytest.fixture
 def service_tg(bexio, source, telegram):
-    return BexioInvoiceSyncService(bexio=bexio, source_moco=source,
-                                   source_account_url="solar",
+    return BexioInvoiceSyncService(bexio=bexio, moco=source,
+                                   subdomain="solar",
                                    telegram=telegram)
 
 

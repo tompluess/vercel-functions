@@ -16,14 +16,14 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 TEST_ENV = {
     "MOCO_WEBHOOK_SECRET": "test_secret",
-    "MOCO_SOURCE_ACCOUNT_URL": "solar",
+    "MOCO_SUBDOMAIN": "solar",
     "MOCO_USER_ID_FILTER": "933719334",
     "MOCO_TARGET_SUBDOMAIN": "skyr",
     "MOCO_TARGET_API_KEY": "test_api_key",
     "MOCO_TARGET_COMPANY_ID": "761404231",
     "MOCO_TARGET_DEFAULT_PROJECT_ID": "947156885",
     "MOCO_TARGET_DEFAULT_TASK_ID": "25339113",
-    "MOCO_SOURCE_API_KEY": "test_source_moco_key",
+    "MOCO_API_KEY": "test_moco_key",
     "BEXIO_API_TOKEN": "test_bexio_token",
     "BREVO_API_KEY": "test_brevo_key",
     "BREVO_LIST_ID": "5",

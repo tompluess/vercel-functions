@@ -73,7 +73,7 @@ Receives Moco `Purchase` webhooks and creates a matching supplier bill in [Bexio
 Receives Moco `Invoice` webhooks and creates a matching customer invoice in Bexio. Replaces the n8n workflow `Sync invoices from Moco to Bexio.json`.
 
 - Gates on `status == "sent"` — drafts are ignored so Moco edit-loops don't churn Bexio.
-- Fetches the source project to read its labels and customer.
+- Fetches the Moco project to read its labels and customer.
 - Resolves the revenue account from project labels (e.g. `Stromproduktion → 3010`, `Wartung → 3450`); see `INVOICE_REVENUE_ACCOUNT_BY_LABEL` in [`api/bexio_config.py`](api/bexio_config.py) for the full mapping.
 - Creates the invoice with `api_reference` set to the Moco identifier, then calls `/issue` to transition the invoice to Open (awaiting payment).
 - Cross-comments: a Bexio comment with the Moco URL, and a Moco comment with the Bexio URL.
@@ -112,11 +112,11 @@ Operator scripts for validating the OCR pipeline against real Moco drafts live u
 
 ## Scripts
 
-Two CLIs drive the OCR pipeline directly against the source Moco account so you can validate behaviour without going through the webhook. Both default to **dry-run** (no Moco writes); pass `--apply` to actually create purchases. Both load env from `.env.local` (use `vercel env pull .env.local` first) and need `MOCO_SOURCE_ACCOUNT_URL`, `MOCO_SOURCE_API_KEY`, and `ANTHROPIC_API_KEY`.
+Two CLIs drive the OCR pipeline directly against the Moco account so you can validate behaviour without going through the webhook. Both default to **dry-run** (no Moco writes); pass `--apply` to actually create purchases. Both load env from `.env.local` (use `vercel env pull .env.local` first) and need `MOCO_SUBDOMAIN`, `MOCO_API_KEY`, and `ANTHROPIC_API_KEY`.
 
 ### `scripts/test_ocr_create_purchase.py` — single draft
 
-Runs the full pipeline against one specific draft id and prints a detailed step-by-step view: the source draft fields, the OCR'd `InvoiceData`, the supplier-lookup outcome, the resolved VAT code, the Kommission → project resolution (status + tier + candidate count), the chosen category (with reasoning), the exact `POST /purchases` payload (with the PDF base64 elided) and rendered comment bodies, plus a preview of the `POST /purchases/{id}/assign_to_project` body. Useful when iterating on the prompt or chasing a single weird invoice.
+Runs the full pipeline against one specific draft id and prints a detailed step-by-step view: the draft fields, the OCR'd `InvoiceData`, the supplier-lookup outcome, the resolved VAT code, the Kommission → project resolution (status + tier + candidate count), the chosen category (with reasoning), the exact `POST /purchases` payload (with the PDF base64 elided) and rendered comment bodies, plus a preview of the `POST /purchases/{id}/assign_to_project` body. Useful when iterating on the prompt or chasing a single weird invoice.
 
 ```bash
 .venv/bin/python scripts/test_ocr_create_purchase.py 3001069                 # dry-run
@@ -150,9 +150,9 @@ Telegram is intentionally **not** wired into the batch script (one alert per row
 ## Architecture
 
 - [`api/index.py`](api/index.py) — FastAPI entrypoint. Parses the request, runs the auth pipeline, dispatches to the appropriate service. The three external-sink endpoints (two Bexio, one Brevo) share `_handle_moco_dispatch_webhook` so the auth/parse/error plumbing isn't duplicated.
-- [`api/moco_webhook_validator.py`](api/moco_webhook_validator.py) — `MocoWebhookValidator`: HMAC-SHA256 signature check, ±300s timestamp window, source-account allowlist. Pure, no I/O.
+- [`api/moco_webhook_validator.py`](api/moco_webhook_validator.py) — `MocoWebhookValidator`: HMAC-SHA256 signature check, ±300s timestamp window, account allowlist. Pure, no I/O.
 - [`api/moco_api.py`](api/moco_api.py) / [`api/moco_sync_service.py`](api/moco_sync_service.py) — target-Moco transport and the Activity replication logic.
-- [`api/source_moco_client.py`](api/source_moco_client.py) — read-only/comment-only client for the *source* Moco account (companies, projects, comments, signed file downloads).
+- [`api/moco_client.py`](api/moco_client.py) — read-only/comment-only client for the attached Moco account (companies, projects, comments, signed file downloads).
 - [`api/bexio_api.py`](api/bexio_api.py) — Bearer-auth Bexio REST wrapper covering contacts, accounts, bills, invoices (incl. state transitions), files (multipart upload), document templates.
 - [`api/bexio_config.py`](api/bexio_config.py) — non-secret Bexio numeric IDs (user, owner, bank, defaults) and the label → revenue-account mapping. Hardcoded since they change rarely and aren't credentials.
 - [`api/bexio_expense_sync_service.py`](api/bexio_expense_sync_service.py) / [`api/bexio_invoice_sync_service.py`](api/bexio_invoice_sync_service.py) — pure business logic; all HTTP transport delegated to the two collaborators above.
@@ -160,7 +160,7 @@ Telegram is intentionally **not** wired into the batch script (one alert per row
 - [`api/brevo_contact_sync_service.py`](api/brevo_contact_sync_service.py) — pure business logic for the Brevo flow (lookup → create-or-update → SMS → list add → optional cross-comment to Moco).
 - [`api/telegram_notifier.py`](api/telegram_notifier.py) — `TelegramNotifier`: best-effort `sendMessage` to a Telegram chat. Used for error/skip notifications; never raises (a Telegram outage won't change the HTTP response).
 - [`api/anthropic_ocr_client.py`](api/anthropic_ocr_client.py) — `AnthropicOcrClient`: thin wrapper around Anthropic's `POST /v1/messages` (Claude Sonnet 4.6 Vision). Sends a PDF as a base64 `document` content block, parses the JSON response into an `InvoiceData` dataclass. Robust parser tolerates `<think>`-style preamble (Sonnet sometimes reasons out loud when length-checked prompts fire); IBAN mod-97 validated; QR-Referenz strict 27-digit check.
-- [`api/moco_purchase_client.py`](api/moco_purchase_client.py) — `MocoPurchaseClient`: draft read + create real purchase + delete draft + list vat-code-purchases + list purchases categories + assign-item-to-project + comment on the source Moco account. Note the `drafts/` URL space — drafts live at `GET /purchases/drafts/{id}`, distinct from confirmed `GET /purchases/{id}`.
+- [`api/moco_purchase_client.py`](api/moco_purchase_client.py) — `MocoPurchaseClient`: draft read + create real purchase + delete draft + list vat-code-purchases + list purchases categories + assign-item-to-project + comment on the Moco account. Note the `drafts/` URL space — drafts live at `GET /purchases/drafts/{id}`, distinct from confirmed `GET /purchases/{id}`.
 - [`api/moco_project_resolver.py`](api/moco_project_resolver.py) — `MocoProjectResolver`: indexes Moco projects by their `Kommission` custom-property (falling back to `project.name`) and resolves an OCR'd commission string in three tiers (exact → substring → token-overlap), reporting `matched` / `ambiguous` / `no_match` / `empty` with the winning tier. Pure, no I/O.
 - [`api/moco_category_resolver.py`](api/moco_category_resolver.py) — `MocoCategoryResolver`: maps a `(project, already_paid)` pair to a `category_id` from the `GET /purchases/categories` catalog via `credit_account`. Omits on card-paid receipts, prefers the project's `Aufwandkonto` custom-property, falls back to SKR `4000` (Wareneinkauf). Pure, no I/O.
 - [`api/supplier_invoice_ocr_service.py`](api/supplier_invoice_ocr_service.py) — pure business logic for the OCR flow; orchestrates download → OCR → supplier lookup → VAT resolve → project resolve → category resolve → create → two comments → assign-to-project per item → delete draft → confidence-routed Telegram.
@@ -208,8 +208,8 @@ Required environment variables (configure in the Vercel project, then `vercel en
 
 | Variable | Purpose |
 | --- | --- |
-| `MOCO_WEBHOOK_SECRET` | Shared secret used by the source Moco account to sign webhook bodies |
-| `MOCO_SOURCE_ACCOUNT_URL` | Expected `x-moco-account-url` header value (e.g. `solar`) |
+| `MOCO_WEBHOOK_SECRET` | Shared secret used by the Moco account to sign webhook bodies |
+| `MOCO_SUBDOMAIN` | Subdomain of the attached Moco account (`{subdomain}.mocoapp.com`, e.g. `solar`); also the expected `x-moco-account-url` header value |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token (the `…/bot<token>/sendMessage` path) for error/skip notifications |
 | `TELEGRAM_CHAT_ID` | Target Telegram chat/group ID (e.g. `-1002342319319`); per-environment so dev/staging/prod can notify different chats |
 
@@ -228,7 +228,7 @@ Required environment variables (configure in the Vercel project, then `vercel en
 
 | Variable | Purpose |
 | --- | --- |
-| `MOCO_SOURCE_API_KEY` | API token for the **source** Moco account (used to fetch companies/projects and post comments back) |
+| `MOCO_API_KEY` | API token for the Moco account (used to fetch companies/projects and post comments back) |
 | `BEXIO_API_TOKEN` | Bexio API v3 token (sent as `Authorization: Bearer …`) |
 | `BEXIO_MANUAL_BANK_MAP` | *Optional.* JSON map of Moco user first name → Bexio `bank_account_id` for non-IBAN bills. Example: `{"default": 3, "Alice": 5, "Bob": 4}`. Falls back to `bexio_config.BANK_ACCOUNT_ID` when missing. |
 | `BEXIO_OUTGOING_PAYMENT_SENDER` | JSON object with the own-company sender fields embedded in every Bexio outgoing payment created by the expense flow. Expected keys: `name`, `iban`, `bank_name`, `bc_no`, `street`, `house_no`, `postcode`, `city`, `country_code`, `bank_account_id` (int). IBAN must be contiguous (no spaces). When missing/malformed, the book+pay step is skipped and a Telegram alert fires — the bill itself is still created. Not used by the invoice flow. |
@@ -237,7 +237,7 @@ Required environment variables (configure in the Vercel project, then `vercel en
 
 | Variable | Purpose |
 | --- | --- |
-| `MOCO_SOURCE_API_KEY` | API token for the **source** Moco account (used to post the cross-link comment back) |
+| `MOCO_API_KEY` | API token for the Moco account (used to post the cross-link comment back) |
 | `BREVO_API_KEY` | Brevo API v3 key (sent as `api-key: …`) |
 | `BREVO_LIST_ID` | Numeric ID of the Brevo list every synced contact is added to |
 
@@ -245,7 +245,7 @@ Required environment variables (configure in the Vercel project, then `vercel en
 
 | Variable | Purpose |
 | --- | --- |
-| `MOCO_SOURCE_API_KEY` | API token for the **source** Moco account (read draft, list vat codes + suppliers, create the real purchase, post comments, delete draft) |
+| `MOCO_API_KEY` | API token for the Moco account (read draft, list vat codes + suppliers, create the real purchase, post comments, delete draft) |
 | `ANTHROPIC_API_KEY` | Anthropic API key for the Claude Sonnet 4.6 Vision OCR call (`x-api-key` header) |
 
 The VAT code is resolved dynamically per invoice (OCR `vat_rate` → supplier company default → account-wide `default: true` flag in `/vat_code_purchases`), so there's no env-var default to configure.

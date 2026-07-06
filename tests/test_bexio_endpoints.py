@@ -1,6 +1,6 @@
 """End-to-end tests for /api/bexio-expense-sync and /api/bexio-invoice-sync.
 
-Patches urlopen in both `api.bexio_api` and `api.source_moco_client` so the
+Patches urlopen in both `api.bexio_api` and `api.moco_client` so the
 full request pipeline runs without network. Asserts the HMAC pipeline and
 that Bexio receives the expected calls.
 """
@@ -17,7 +17,7 @@ from tests.conftest import (FIXTURES_DIR, FakeUrlopenResponse, load_fixture,
 
 @pytest.fixture
 def stub_pipeline(monkeypatch):
-    """Patches urlopen in api.bexio_api AND api.source_moco_client.
+    """Patches urlopen in api.bexio_api AND api.moco_client.
 
     Routes by hostname/path so tests get realistic Bexio responses and the
     source-Moco calls (companies, projects, comments, file downloads) succeed.
@@ -97,7 +97,7 @@ def stub_pipeline(monkeypatch):
         raise AssertionError(f"unexpected request: {method} {url}")
 
     import api.bexio_api as bexio_mod
-    import api.source_moco_client as src_mod
+    import api.moco_client as src_mod
     monkeypatch.setattr(bexio_mod.urlrequest, "urlopen", fake_urlopen)
     monkeypatch.setattr(src_mod.urlrequest, "urlopen", fake_urlopen)
     return state

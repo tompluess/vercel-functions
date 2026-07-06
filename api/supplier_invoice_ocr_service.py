@@ -63,7 +63,7 @@ from api.anthropic_ocr_client import (
 from api.moco_category_resolver import MocoCategoryResolver
 from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
-from api.source_moco_client import SourceMocoClient
+from api.moco_client import MocoClient
 from api.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger("supplier_invoice_ocr_service")
@@ -79,17 +79,17 @@ NOTIFICATION_SUBJECT_KEYWORDS = ("sicherheitshinweis", "zustellungshinweis")
 
 
 class SupplierInvoiceOcrService:
-    def __init__(self, *, source_moco: SourceMocoClient,
+    def __init__(self, *, moco: MocoClient,
                  purchase_client: MocoPurchaseClient,
                  ocr: AnthropicOcrClient,
-                 source_account_url: str,
+                 subdomain: str,
                  telegram: TelegramNotifier | None = None,
                  project_resolver: MocoProjectResolver | None = None,
                  category_resolver: MocoCategoryResolver | None = None):
-        self._source_moco = source_moco
+        self._moco = moco
         self._purchases = purchase_client
         self._ocr = ocr
-        self._source_account_url = source_account_url
+        self._subdomain = subdomain
         self._telegram = telegram
         # Optional — when set, the service resolves the OCR'd Kommission
         # to a Moco project and assigns each line item to it after the
@@ -151,7 +151,7 @@ class SupplierInvoiceOcrService:
         invoice: InvoiceData | None = None
         company_id: int | None = None
         try:
-            pdf_bytes = self._source_moco.download_file(file_url)
+            pdf_bytes = self._moco.download_file(file_url)
             logger.info("ocr: downloaded PDF draft_id=%s bytes=%d",
                         draft_id, len(pdf_bytes))
 
@@ -286,7 +286,7 @@ class SupplierInvoiceOcrService:
 
         if supplier_company_id is not None:
             try:
-                company = self._source_moco.get_company(supplier_company_id)
+                company = self._moco.get_company(supplier_company_id)
             except Exception:
                 logger.exception("ocr: get_company failed for vat fallback "
                                  "id=%s", supplier_company_id)
@@ -328,7 +328,7 @@ class SupplierInvoiceOcrService:
         if not supplier_name:
             return None
         try:
-            matches = self._source_moco.search_suppliers(supplier_name)
+            matches = self._moco.search_suppliers(supplier_name)
         except Exception:
             # Don't fail the whole sync just because supplier lookup
             # blew up — the purchase is the authoritative side effect;
@@ -629,11 +629,11 @@ class SupplierInvoiceOcrService:
         )
 
     def _purchase_url(self, purchase_id: int) -> str:
-        return (f"https://{self._source_account_url}.mocoapp.com"
+        return (f"https://{self._subdomain}.mocoapp.com"
                 f"/purchases/{purchase_id}")
 
     def _draft_url(self, draft_id: int) -> str:
-        return (f"https://{self._source_account_url}.mocoapp.com"
+        return (f"https://{self._subdomain}.mocoapp.com"
                 f"/purchases/drafts/{draft_id}")
 
 
