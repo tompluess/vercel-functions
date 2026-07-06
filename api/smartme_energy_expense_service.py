@@ -386,8 +386,11 @@ def _unmatched_reason(bill: EnergyBillData,
         return "OCR fand kein Objekt"
     if match.status == "ambiguous":
         return (f"Objekt passt auf {match.candidate_count} Projekte "
-                "(mehrdeutig)")
-    return "kein ZEV/Eigenverbrauch-Projekt passt zum Objekt"
+                "(mehrdeutig — smart-me Objektname ins Kommission-Feld "
+                "des Zielprojekts eintragen)")
+    return ("kein ZEV/Eigenverbrauch-Projekt passt zum Objekt "
+            "(smart-me Objektname ins Kommission-Feld des Zielprojekts "
+            "eintragen)")
 
 
 def _format_keep_comment(bill: EnergyBillData | None, reason: str) -> str:

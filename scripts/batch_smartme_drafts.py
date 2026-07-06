@@ -155,7 +155,8 @@ def _process_draft(draft: dict, *, moco: MocoClient,
                    f"error: {e}")
 
     match = matcher.match(bill.objekt)
-    _step(f"project: {_project_cell(match)} (score={match.score})")
+    _step(f"project: {_project_cell(match)} "
+          f"(tier={match.tier}, score={match.score})")
     label = (project_energy_label(match.project)
              if match.status == "matched" else None)
     amount = (f"CHF {bill.net_amount:.2f}"
