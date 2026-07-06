@@ -64,6 +64,10 @@ from api.moco_category_resolver import MocoCategoryResolver
 from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_client import MocoClient
+from api.smartme_energy_expense_service import (
+    SmartmeEnergyExpenseService,
+    is_smartme_draft,
+)
 from api.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger("supplier_invoice_ocr_service")
@@ -85,12 +89,18 @@ class SupplierInvoiceOcrService:
                  subdomain: str,
                  telegram: TelegramNotifier | None = None,
                  project_resolver: MocoProjectResolver | None = None,
-                 category_resolver: MocoCategoryResolver | None = None):
+                 category_resolver: MocoCategoryResolver | None = None,
+                 smartme: SmartmeEnergyExpenseService | None = None):
         self._moco = moco
         self._purchases = purchase_client
         self._ocr = ocr
         self._subdomain = subdomain
         self._telegram = telegram
+        # Optional — when set, drafts detected as smart-me
+        # Energiekostenabrechnungen (see `is_smartme_draft`) are delegated
+        # to the energy-expense branch instead of the OCR→purchase path.
+        # Optional so existing unit tests can omit it.
+        self._smartme = smartme
         # Optional — when set, the service resolves the OCR'd Kommission
         # to a Moco project and assigns each line item to it after the
         # purchase is created. Optional so existing unit tests that don't
@@ -124,6 +134,17 @@ class SupplierInvoiceOcrService:
                 + _draft_context_suffix(body)
             )
             return {"skipped": "no_purchase_id"}
+        # smart-me Energiekostenabrechnungen are our OWN outgoing energy
+        # statements, not supplier invoices — they become a project
+        # expense, never a purchase. Detection runs before the file_url
+        # gate on purpose: an attachment-less smart-me draft must hit the
+        # smart-me branch's keep-and-alert path, not the notification
+        # silent-delete below.
+        if self._smartme is not None and is_smartme_draft(body):
+            logger.info("ocr: draft %s detected as smart-me "
+                        "Energiekostenabrechnung — routing to "
+                        "energy-expense branch", draft_id)
+            return self._smartme.process_draft(body)
         if not file_url:
             if _is_notification_subject(body.get("title")):
                 # Bank/portal notification mails ("Sicherheitshinweis",

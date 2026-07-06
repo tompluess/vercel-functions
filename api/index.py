@@ -33,6 +33,8 @@ from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_sync_service import MocoSyncService, TargetNotFoundError
 from api.moco_webhook_validator import MocoWebhookValidator
 from api.moco_client import MocoClient
+from api.smartme_energy_expense_service import SmartmeEnergyExpenseService
+from api.smartme_project_matcher import SmartmeProjectMatcher
 from api.supplier_invoice_ocr_service import SupplierInvoiceOcrService
 from api.telegram_notifier import TelegramNotifier
 
@@ -285,14 +287,28 @@ async def supplier_invoice_ocr_webhook(request: Request) -> dict[str, Any]:
                          "disabled for this webhook")
         categories = []
     category_resolver = MocoCategoryResolver(categories)
+    ocr = AnthropicOcrClient(api_key=cfg["ANTHROPIC_API_KEY"])
+    # smart-me Energiekostenabrechnungen arrive on the same inbox but
+    # become a project expense instead of a purchase. The matcher indexes
+    # the ZEV/Eigenverbrauch-labeled subset of the same per-request
+    # projects list the Kommission resolver uses — no extra API call.
+    smartme_service = SmartmeEnergyExpenseService(
+        moco=moco,
+        purchase_client=purchase_client,
+        ocr=ocr,
+        matcher=SmartmeProjectMatcher(projects),
+        subdomain=cfg["MOCO_SUBDOMAIN"],
+        telegram=notifier,
+    )
     service = SupplierInvoiceOcrService(
         moco=moco,
         purchase_client=purchase_client,
-        ocr=AnthropicOcrClient(api_key=cfg["ANTHROPIC_API_KEY"]),
+        ocr=ocr,
         subdomain=cfg["MOCO_SUBDOMAIN"],
         telegram=notifier,
         project_resolver=project_resolver,
         category_resolver=category_resolver,
+        smartme=smartme_service,
     )
 
     try:

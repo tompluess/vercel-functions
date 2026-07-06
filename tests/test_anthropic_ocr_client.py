@@ -519,3 +519,71 @@ def test_constructor_accepts_custom_model_override(calls):
     custom = AnthropicOcrClient(api_key="sk-ant-test", model="claude-opus-4-7")
     custom.extract(PDF_BYTES)
     assert calls["calls"][0]["payload"]["model"] == "claude-opus-4-7"
+
+
+# --- extract_energy_bill (smart-me Energiekostenabrechnung schema) ------------
+
+SAMPLE_ENERGY_OCR = {
+    "objekt": "Gesamtverbrauch (Hauptstrasse 33 Leimbach)",
+    "net_amount": 558.09,
+    "period_from": "2026-01-01",
+    "period_to": "2026-06-30",
+    "invoice_date": "2026-07-05",
+    "invoice_number": "10007",
+    "confidence": 0.95,
+}
+
+
+def test_extract_energy_bill_sends_energy_prompt(client, calls):
+    calls["next_response"] = _anthropic_response(
+        json.dumps(SAMPLE_ENERGY_OCR))
+    client.extract_energy_bill(PDF_BYTES)
+    payload = calls["calls"][0]["payload"]
+    # Own system prompt — the invoice schema must not leak in.
+    assert "Energiekostenabrechnung" in payload["system"]
+    assert "qr_reference" not in payload["system"]
+    # Same document-block transport as extract().
+    doc_block = next(b for b in payload["messages"][0]["content"]
+                     if b["type"] == "document")
+    assert doc_block["source"]["data"] == base64.b64encode(
+        PDF_BYTES).decode("ascii")
+
+
+def test_extract_energy_bill_parses_all_fields(client, calls):
+    calls["next_response"] = _anthropic_response(
+        json.dumps(SAMPLE_ENERGY_OCR))
+    bill = client.extract_energy_bill(PDF_BYTES)
+    assert bill.objekt == "Gesamtverbrauch (Hauptstrasse 33 Leimbach)"
+    assert bill.net_amount == 558.09
+    assert bill.period_from == "2026-01-01"
+    assert bill.period_to == "2026-06-30"
+    assert bill.invoice_date == "2026-07-05"
+    assert bill.invoice_number == "10007"
+    assert bill.confidence == 0.95
+
+
+def test_extract_energy_bill_coerces_numeric_strings(client, calls):
+    payload = {**SAMPLE_ENERGY_OCR, "net_amount": "558.09",
+               "confidence": "0.9"}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    bill = client.extract_energy_bill(PDF_BYTES)
+    assert bill.net_amount == 558.09
+    assert bill.confidence == 0.9
+
+
+def test_extract_energy_bill_missing_fields_default_safely(client, calls):
+    calls["next_response"] = _anthropic_response(json.dumps({}))
+    bill = client.extract_energy_bill(PDF_BYTES)
+    assert bill.objekt is None
+    assert bill.net_amount is None
+    assert bill.period_from is None
+    assert bill.invoice_number is None
+    assert bill.confidence == 0.0
+
+
+def test_extract_energy_bill_tolerates_reasoning_preamble(client, calls):
+    text = ("Let me check the Übersicht table first...\n\n"
+            + json.dumps(SAMPLE_ENERGY_OCR))
+    calls["next_response"] = _anthropic_response(text)
+    bill = client.extract_energy_bill(PDF_BYTES)
+    assert bill.net_amount == 558.09

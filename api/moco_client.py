@@ -103,6 +103,25 @@ class MocoClient:
             page += 1
         return projects[:limit]
 
+    def create_project_expense(self, project_id: int, payload: dict) -> dict:
+        """POST /projects/{id}/expenses — create one additional service.
+
+        Used by the smart-me energy-bill flow to book the Netto-Betrag as
+        a billable expense on the matched project. An attachment rides
+        along JSON-embedded as `file: {filename, base64}` (same convention
+        as POST /purchases — not multipart). Pure transport; the caller
+        builds the payload. 4xx/5xx propagate as HTTPError so the endpoint
+        can map them to the retry semantics.
+        """
+        headers = {**self._auth_headers, "Content-Type": "application/json"}
+        req = urlrequest.Request(
+            f"{self._base_url}/projects/{project_id}/expenses",
+            data=json.dumps(payload).encode(),
+            method="POST", headers=headers)
+        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
+            raw = resp.read()
+        return json.loads(raw) if raw else {}
+
     def post_comment(self, *, commentable_id: int, commentable_type: str,
                      text: str) -> dict:
         headers = {**self._auth_headers, "Content-Type": "application/json"}

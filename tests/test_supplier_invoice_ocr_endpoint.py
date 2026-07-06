@@ -85,6 +85,9 @@ def stub_pipeline(monkeypatch):
             {"id": 18, "credit_account": "4500", "label": "Materialaufwand"},
         ],
         "assigns": [],
+        # POST /projects/{id}/expenses — smart-me energy-expense branch.
+        "expenses": [],
+        "next_expense_id": 5555001,
         "calls": [],
     }
 
@@ -137,6 +140,15 @@ def stub_pipeline(monkeypatch):
                     return FakeUrlopenResponse(
                         json.dumps(state["projects"]).encode())
                 return FakeUrlopenResponse(b"[]")
+            if method == "POST" and url.endswith("/expenses"):
+                # /projects/{id}/expenses — smart-me branch. The PDF must
+                # ride along base64-embedded, like POST /purchases.
+                assert isinstance(payload, dict) and "file" in payload
+                assert payload["file"]["base64"]
+                state["expenses"].append({"url": url, "payload": payload})
+                created = {"id": state["next_expense_id"], **payload}
+                state["next_expense_id"] += 1
+                return FakeUrlopenResponse(json.dumps(created).encode())
             if method == "POST" and "/assign_to_project" in url:
                 # Track the assign so tests can assert against it.
                 state["assigns"].append({"url": url, "payload": payload})
@@ -382,3 +394,97 @@ def test_no_file_url_is_skipped_with_telegram_alert(client, stub_pipeline):
     assert resp.json()["skipped"] == "no_file_url"
     assert any("api.telegram.org" in c[1] for c in stub_pipeline["calls"])
     assert not any("api.anthropic.com" in c[1] for c in stub_pipeline["calls"])
+
+
+# --- smart-me energy-expense branch ------------------------------------------
+
+SAMPLE_ENERGY_OCR = {
+    "objekt": "Gesamtverbrauch (Hauptstrasse 33 Leimbach)",
+    "net_amount": 558.09,
+    "period_from": "2026-01-01",
+    "period_to": "2026-06-30",
+    "invoice_date": "2026-07-05",
+    "invoice_number": "10007",
+    "confidence": 0.95,
+}
+
+SMARTME_WEBHOOK_BODY = {
+    "id": 3070959,
+    "title": "Test: smart-me: Ihre Energiekostenabrechnung",
+    "email_from": "thomas@example.com",
+    "email_body": "Objektname: Gesamtverbrauch\n"
+                  "Abrechnungszeitraum: 01.01.2026 - 30.06.2026",
+    "file_url": "https://data.mocoapp.com/objects/fake.pdf?sig=abc",
+}
+
+ENERGY_PROJECTS = [
+    {"id": 947440794,
+     "name": "Hauptstrasse 33, Leimbach, Solarstrom Eigenverbrauch",
+     "tags": ["Contracting", "Eigenverbrauch", "Stromproduktion"]},
+    {"id": 947749060, "name": "ZEV Strombezug, Blumenrain 1, Oberkirch",
+     "tags": ["ZEV"]},
+]
+
+
+def test_smartme_draft_creates_expense_not_purchase(client, stub_pipeline):
+    stub_pipeline["projects"] = ENERGY_PROJECTS
+    stub_pipeline["ocr_text"] = json.dumps(SAMPLE_ENERGY_OCR)
+    raw = json.dumps(SMARTME_WEBHOOK_BODY).encode()
+    headers = signed_headers(raw, target="Purchase::Draft", event="create")
+    resp = client.post("/api/supplier-invoice-ocr", content=raw,
+                       headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["smartme"] is True
+    assert body["expense_id"] == 5555001
+    assert body["project_id"] == 947440794
+    assert body["expense_title"] == "Solarstrom Eigenverbrauch gemäss Beilage"
+
+    # Expense POSTed to the matched project with the manual conventions.
+    assert len(stub_pipeline["expenses"]) == 1
+    expense = stub_pipeline["expenses"][0]
+    assert expense["url"].endswith("/api/v1/projects/947440794/expenses")
+    payload = expense["payload"]
+    assert payload["unit"] == "Netto"
+    assert payload["unit_price"] == 558.09
+    assert payload["unit_cost"] == 0
+    assert payload["service_period_from"] == "2026-01-01"
+    assert payload["service_period_to"] == "2026-06-30"
+    assert base64.b64decode(payload["file"]["base64"]) == \
+        b"%PDF-1.4 fake-test-pdf"
+
+    # No purchase created; the draft was deleted.
+    assert not any(c[0] == "POST" and c[1].endswith("/api/v1/purchases")
+                   for c in stub_pipeline["calls"])
+    delete_calls = [c for c in stub_pipeline["calls"]
+                    if c[0] == "DELETE"
+                    and c[1].endswith("/api/v1/purchases/drafts/3070959")]
+    assert len(delete_calls) == 1
+
+
+def test_smartme_unmatched_objekt_keeps_draft_with_comment(client,
+                                                           stub_pipeline):
+    stub_pipeline["projects"] = ENERGY_PROJECTS
+    ocr = dict(SAMPLE_ENERGY_OCR, objekt="Solarpark Zermatt")
+    stub_pipeline["ocr_text"] = json.dumps(ocr)
+    raw = json.dumps(SMARTME_WEBHOOK_BODY).encode()
+    headers = signed_headers(raw, target="Purchase::Draft", event="create")
+    resp = client.post("/api/supplier-invoice-ocr", content=raw,
+                       headers=headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["skipped"] == "smartme_project_unmatched"
+
+    # No expense, no purchase, no delete — the draft stays.
+    assert stub_pipeline["expenses"] == []
+    assert not any(c[0] == "DELETE" for c in stub_pipeline["calls"])
+    # A comment landed on the draft (PurchaseDraft polymorphic type).
+    comment_calls = [c for c in stub_pipeline["calls"]
+                     if c[0] == "POST" and c[1].endswith("/comments")]
+    assert len(comment_calls) == 1
+    assert comment_calls[0][2]["commentable_type"] == "PurchaseDraft"
+    assert comment_calls[0][2]["commentable_id"] == 3070959
+    # Telegram alert fired.
+    assert any("api.telegram.org" in c[1] for c in stub_pipeline["calls"])

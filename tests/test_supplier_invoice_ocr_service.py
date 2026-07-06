@@ -1918,3 +1918,83 @@ def test_assign_failure_soft_fails_and_enriches_telegram():
     last = tg.messages[-1]
     assert "Projektzuweisung teilweise fehlgeschlagen" in last
     assert "HTTP 422" in last
+
+
+# --- smart-me dispatch --------------------------------------------------------
+
+class FakeSmartmeService:
+    def __init__(self):
+        self.processed: list[dict] = []
+
+    def process_draft(self, body: dict) -> dict:
+        self.processed.append(body)
+        return {"smartme": True, "draft_id": body.get("id"),
+                "expense_id": 5555001}
+
+
+# 2-of-3 detection: title keyword + body markers (email_from is the
+# forwarder, like the real production sample).
+SMARTME_BODY = {
+    "id": 3070959,
+    "title": "Test: smart-me: Ihre Energiekostenabrechnung",
+    "email_from": "thomas@example.com",
+    "email_body": "Objektname: Gesamtverbrauch\n"
+                  "Abrechnungszeitraum: 01.01.2026 - 30.06.2026",
+    "file_url": "https://data.mocoapp.com/objects/fake.pdf?sig=abc",
+}
+
+
+def test_smartme_draft_is_delegated_not_ocr_purchased():
+    ocr = FakeOcr(result=make_invoice())
+    purchases = FakePurchaseClient()
+    smartme = FakeSmartmeService()
+    s = SupplierInvoiceOcrService(
+        moco=FakeMoco(), purchase_client=purchases, ocr=ocr,
+        subdomain="solar", smartme=smartme)
+    result = s.process("create", SMARTME_BODY)
+    assert result == {"smartme": True, "draft_id": 3070959,
+                      "expense_id": 5555001}
+    assert smartme.processed == [SMARTME_BODY]
+    # The generic OCR→purchase path never ran.
+    assert ocr.calls == []
+    assert purchases.creates == []
+
+
+def test_smartme_draft_without_service_falls_through_to_generic_path():
+    """smartme=None (default) — legacy behavior on the same body."""
+    ocr = FakeOcr(result=make_invoice())
+    purchases = FakePurchaseClient()
+    s = build_service(ocr=ocr, purchases=purchases)
+    result = s.process("create", SMARTME_BODY)
+    assert "smartme" not in result
+    assert len(purchases.creates) == 1
+
+
+def test_attachmentless_smartme_draft_routes_to_smartme_not_notification():
+    """Detection runs before the file_url gate: an attachment-less
+    smart-me draft must reach the smart-me branch (keep + alert), not the
+    notification silent-delete or the generic no-attachment alert."""
+    purchases = FakePurchaseClient()
+    smartme = FakeSmartmeService()
+    s = SupplierInvoiceOcrService(
+        moco=FakeMoco(), purchase_client=purchases,
+        ocr=FakeOcr(result=make_invoice()),
+        subdomain="solar", smartme=smartme)
+    body = {k: v for k, v in SMARTME_BODY.items() if k != "file_url"}
+    s.process("create", body)
+    assert smartme.processed == [body]
+    assert purchases.deleted_drafts == []
+
+
+def test_non_smartme_draft_never_touches_smartme_service():
+    smartme = FakeSmartmeService()
+    purchases = FakePurchaseClient()
+    s = SupplierInvoiceOcrService(
+        moco=FakeMoco(), purchase_client=purchases,
+        ocr=FakeOcr(result=make_invoice()),
+        subdomain="solar", smartme=smartme)
+    s.process("create", {"id": 3001069,
+                         "title": "Rechnung R-2026-042",
+                         "file_url": "https://x/y.pdf"})
+    assert smartme.processed == []
+    assert len(purchases.creates) == 1
