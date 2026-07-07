@@ -54,9 +54,9 @@ class FakeMoco:
         self.pdf_bytes = pdf_bytes
         self.downloads: list[str] = []
         self.download_error: Exception | None = None
-        self.searches: list[str] = []
-        self.search_result: list[dict] = []
-        self.search_error: Exception | None = None
+        self.supplier_list_calls: int = 0
+        self.suppliers: list[dict] = []
+        self.suppliers_error: Exception | None = None
         # get_company is now also exercised — for the VAT-supplier-default
         # fallback path. Default: keyed by id, returns whatever was set.
         self.companies: dict[int, dict] = {}
@@ -68,11 +68,11 @@ class FakeMoco:
             raise self.download_error
         return self.pdf_bytes
 
-    def search_suppliers(self, name: str) -> list[dict]:
-        self.searches.append(name)
-        if self.search_error:
-            raise self.search_error
-        return self.search_result
+    def list_suppliers(self, *, limit: int = 1000) -> list[dict]:
+        self.supplier_list_calls += 1
+        if self.suppliers_error:
+            raise self.suppliers_error
+        return self.suppliers
 
     def get_company(self, company_id: int) -> dict:
         if self.get_company_error:
@@ -347,7 +347,7 @@ def test_process_happy_path_creates_purchase_with_full_payload():
     ocr = FakeOcr(result=make_invoice())
     purchases = FakePurchaseClient()
     purchases.next_create_id = 4001234
-    source.search_result = [{"id": 555, "name": "FLYERALARM"}]
+    source.suppliers = [{"id": 555, "name": "FLYERALARM"}]
     s = build_service(moco=source, purchases=purchases,
                       ocr=ocr, telegram=tg)
 
@@ -356,7 +356,7 @@ def test_process_happy_path_creates_purchase_with_full_payload():
 
     assert source.downloads == ["https://x/y.pdf"]
     assert ocr.calls == [pdf]
-    assert source.searches == ["FLYERALARM"]
+    assert source.supplier_list_calls == 1
     assert len(purchases.creates) == 1
     payload = purchases.creates[0]
 
@@ -820,7 +820,7 @@ def test_no_supplier_match_leaves_company_id_unset():
     """Per "leave empty otherwise" — no match → no company_id field on
     the payload (so Moco doesn't 422 on company_id=null)."""
     source = FakeMoco()
-    source.search_result = []
+    source.suppliers = []
     purchases = FakePurchaseClient()
     s = build_service(moco=source, purchases=purchases)
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
@@ -831,7 +831,7 @@ def test_ambiguous_supplier_match_leaves_company_id_unset():
     """Multiple matches → human review needed; better to leave unset than
     auto-link the wrong company (would silently skew reporting)."""
     source = FakeMoco()
-    source.search_result = [
+    source.suppliers = [
         {"id": 100, "name": "FLYERALARM"},
         {"id": 101, "name": "FLYERALARM"},   # duplicate registration
     ]
@@ -845,7 +845,7 @@ def test_supplier_lookup_failure_does_not_fail_sync():
     """The supplier lookup is best-effort — a flapping /companies endpoint
     shouldn't prevent the purchase from being created. Log + continue."""
     source = FakeMoco()
-    source.search_error = urlerror.HTTPError(
+    source.suppliers_error = urlerror.HTTPError(
         "https://x", 500, "boom", {}, fp=None,
     )
     purchases = FakePurchaseClient()
@@ -863,7 +863,7 @@ def test_no_supplier_name_skips_lookup():
     source = FakeMoco()
     s = build_service(moco=source, ocr=FakeOcr(result=invoice))
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
-    assert source.searches == []
+    assert source.supplier_list_calls == 0
 
 
 # --- vat-code resolution ----------------------------------------------------
@@ -899,7 +899,7 @@ def test_vat_code_falls_back_to_supplier_default_when_rate_missing():
     use its default_vat_code_purchase_id."""
     invoice = make_invoice(vat_rate=None)
     source = FakeMoco()
-    source.search_result = [{"id": 555, "name": "FLYERALARM"}]
+    source.suppliers = [{"id": 555, "name": "FLYERALARM"}]
     source.companies[555] = {
         "id": 555, "name": "FLYERALARM",
         "default_vat_code_purchase_id": 77,
@@ -918,7 +918,7 @@ def test_vat_code_falls_back_to_supplier_vat_tax_via_lookup():
     same way OCR's vat_rate is resolved."""
     invoice = make_invoice(vat_rate=None)
     source = FakeMoco()
-    source.search_result = [{"id": 555, "name": "FLYERALARM"}]
+    source.suppliers = [{"id": 555, "name": "FLYERALARM"}]
     source.companies[555] = {
         "id": 555, "name": "FLYERALARM",
         "supplier_vat": {"tax": 2.6},   # percentage as Moco emits it
@@ -937,7 +937,7 @@ def test_vat_code_supplier_vat_tax_zero_resolves_to_zero_rate_code():
     account default."""
     invoice = make_invoice(vat_rate=None)
     source = FakeMoco()
-    source.search_result = [{"id": 555, "name": "X"}]
+    source.suppliers = [{"id": 555, "name": "FLYERALARM"}]
     source.companies[555] = {"id": 555, "supplier_vat": {"tax": 0.0}}
     purchases = FakePurchaseClient()
     # vat_codes defaults: id=13, tax=0.0.
@@ -953,7 +953,7 @@ def test_vat_code_supplier_vat_tax_with_no_matching_code_falls_through():
     through to the account-wide default rather than getting stuck."""
     invoice = make_invoice(vat_rate=None)
     source = FakeMoco()
-    source.search_result = [{"id": 555, "name": "X"}]
+    source.suppliers = [{"id": 555, "name": "FLYERALARM"}]
     source.companies[555] = {"id": 555, "supplier_vat": {"tax": 19.0}}  # DE
     purchases = FakePurchaseClient()
     purchases.vat_codes = [
@@ -972,7 +972,7 @@ def test_vat_code_supplier_lookup_uses_alternate_field_name():
     `default_vat_code_purchase_id`."""
     invoice = make_invoice(vat_rate=None)
     source = FakeMoco()
-    source.search_result = [{"id": 555, "name": "FLYERALARM"}]
+    source.suppliers = [{"id": 555, "name": "FLYERALARM"}]
     source.companies[555] = {"id": 555, "vat_code_purchase_id": 88}
     purchases = FakePurchaseClient()
     s = build_service(moco=source, purchases=purchases,
@@ -987,7 +987,7 @@ def test_vat_code_falls_back_to_supplier_when_ocr_rate_doesnt_match():
     than giving up immediately."""
     invoice = make_invoice(vat_rate=0.19)   # German 19% — no Moco match
     source = FakeMoco()
-    source.search_result = [{"id": 555, "name": "FLYERALARM"}]
+    source.suppliers = [{"id": 555, "name": "FLYERALARM"}]
     source.companies[555] = {"id": 555, "default_vat_code_purchase_id": 77}
     purchases = FakePurchaseClient()
     purchases.vat_codes = [{"id": 11, "tax": 8.1, "active": True}, {"id": 12, "tax": 2.6, "active": True}]
@@ -1010,7 +1010,7 @@ def test_vat_code_falls_back_to_account_default_when_nothing_else_matches():
     ]
     # No supplier match → no company branch taken.
     source = FakeMoco()
-    source.search_result = []
+    source.suppliers = []
     s = build_service(moco=source, purchases=purchases,
                       ocr=FakeOcr(result=invoice))
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
@@ -1068,7 +1068,7 @@ def test_vat_code_id_omitted_when_no_branch_resolves():
     purchases = FakePurchaseClient()
     purchases.vat_codes = [{"id": 11, "tax": 8.1, "active": True}]  # nothing flagged default
     source = FakeMoco()
-    source.search_result = []  # no supplier match either
+    source.suppliers = []  # no supplier match either
     s = build_service(moco=source, purchases=purchases,
                       ocr=FakeOcr(result=invoice))
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
@@ -1084,7 +1084,7 @@ def test_vat_code_list_failure_still_allows_supplier_default():
         "https://x", 500, "boom", {}, fp=None,
     )
     source = FakeMoco()
-    source.search_result = [{"id": 555, "name": "FLYERALARM"}]
+    source.suppliers = [{"id": 555, "name": "FLYERALARM"}]
     source.companies[555] = {"id": 555, "default_vat_code_purchase_id": 77}
     s = build_service(moco=source, purchases=purchases,
                       ocr=FakeOcr(result=invoice))
@@ -1098,7 +1098,7 @@ def test_vat_code_supplier_get_company_failure_falls_through_to_account_default(
     rather than abandoning the run."""
     invoice = make_invoice(vat_rate=None)
     source = FakeMoco()
-    source.search_result = [{"id": 555, "name": "FLYERALARM"}]
+    source.suppliers = [{"id": 555, "name": "FLYERALARM"}]
     source.get_company_error = urlerror.HTTPError(
         "https://x", 500, "boom", {}, fp=None,
     )
@@ -1655,7 +1655,7 @@ def test_moco_4xx_during_supplier_search_is_silent_skip():
     422 the supplier search. Same silent-skip treatment so the whole
     flow doesn't go down because of one Moco rejection."""
     source = FakeMoco()
-    source.search_error = urlerror.HTTPError(
+    source.suppliers_error = urlerror.HTTPError(
         "https://x", 400, "Bad Request", {}, fp=None,
     )
     tg = FakeTelegram()

@@ -1,11 +1,12 @@
-"""Unit tests for MocoClient.search_suppliers.
+"""Unit tests for MocoClient.list_suppliers.
 
 The rest of MocoClient (get_company / get_project / post_comment /
 download_file) is exercised end-to-end via the Bexio and OCR endpoint tests
 — they stub urlopen so the wrappers are trivially covered by call-site
-assertions. The supplier search has non-trivial client-side logic
-(case-insensitive exact matching, blank guard, 404 fallback) that deserves
-focused unit tests."""
+assertions. The supplier listing has non-trivial client-side logic
+(pagination, defensive shape handling) that deserves focused unit tests.
+The name matching itself lives in MocoSupplierMatcher (own test module).
+"""
 
 import json
 from urllib import error as urlerror
@@ -19,7 +20,7 @@ from tests.conftest import FakeUrlopenResponse
 
 @pytest.fixture
 def calls(monkeypatch):
-    state: dict = {"calls": [], "next_response": b"{}", "next_status": 200}
+    state: dict = {"calls": [], "responses": [], "next_status": 200}
 
     def fake_urlopen(req, timeout=None):
         url = req.full_url
@@ -30,7 +31,12 @@ def calls(monkeypatch):
         })
         if state["next_status"] >= 400:
             raise urlerror.HTTPError(url, state["next_status"], "err", {}, fp=None)
-        return FakeUrlopenResponse(state["next_response"])
+        # Responses are consumed in order; the last one repeats so a
+        # single-page test doesn't have to queue terminators.
+        if len(state["responses"]) > 1:
+            return FakeUrlopenResponse(state["responses"].pop(0))
+        return FakeUrlopenResponse(state["responses"][0]
+                                   if state["responses"] else b"[]")
 
     monkeypatch.setattr(src_mod.urlrequest, "urlopen", fake_urlopen)
     return state
@@ -41,78 +47,65 @@ def client():
     return MocoClient(subdomain="solar", api_key="test_source_key")
 
 
-def test_search_suppliers_uses_type_and_term_query_params(client, calls):
-    """Server-side narrowing via `term=` plus client-side exact
-    case-insensitive filter: Moco's `term=` returns substring/prefix
-    matches, but we only auto-link on a fully-qualified exact name
-    (partial matches are too risky for auto-linking `company_id`)."""
-    calls["next_response"] = json.dumps([
+def test_list_suppliers_uses_type_supplier_and_pagination_params(client, calls):
+    """`type=supplier` narrows server-side (customers must never be
+    linkable as purchase suppliers); per_page/page drive pagination."""
+    calls["responses"] = [json.dumps([
         {"id": 100, "name": "FLYERALARM"},
-        {"id": 101, "name": "Flyeralarm GmbH"},   # substring hit, not exact
-        {"id": 102, "name": "Other AG"},          # ignored entirely
-    ]).encode()
-    result = client.search_suppliers("flyeralarm")
-    assert [c["id"] for c in result] == [100]
+        {"id": 102, "name": "Other AG"},
+    ]).encode()]
+    result = client.list_suppliers()
+    assert [c["id"] for c in result] == [100, 102]
     call = calls["calls"][0]
     assert call["method"] == "GET"
-    # Both `type` and `term` ride along; order is stable from urlencode().
     assert call["url"] == (
         "https://solar.mocoapp.com/api/v1/companies"
-        "?type=supplier&term=flyeralarm"
+        "?type=supplier&per_page=100&page=1"
     )
     headers = {k.lower(): v for k, v in call["headers"].items()}
     assert headers["authorization"] == "Token token=test_source_key"
 
 
-def test_search_suppliers_url_encodes_special_chars_in_term(client, calls):
-    """Real supplier names contain spaces, ampersands, umlauts. The term
-    must be url-encoded so Moco parses the query string correctly."""
-    calls["next_response"] = b"[]"
-    client.search_suppliers("Müller & Co AG")
-    call = calls["calls"][0]
-    assert call["url"] == (
-        "https://solar.mocoapp.com/api/v1/companies"
-        "?type=supplier&term=M%C3%BCller+%26+Co+AG"
-    )
+def test_list_suppliers_stops_after_a_short_page(client, calls):
+    """A page shorter than per_page is the last one — no extra request."""
+    calls["responses"] = [json.dumps([{"id": 1, "name": "A"}]).encode()]
+    client.list_suppliers()
+    assert len(calls["calls"]) == 1
 
 
-def test_search_suppliers_strips_whitespace_before_querying(client, calls):
-    """The OCR'd supplier_name often carries trailing whitespace; the
-    stripped form is sent to Moco AND used for exact match locally."""
-    calls["next_response"] = json.dumps([{"id": 100, "name": "FLYERALARM"}]).encode()
-    result = client.search_suppliers("  FLYERALARM  ")
-    assert result == [{"id": 100, "name": "FLYERALARM"}]
-    call = calls["calls"][0]
-    assert call["url"].endswith("term=FLYERALARM")
+def test_list_suppliers_follows_pagination_until_short_page(client, calls):
+    """A full page (100 entries) means there may be more — fetch page 2."""
+    page1 = [{"id": i, "name": f"S{i}"} for i in range(100)]
+    page2 = [{"id": 100, "name": "S100"}]
+    calls["responses"] = [json.dumps(page1).encode(),
+                          json.dumps(page2).encode()]
+    result = client.list_suppliers()
+    assert len(result) == 101
+    assert [c["url"].endswith(f"page={n}")
+            for c, n in zip(calls["calls"], (1, 2))] == [True, True]
 
 
-def test_search_suppliers_returns_empty_for_blank_input(client, calls):
-    """Blank / None → no Moco call (avoids round-tripping when OCR
-    couldn't extract a supplier name at all)."""
-    assert client.search_suppliers("") == []
-    assert client.search_suppliers("   ") == []
-    assert calls["calls"] == []
+def test_list_suppliers_respects_limit(client, calls):
+    """`limit` caps the result even when Moco would keep paginating."""
+    page = [{"id": i, "name": f"S{i}"} for i in range(100)]
+    calls["responses"] = [json.dumps(page).encode()]
+    result = client.list_suppliers(limit=50)
+    assert len(result) == 50
+    assert len(calls["calls"]) == 1
 
 
-def test_search_suppliers_returns_empty_on_404(client, calls):
-    """A 404 from the list endpoint (account with no suppliers, or env
-    quirk) becomes an empty result rather than an exception."""
-    calls["next_status"] = 404
-    assert client.search_suppliers("anything") == []
-
-
-def test_search_suppliers_propagates_non_404_errors(client, calls):
-    """A 5xx during company lookup must propagate so the handler can map
-    it to 502 — silently treating it as "no match" would link no company
-    on every retry, which is worse than failing loudly."""
+def test_list_suppliers_propagates_http_errors(client, calls):
+    """A 5xx during the company listing must propagate so the handler can
+    map it to 502 — silently treating it as "no suppliers" would link no
+    company on every retry, which is worse than failing loudly."""
     calls["next_status"] = 500
     with pytest.raises(urlerror.HTTPError):
-        client.search_suppliers("anything")
+        client.list_suppliers()
 
 
-def test_search_suppliers_handles_unexpected_response_shape(client, calls):
+def test_list_suppliers_handles_unexpected_response_shape(client, calls):
     """Defensive: if Moco's response shape ever changes (e.g. wraps results
     in a `data` key), don't crash — return empty so the OCR service falls
     back to "no company linked" rather than 500-ing on a schema drift."""
-    calls["next_response"] = json.dumps({"data": []}).encode()
-    assert client.search_suppliers("anything") == []
+    calls["responses"] = [json.dumps({"data": []}).encode()]
+    assert client.list_suppliers() == []
