@@ -356,7 +356,7 @@ def test_process_happy_path_creates_purchase_with_full_payload():
 
     assert source.downloads == ["https://x/y.pdf"]
     assert ocr.calls == [pdf]
-    assert source.searches == ["FLYERALARM"]
+    assert source.supplier_list_calls == 1
     assert len(purchases.creates) == 1
     payload = purchases.creates[0]
 
@@ -820,7 +820,7 @@ def test_no_supplier_match_leaves_company_id_unset():
     """Per "leave empty otherwise" — no match → no company_id field on
     the payload (so Moco doesn't 422 on company_id=null)."""
     source = FakeMoco()
-    source.search_result = []
+    source.suppliers = []
     purchases = FakePurchaseClient()
     s = build_service(moco=source, purchases=purchases)
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
@@ -831,7 +831,7 @@ def test_ambiguous_supplier_match_leaves_company_id_unset():
     """Multiple matches → human review needed; better to leave unset than
     auto-link the wrong company (would silently skew reporting)."""
     source = FakeMoco()
-    source.search_result = [
+    source.suppliers = [
         {"id": 100, "name": "FLYERALARM"},
         {"id": 101, "name": "FLYERALARM"},   # duplicate registration
     ]
@@ -863,7 +863,7 @@ def test_no_supplier_name_skips_lookup():
     source = FakeMoco()
     s = build_service(moco=source, ocr=FakeOcr(result=invoice))
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
-    assert source.searches == []
+    assert source.supplier_list_calls == 0
 
 
 # --- vat-code resolution ----------------------------------------------------
@@ -1010,7 +1010,7 @@ def test_vat_code_falls_back_to_account_default_when_nothing_else_matches():
     ]
     # No supplier match → no company branch taken.
     source = FakeMoco()
-    source.search_result = []
+    source.suppliers = []
     s = build_service(moco=source, purchases=purchases,
                       ocr=FakeOcr(result=invoice))
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
@@ -1068,7 +1068,7 @@ def test_vat_code_id_omitted_when_no_branch_resolves():
     purchases = FakePurchaseClient()
     purchases.vat_codes = [{"id": 11, "tax": 8.1, "active": True}]  # nothing flagged default
     source = FakeMoco()
-    source.search_result = []  # no supplier match either
+    source.suppliers = []  # no supplier match either
     s = build_service(moco=source, purchases=purchases,
                       ocr=FakeOcr(result=invoice))
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
