@@ -296,6 +296,14 @@ def main() -> int:
         _find_vat_code_by_rate,
         _supplier_default_vat_code_id,
     )
+    # Full company record, fetched once — feeds the vat chain (supplier
+    # default vat code) and the category chain (supplier Aufwandkonto).
+    full_company = None
+    if company_id is not None:
+        try:
+            full_company = moco.get_company(company_id)
+        except Exception as e:
+            log.warning("get_company failed: %s", e)
     vat_code_id = None
     if invoice.vat_rate is not None:
         match = _find_vat_code_by_rate(vat_codes, invoice.vat_rate)
@@ -303,14 +311,10 @@ def main() -> int:
             vat_code_id = match.get("id")
             print(f"  → matched OCR vat_rate={invoice.vat_rate} to "
                   f"vat_code_id={vat_code_id}")
-    if vat_code_id is None and company_id is not None:
-        try:
-            full_company = moco.get_company(company_id)
-            vat_code_id = _supplier_default_vat_code_id(full_company, vat_codes)
-            if vat_code_id is not None:
-                print(f"  → using supplier-default vat_code_id={vat_code_id}")
-        except Exception as e:
-            log.warning("get_company failed: %s", e)
+    if vat_code_id is None and full_company:
+        vat_code_id = _supplier_default_vat_code_id(full_company, vat_codes)
+        if vat_code_id is not None:
+            print(f"  → using supplier-default vat_code_id={vat_code_id}")
     if vat_code_id is None:
         account_default = _account_default_vat_code(vat_codes)
         if account_default is not None:
@@ -345,8 +349,8 @@ def main() -> int:
         print(f"  Kommission {invoice.commission!r} → no_match — "
               "purchase will NOT be assigned")
 
-    # 6. resolve category (Buchhaltungs-Konto) from project's Aufwandkonto
-    #    or the hardcoded 4000 fallback
+    # 6. resolve category (Buchhaltungs-Konto) from the project's or
+    #    supplier's Aufwandkonto, or the hardcoded 4000 fallback
     _print_section("Category (Buchhaltungs-Konto) resolution")
     log.info("listing Moco purchase categories")
     try:
@@ -361,7 +365,8 @@ def main() -> int:
                        if kommission_match.status == "matched" else None)
     category_decision = category_resolver.resolve(
         already_paid_by_card=invoice.already_paid_by_card,
-        project=matched_project)
+        project=matched_project,
+        supplier=full_company)
     print(f"  category_id={category_decision.category_id} "
           f"({category_decision.reason})")
 

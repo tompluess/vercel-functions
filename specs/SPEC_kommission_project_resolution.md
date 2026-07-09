@@ -124,29 +124,36 @@ omitted and the operator picks it manually during review.
 
 ### Resolution chain (decided)
 
-1. **Bills already paid via card / POS** (`invoice.already_paid_by_card`):
-   **OMIT** the category entirely. These bills mix personal and project
-   purchases and the operator must decide per receipt. Setting a default
-   would lull the reviewer into approving the wrong account.
-
-2. **Project-specified expense account**: if the resolver matched a Moco
+1. **Project-specified expense account**: if the resolver matched a Moco
    project AND that project carries an `Aufwandkonto` custom-property:
    - look up the category in `GET /purchases/categories` whose
      `credit_account` equals the property value (string equality after
      trim);
    - **on match**: use that category's `id`;
    - **on miss** (project says `"4500"` but no category has it): OMIT
-     the field. We do NOT fall back to the default in this branch —
-     the project explicitly said something other than the default, so
-     silently using `4000` would mis-route the booking. Operator must
-     either fix the project's `Aufwandkonto` or pick a category by hand.
+     the field. We do NOT fall back in this branch — the project
+     explicitly said something other than the default, so silently
+     using `4000` would mis-route the booking. Operator must either
+     fix the project's `Aufwandkonto` or pick a category by hand.
 
-3. **Account-wide fallback**: otherwise (no project resolved, or project
-   has no `Aufwandkonto`), look up the category whose `credit_account`
-   is the hardcoded default `"4000"` (Wareneinkauf — Swiss SKR
-   convention).
+2. **Supplier-specified expense account**: otherwise, if the supplier
+   matcher linked a Moco company AND that company carries an
+   `Aufwandkonto` custom-property (e.g. a telecom supplier whose bills
+   always book to 6510): same lookup, same no-fallthrough-on-miss
+   semantics as the project branch.
 
-4. **Missing-fallback edge case**: if even `"4000"` doesn't match any
+3. **Bills already paid via card / POS** (`invoice.already_paid_by_card`)
+   that reached this point (no explicit override above): **OMIT** the
+   category. These bills mix personal and project purchases and the
+   operator must decide per receipt. Setting a default would lull the
+   reviewer into approving the wrong account. A linked supplier whose
+   `Aufwandkonto` is unset behaves like no supplier here.
+
+4. **Account-wide fallback**: otherwise, look up the category whose
+   `credit_account` is the hardcoded default `"4000"` (Wareneinkauf —
+   Swiss SKR convention).
+
+5. **Missing-fallback edge case**: if even `"4000"` doesn't match any
    category in the catalog, OMIT the field rather than guessing — Moco
    will accept the purchase with its own default and the operator can
    set a category during review.
@@ -163,6 +170,11 @@ Moco's purchase UI).
   `GET /vat_code_purchases` and `GET /projects`.
 - `project.custom_properties["Aufwandkonto"]` carries the per-project
   override. Same shape as `Kommission` — string-valued custom field.
+- `company.custom_properties["Aufwandkonto"]` carries the per-supplier
+  override. The company-list shape behind the supplier matcher doesn't
+  carry `custom_properties`, so the full record comes from
+  `GET /companies/{id}` — fetched once per webhook and shared with the
+  vat-code chain's supplier-default lookup.
 
 ### Out of scope for Stage 3
 
