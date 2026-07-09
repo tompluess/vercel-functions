@@ -109,8 +109,9 @@ class SupplierInvoiceOcrService:
         # care about assignment can omit it without setup churn.
         self._project_resolver = project_resolver
         # Optional — when set, the service picks `category_id` per the
-        # Stage-3 chain (already-paid → omit, project Aufwandkonto →
-        # match, else 4000 fallback). Same optional-collaborator pattern.
+        # Stage-3 chain (project Aufwandkonto → supplier Aufwandkonto →
+        # already-paid omit → 4000 fallback). Same optional-collaborator
+        # pattern.
         self._category_resolver = category_resolver
 
     def process(self, event: str, body: dict) -> dict[str, Any]:
@@ -186,13 +187,20 @@ class SupplierInvoiceOcrService:
             invoice = _prefer_draft_payment_fields(invoice, body)
 
             company_id = self._lookup_supplier_company(invoice.supplier_name)
-            vat_code_id = self._resolve_vat_code_id(invoice, company_id)
+            # Fetch the matched supplier's full record once — the list
+            # shape from `list_suppliers` carries neither the default vat
+            # code nor custom_properties, and both the vat chain and the
+            # category chain (supplier Aufwandkonto) need them.
+            company = self._fetch_company(company_id)
+            vat_code_id = self._resolve_vat_code_id(invoice, company)
             # Resolve the project first so the category lookup can use it
-            # (project's Aufwandkonto custom-property overrides the 4000
-            # default). The same match feeds the post-create
-            # `assign_to_project` loop so we don't resolve twice.
+            # (project's / supplier's Aufwandkonto custom-property
+            # overrides the 4000 default). The same match feeds the
+            # post-create `assign_to_project` loop so we don't resolve
+            # twice.
             project_match = self._resolve_project_match(invoice)
-            category_id = self._resolve_category_id(invoice, project_match)
+            category_id = self._resolve_category_id(invoice, project_match,
+                                                    company)
 
             payload = _build_create_payload(
                 invoice, pdf_bytes,
@@ -267,15 +275,15 @@ class SupplierInvoiceOcrService:
     # --- vat code resolution ------------------------------------------------
 
     def _resolve_vat_code_id(self, invoice: InvoiceData,
-                             supplier_company_id: int | None) -> int | None:
+                             supplier_company: dict | None) -> int | None:
         """Decide which Moco vat_code_id to put on the new purchase's item.
 
         Priority order (per the product spec):
           1. The OCR'd `vat_rate`, matched against the values in
              `GET /vat_code_purchases`.
-          2. The matched supplier's default vat code (requires fetching
-             the full company via `get_company` — the company-list shape
-             from `list_suppliers` doesn't carry the default).
+          2. The matched supplier's default vat code (`supplier_company`
+             is the full record from `get_company` — the company-list
+             shape from `list_suppliers` doesn't carry the default).
           3. The vat_code from `GET /vat_code_purchases` marked as
              `default: true` (most Moco accounts have one designated
              default for purchases).
@@ -283,10 +291,11 @@ class SupplierInvoiceOcrService:
              dispatcher fires a Telegram alert + ACKs 200 ok=false. Rare
              in practice, but better than guessing.
 
-        A failure in any *individual* lookup (vat-codes list, get_company)
-        is logged and treated as "no match in this branch" — we don't
-        want a flapping /vat_code_purchases to nuke an otherwise-good run
-        when the supplier could still supply a fallback.
+        A failure in any *individual* lookup (vat-codes list,
+        `_fetch_company`) is logged and treated as "no match in this
+        branch" — we don't want a flapping /vat_code_purchases to nuke an
+        otherwise-good run when the supplier could still supply a
+        fallback.
         """
         try:
             vat_codes = self._purchases.list_vat_codes()
@@ -307,25 +316,18 @@ class SupplierInvoiceOcrService:
                            [c.get("tax") for c in vat_codes
                             if c.get("active") is not False])
 
-        if supplier_company_id is not None:
-            try:
-                company = self._moco.get_company(supplier_company_id)
-            except Exception:
-                logger.exception("ocr: get_company failed for vat fallback "
-                                 "id=%s", supplier_company_id)
-                company = None
-            if company:
-                supplier_default = _supplier_default_vat_code_id(
-                    company, vat_codes,
-                )
-                if supplier_default is not None:
-                    logger.info("ocr: using supplier default vat_code_id=%s "
-                                "(company_id=%s)",
-                                supplier_default, supplier_company_id)
-                    return supplier_default
-                logger.info("ocr: supplier id=%s has no default vat_code, "
-                            "falling back to account default",
-                            supplier_company_id)
+        if supplier_company:
+            supplier_default = _supplier_default_vat_code_id(
+                supplier_company, vat_codes,
+            )
+            if supplier_default is not None:
+                logger.info("ocr: using supplier default vat_code_id=%s "
+                            "(company_id=%s)",
+                            supplier_default, supplier_company.get("id"))
+                return supplier_default
+            logger.info("ocr: supplier id=%s has no default vat_code, "
+                        "falling back to account default",
+                        supplier_company.get("id"))
 
         account_default = _account_default_vat_code(vat_codes)
         if account_default is not None:
@@ -377,6 +379,23 @@ class SupplierInvoiceOcrService:
                         supplier_name)
         return None
 
+    def _fetch_company(self, company_id: int | None) -> dict | None:
+        """Best-effort `get_company` for the matched supplier.
+
+        Feeds both the vat-code chain (supplier default vat code) and the
+        category chain (supplier Aufwandkonto). A failed fetch degrades
+        those fallbacks but never fails the run — the purchase is still
+        created and the reviewer fills the gaps.
+        """
+        if company_id is None:
+            return None
+        try:
+            return self._moco.get_company(company_id)
+        except Exception:
+            logger.exception("ocr: get_company failed id=%s — supplier "
+                             "vat/category fallbacks degraded", company_id)
+            return None
+
     # --- comment back to Moco -----------------------------------------------
 
     def _post_summary_comments(self, purchase_id: int, invoice: InvoiceData,
@@ -425,14 +444,17 @@ class SupplierInvoiceOcrService:
         return self._project_resolver.resolve(invoice.commission)
 
     def _resolve_category_id(self, invoice: InvoiceData,
-                              project_match: ProjectMatch | None
+                              project_match: ProjectMatch | None,
+                              supplier_company: dict | None
                               ) -> int | None:
         """Decide which `category_id` to set on the purchase's line item.
 
         Returns None whenever the caller should OMIT `category_id` from
-        the payload (already-paid bill, project-override miss, no
-        4000-fallback, or no resolver wired). The category resolver owns
-        the chain; this method just bridges to it.
+        the payload (already-paid bill without an override, override
+        miss, no 4000-fallback, or no resolver wired). The category
+        resolver owns the chain (project Aufwandkonto → supplier
+        Aufwandkonto → already-paid omit → 4000); this method just
+        bridges to it.
         """
         if self._category_resolver is None:
             return None
@@ -441,7 +463,8 @@ class SupplierInvoiceOcrService:
                    else None)
         decision = self._category_resolver.resolve(
             already_paid_by_card=invoice.already_paid_by_card,
-            project=project)
+            project=project,
+            supplier=supplier_company)
         logger.info("ocr: category_id=%s (%s)",
                     decision.category_id, decision.reason)
         return decision.category_id
@@ -768,9 +791,10 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
     if vat_code_id is not None:
         item["vat_code_id"] = vat_code_id
     # `category_id` is the Buchhaltungs-Konto. Omitted when the resolver
-    # couldn't pick one (already-paid card receipt, project Aufwandkonto
-    # miss, missing 4000 fallback) — Moco accepts the purchase with its
-    # own default and the reviewer picks an account during approval.
+    # couldn't pick one (already-paid card receipt without an override,
+    # project/supplier Aufwandkonto miss, missing 4000 fallback) — Moco
+    # accepts the purchase with its own default and the reviewer picks
+    # an account during approval.
     if category_id is not None:
         item["category_id"] = category_id
 

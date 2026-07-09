@@ -43,7 +43,7 @@ from urllib import error as urlerror
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from api.anthropic_ocr_client import AnthropicOcrClient, AnthropicOcrError
-from api.moco_category_resolver import MocoCategoryResolver
+from api.moco_category_resolver import CategoryDecision, MocoCategoryResolver
 from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_client import MocoClient
@@ -100,6 +100,10 @@ class Row:
     Kommission column can render `✗ ambiguous (N)`. `result` is a
     short human-readable summary; we truncate it at print time so the
     table stays readable.
+
+    `category` is the pre-formatted KATEGORIE cell (see
+    `_format_category_cell`); defaults to "-" for the early-skip rows
+    that never reach category resolution.
     """
     draft_id: int
     purchase_id: int | None
@@ -111,6 +115,7 @@ class Row:
     kommission_status: str
     kommission_candidate_count: int
     result: str
+    category: str = "-"
 
 
 def _newest_first(drafts: list[dict]) -> list[dict]:
@@ -139,9 +144,8 @@ def _step(msg: str) -> None:
     print(f"      {msg}", flush=True)
 
 
-def _resolve_vat_code_with_tier(invoice, company_id: int | None,
-                                vat_codes: list[dict],
-                                moco: MocoClient
+def _resolve_vat_code_with_tier(invoice, company: dict | None,
+                                vat_codes: list[dict]
                                 ) -> tuple[int | None, str]:
     """Mirror of `SupplierInvoiceOcrService._resolve_vat_code_id` that
     additionally reports which tier of the 4-step chain won.
@@ -150,24 +154,40 @@ def _resolve_vat_code_with_tier(invoice, company_id: int | None,
     service returns only the id (the tier is purely operator-facing); the
     refactor would touch every call site. Keeping the chain mirrored here
     is ~20 lines and easy to diff against the service when it changes.
+    `company` is the matched supplier's full `get_company` record —
+    fetched once by the caller and shared with the category resolver.
     """
     if invoice.vat_rate is not None:
         match = _find_vat_code_by_rate(vat_codes, invoice.vat_rate)
         if match is not None:
             return match.get("id"), f"matched OCR rate {invoice.vat_rate*100:.1f}%"
-    if company_id is not None:
-        try:
-            company = moco.get_company(company_id)
-        except Exception:
-            company = None
-        if company:
-            sid = _supplier_default_vat_code_id(company, vat_codes)
-            if sid is not None:
-                return sid, "supplier default"
+    if company:
+        sid = _supplier_default_vat_code_id(company, vat_codes)
+        if sid is not None:
+            return sid, "supplier default"
     account_default = _account_default_vat_code(vat_codes)
     if account_default is not None:
         return account_default.get("id"), "account default"
     return None, "unresolved — Moco will 422"
+
+
+def _format_category_cell(decision: CategoryDecision) -> str:
+    """Compact KATEGORIE cell from a CategoryDecision.
+
+    `✓ 4500 (project)` on a hit, `✗ 4999 (project)` when the winning
+    tier named an account that isn't in the catalog (field OMITTED —
+    operator fixes the custom field or picks by hand; also covers the
+    missing-4000 edge as `✗ 4000 (default)`), `- paid` for the
+    no-default card-receipt omit. Mirrors the ✓/✗ marker style of the
+    other columns.
+    """
+    if decision.category_id is not None:
+        return f"✓ {decision.credit_account} ({decision.source})"
+    if decision.source == "already_paid":
+        return "- paid"
+    if decision.credit_account is not None:
+        return f"✗ {decision.credit_account} ({decision.source})"
+    return "-"
 
 
 def _format_kommission_log(raw: str | None, match: ProjectMatch) -> str:
@@ -302,6 +322,16 @@ def _process_draft(draft: dict, *,
     else:
         _step("supplier: OCR returned no supplier_name")
 
+    # Full company record, fetched once — feeds the vat chain (supplier
+    # default vat code) and the category chain (supplier Aufwandkonto).
+    # The list shape behind the matcher carries neither field.
+    full_company: dict | None = None
+    if company_id is not None:
+        try:
+            full_company = moco.get_company(company_id)
+        except Exception as e:
+            log.warning("get_company failed id=%s: %s", company_id, e)
+
     # --- Kommission → Moco project ----------------------------------------
     # Resolver-only (Stage 1): we surface the would-be project but DON'T
     # wire it into the create payload yet. Stage 2 will pass project_id to
@@ -320,7 +350,7 @@ def _process_draft(draft: dict, *,
         vat_codes = []
         log.warning("list_vat_codes failed: %s", e)
     vat_code_id, vat_tier = _resolve_vat_code_with_tier(
-        invoice, company_id, vat_codes, moco)
+        invoice, full_company, vat_codes)
     _step(f"vat_code {vat_code_id if vat_code_id else '?'} ({vat_tier})")
 
     # --- payment method + IBAN tail ---------------------------------------
@@ -336,6 +366,23 @@ def _process_draft(draft: dict, *,
         qr_note = "  (QR-IBAN)" if _is_qr_iban(invoice.iban) else ""
         _step(f"payment: {method}  IBAN …{iban_tail}{qr_note}")
 
+    # --- category resolution ----------------------------------------------
+    # Mirrors the webhook flow: project's Aufwandkonto override first,
+    # then the supplier's, then 4000 fallback — OMIT on any override miss
+    # or on already-paid without an override. Resolved in dry-run too so
+    # the inline log and the KATEGORIE column show what an --apply run
+    # would book.
+    matched_project = (kommission_match.project
+                       if kommission_match.status == "matched"
+                       else None)
+    category_decision = category_resolver.resolve(
+        already_paid_by_card=invoice.already_paid_by_card,
+        project=matched_project,
+        supplier=full_company)
+    _step(f"category_id={category_decision.category_id} "
+          f"({category_decision.reason})")
+    category_cell = _format_category_cell(category_decision)
+
     amount_cell = _format_amount(invoice.currency, invoice.total_amount)
     paid = invoice.already_paid_by_card
 
@@ -343,19 +390,8 @@ def _process_draft(draft: dict, *,
         return Row(draft_id, None, invoice.supplier_name, matched, amount_cell,
                    paid, kommission_raw, kommission_status,
                    kommission_candidate_count,
-                   f"Dry-run OK (would create, confidence={invoice.confidence:.0%})")
-
-    # --- category resolution ----------------------------------------------
-    # Mirrors the webhook flow: project's Aufwandkonto override first,
-    # then 4000 fallback, OMIT on already-paid or any miss.
-    matched_project = (kommission_match.project
-                       if kommission_match.status == "matched"
-                       else None)
-    category_decision = category_resolver.resolve(
-        already_paid_by_card=invoice.already_paid_by_card,
-        project=matched_project)
-    _step(f"category_id={category_decision.category_id} "
-          f"({category_decision.reason})")
+                   f"Dry-run OK (would create, confidence={invoice.confidence:.0%})",
+                   category=category_cell)
 
     # --- apply: create + comments + delete draft --------------------------
     payload = _build_create_payload(
@@ -371,13 +407,14 @@ def _process_draft(draft: dict, *,
             return Row(draft_id, None, invoice.supplier_name, matched,
                        amount_cell, paid, kommission_raw, kommission_status,
                        kommission_candidate_count,
-                       f"HTTP {e.code} {e.reason}")
+                       f"HTTP {e.code} {e.reason}", category=category_cell)
         err_body = e.read().decode("utf-8", errors="replace")[:500]
         err_body = err_body.replace("\n", " ")
         _step(f"Moco rejected: {e.code} {err_body}")
         return Row(draft_id, None, invoice.supplier_name, matched, amount_cell,
                    paid, kommission_raw, kommission_status,
-                   kommission_candidate_count, f"Moco {e.code}: {err_body}")
+                   kommission_candidate_count, f"Moco {e.code}: {err_body}",
+                   category=category_cell)
 
     new_purchase_id = created.get("id")
     if new_purchase_id:
@@ -397,7 +434,8 @@ def _process_draft(draft: dict, *,
     return Row(draft_id, new_purchase_id, invoice.supplier_name, matched,
                amount_cell, paid, kommission_raw, kommission_status,
                kommission_candidate_count,
-               f"Created (confidence={invoice.confidence:.0%})")
+               f"Created (confidence={invoice.confidence:.0%})",
+               category=category_cell)
 
 
 SUPPLIER_MAX_CHARS = 32   # ample for typical Swiss supplier names, fits 80-col
@@ -410,20 +448,22 @@ DRAFT_FETCH_CAP = 100
 
 
 def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
-    """Aligned six-column table on stdout.
+    """Aligned seven-column table on stdout.
 
-    Columns: DRAFT ID | PURCHASE ID | LIEFERANT | BETRAG | KOMMISSION | RESULT.
+    Columns: DRAFT ID | PURCHASE ID | LIEFERANT | BETRAG | KOMMISSION |
+    KATEGORIE | RESULT.
     Lieferant gets a leading ✓ when the supplier was uniquely matched in
     Moco's company list; Betrag gets a leading ✓ on already-paid bills;
     Kommission gets a leading ✓ when the OCR'd value resolved to exactly
     one Moco project, or a trailing `✗ ambiguous (N)` when more than one
-    matched.
+    matched. Kategorie carries the pre-formatted `_format_category_cell`
+    outcome (✓ account (source) / ✗ unmapped account / `- paid`).
 
     Truncates Lieferant / Kommission / Result so long values don't blow
     up the layout. Full text stays in the underlying Row objects.
     """
     headers = ("DRAFT ID", "PURCHASE ID", "LIEFERANT", "BETRAG",
-               "KOMMISSION", "RESULT")
+               "KOMMISSION", "KATEGORIE", "RESULT")
 
     def _supplier_cell(r: Row) -> str:
         if not r.supplier:
@@ -466,6 +506,7 @@ def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
     supplier_cells = [_supplier_cell(r) for r in rows]
     amount_cells = [_amount_cell(r) for r in rows]
     kommission_cells = [_kommission_cell(r) for r in rows]
+    category_cells = [r.category for r in rows]
 
     draft_w = max(len(headers[0]),
                   max((len(str(r.draft_id)) for r in rows), default=0))
@@ -478,6 +519,8 @@ def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
                    max((len(c) for c in amount_cells), default=0))
     kommission_w = max(len(headers[4]),
                        max((len(c) for c in kommission_cells), default=0))
+    category_w = max(len(headers[5]),
+                     max((len(c) for c in category_cells), default=0))
 
     print()
     print(f"{headers[0]:<{draft_w}}  "
@@ -485,19 +528,22 @@ def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
           f"{headers[2]:<{supplier_w}}  "
           f"{headers[3]:<{amount_w}}  "
           f"{headers[4]:<{kommission_w}}  "
-          f"{headers[5]}")
+          f"{headers[5]:<{category_w}}  "
+          f"{headers[6]}")
     print(f"{'-' * draft_w}  {'-' * purchase_w}  "
           f"{'-' * supplier_w}  {'-' * amount_w}  "
-          f"{'-' * kommission_w}  "
-          f"{'-' * len(headers[5])}")
-    for r, supplier, amount, kommission in zip(rows, supplier_cells,
-                                               amount_cells, kommission_cells):
+          f"{'-' * kommission_w}  {'-' * category_w}  "
+          f"{'-' * len(headers[6])}")
+    for r, supplier, amount, kommission, category in zip(
+            rows, supplier_cells, amount_cells, kommission_cells,
+            category_cells):
         purchase = str(r.purchase_id) if r.purchase_id else "-"
         print(f"{r.draft_id:<{draft_w}}  "
               f"{purchase:<{purchase_w}}  "
               f"{supplier:<{supplier_w}}  "
               f"{amount:<{amount_w}}  "
               f"{kommission:<{kommission_w}}  "
+              f"{category:<{category_w}}  "
               f"{_trim(r.result)}")
 
     created = sum(1 for r in rows if r.purchase_id is not None)

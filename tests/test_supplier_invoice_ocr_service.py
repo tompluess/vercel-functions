@@ -1878,8 +1878,58 @@ def test_category_omitted_when_project_aufwand_does_not_match_catalog():
     assert "category_id" not in purchases.creates[0]["items"][0]
 
 
+def test_category_uses_supplier_aufwandkonto_when_no_project():
+    """A matched supplier whose company carries an Aufwandkonto custom
+    field routes the booking there instead of the 4000 default."""
+    source = FakeMoco()
+    source.suppliers = [{"id": 555, "name": "FLYERALARM"}]
+    source.companies[555] = {
+        "id": 555, "custom_properties": {"Aufwandkonto": "4500"},
+    }
+    purchases = FakePurchaseClient()
+    s = build_service(moco=source, purchases=purchases,
+                      ocr=FakeOcr(result=make_invoice()),
+                      category_resolver=_category_resolver())
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["items"][0]["category_id"] == 18
+
+
+def test_category_supplier_aufwandkonto_applies_to_already_paid():
+    """The supplier override beats the already-paid guard — only the
+    4000 default is suppressed for card receipts."""
+    source = FakeMoco()
+    source.suppliers = [{"id": 555, "name": "FLYERALARM"}]
+    source.companies[555] = {
+        "id": 555, "custom_properties": {"Aufwandkonto": "4500"},
+    }
+    purchases = FakePurchaseClient()
+    s = build_service(moco=source, purchases=purchases,
+                      ocr=FakeOcr(result=make_invoice(
+                          already_paid_by_card=True)),
+                      category_resolver=_category_resolver())
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["items"][0]["category_id"] == 18
+
+
+def test_category_falls_back_when_get_company_fails():
+    """A failing get_company degrades the supplier tier (no crash): the
+    chain proceeds to the 4000 default."""
+    source = FakeMoco()
+    source.suppliers = [{"id": 555, "name": "FLYERALARM"}]
+    source.get_company_error = urlerror.HTTPError(
+        "https://x", 500, "boom", {}, fp=None,
+    )
+    purchases = FakePurchaseClient()
+    s = build_service(moco=source, purchases=purchases,
+                      ocr=FakeOcr(result=make_invoice()),
+                      category_resolver=_category_resolver())
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["items"][0]["category_id"] == 17
+
+
 def test_category_omitted_when_already_paid_by_card():
-    """Card receipts must be manually triaged; no default at all."""
+    """Card receipts without an Aufwandkonto override must be manually
+    triaged; no default at all."""
     ocr = FakeOcr(result=make_invoice(already_paid_by_card=True))
     purchases = FakePurchaseClient()
     s = build_service(purchases=purchases, ocr=ocr,
