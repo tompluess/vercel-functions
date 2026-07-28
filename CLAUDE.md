@@ -76,7 +76,8 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 # Deploy preview
 vercel deploy
 
-# Deploy to production (do this for feature branches BEFORE merging to main; see auto-memory)
+# Deploy to production (optional for feature branches — usually verification
+# runs through the scripts/ CLIs instead; see auto-memory)
 vercel --prod
 
 # Tail production logs
