@@ -61,6 +61,10 @@ from api.anthropic_ocr_client import (
     _normalize_iban,
     _normalize_qr_reference,
 )
+from api.energy_credit_note_service import (
+    EnergyCreditNoteService,
+    is_energy_credit_note,
+)
 from api.moco_category_resolver import MocoCategoryResolver
 from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
@@ -92,7 +96,8 @@ class SupplierInvoiceOcrService:
                  telegram: TelegramNotifier | None = None,
                  project_resolver: MocoProjectResolver | None = None,
                  category_resolver: MocoCategoryResolver | None = None,
-                 smartme: SmartmeEnergyExpenseService | None = None):
+                 smartme: SmartmeEnergyExpenseService | None = None,
+                 energy_credit_note: EnergyCreditNoteService | None = None):
         self._moco = moco
         self._purchases = purchase_client
         self._ocr = ocr
@@ -103,6 +108,13 @@ class SupplierInvoiceOcrService:
         # to the energy-expense branch instead of the OCR→purchase path.
         # Optional so existing unit tests can omit it.
         self._smartme = smartme
+        # Optional — when set, drafts detected as EVU production credit
+        # notes (see `is_energy_credit_note`) are delegated to the
+        # expense+invoice branch instead of becoming a purchase. Checked
+        # after the general OCR pass + supplier lookup, since (unlike
+        # smart-me) there's no cheap pre-download signal for this
+        # document class. Optional so existing unit tests can omit it.
+        self._energy_credit_note = energy_credit_note
         # Optional — when set, the service resolves the OCR'd Kommission
         # to a Moco project and assigns each line item to it after the
         # purchase is created. Optional so existing unit tests that don't
@@ -174,6 +186,13 @@ class SupplierInvoiceOcrService:
         # download 403).
         invoice: InvoiceData | None = None
         company_id: int | None = None
+        # Set right before delegating to the energy-credit-note branch so
+        # the except clause below can tell its HTTPErrors apart from a
+        # purchase-creation failure: that branch's errors must propagate
+        # to index.py's standard 4xx/5xx mapping (ok=false app error /
+        # 502 retry), NOT the purchase-specific "silent skip" this
+        # function uses for a routine duplicate-receipt 422.
+        in_energy_credit_note_branch = False
         try:
             pdf_bytes = self._moco.download_file(file_url)
             logger.info("ocr: downloaded PDF draft_id=%s bytes=%d",
@@ -192,6 +211,23 @@ class SupplierInvoiceOcrService:
             # code nor custom_properties, and both the vat chain and the
             # category chain (supplier Aufwandkonto) need them.
             company = self._fetch_company(company_id)
+
+            # EVU production credit notes (see `is_energy_credit_note`)
+            # become a project expense + Moco invoice, never a purchase —
+            # delegate before any purchase-payload work. Detection needs
+            # the OCR result + matched supplier company, so it can only
+            # run here (unlike the smart-me check, which runs before the
+            # PDF is even downloaded).
+            if (self._energy_credit_note is not None
+                    and is_energy_credit_note(invoice, company)):
+                logger.info("ocr: draft %s detected as EVU production "
+                            "credit note — routing to energy-credit-note "
+                            "branch", draft_id)
+                in_energy_credit_note_branch = True
+                return self._energy_credit_note.process(
+                    pdf_bytes=pdf_bytes, invoice=invoice, company=company,
+                    draft_id=draft_id, body=body)
+
             vat_code_id = self._resolve_vat_code_id(invoice, company)
             # Resolve the project first so the category lookup can use it
             # (project's / supplier's Aufwandkonto custom-property
@@ -212,6 +248,11 @@ class SupplierInvoiceOcrService:
             )
             created = self._purchases.create_purchase(payload)
         except urlerror.HTTPError as e:
+            if in_energy_credit_note_branch:
+                # Let index.py's standard mapping handle it (4xx -> app
+                # error/ok=false, 5xx -> 502 retry) instead of this
+                # function's purchase-specific duplicate-receipt swallow.
+                raise
             # 4xx from any Moco call (most commonly POST /purchases 422 for
             # `receipt_identifier: ["ist bereits vergeben"]` on a duplicate)
             # is an unfixable-by-retry condition. Treat as a silent skip:

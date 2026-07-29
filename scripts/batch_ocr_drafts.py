@@ -43,11 +43,17 @@ from urllib import error as urlerror
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from api.anthropic_ocr_client import AnthropicOcrClient, AnthropicOcrError
+from api.energy_credit_note_service import (
+    EnergyCreditNoteService,
+    is_energy_credit_note,
+)
 from api.moco_category_resolver import CategoryDecision, MocoCategoryResolver
+from api.moco_invoice_client import MocoInvoiceClient
 from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_client import MocoClient
 from api.moco_supplier_matcher import MocoSupplierMatcher
+from api.stromproduktion_project_matcher import StromproduktionProjectMatcher
 from api.supplier_invoice_ocr_service import (
     CONFIDENCE_THRESHOLD,
     SupplierInvoiceOcrService,
@@ -210,6 +216,56 @@ def _format_kommission_log(raw: str | None, match: ProjectMatch) -> str:
     return f"{label} → no project match"
 
 
+def _process_energy_credit_note(draft: dict, *, pdf_bytes: bytes, invoice,
+                                company: dict | None,
+                                supplier_matched: bool,
+                                service: EnergyCreditNoteService,
+                                apply: bool) -> Row:
+    """Preview or apply the energy-credit-note branch for one draft.
+
+    Mirrors how the rest of this script reuses `service.process()` / its
+    internals for apply mode (see the docstring on `_process_draft`) —
+    dry-run peeks at the SAME `ocr`/`matcher` objects the production
+    webhook uses (via the service's own collaborators) without writing
+    anything to Moco; apply mode calls `service.process()` directly, the
+    exact call the webhook makes.
+
+    Reuses the `Row.purchase_id` column for the created invoice's id
+    (labeled explicitly in the `result` text) rather than adding a new
+    table column for this one row type.
+    """
+    draft_id = draft.get("id")
+    credit = service._ocr.extract_energy_credit_note(pdf_bytes)
+    amount_cell = _format_amount("CHF", credit.net_amount)
+    _step(f"energy credit note: objekt={credit.objekt!r} "
+          f"net={credit.net_amount} confidence={credit.confidence:.0%}")
+
+    if not apply:
+        match = service._matcher.match(supplier_name=invoice.supplier_name,
+                                       objekt=credit.objekt)
+        if match.status == "matched":
+            result = ("Dry-run OK (energy credit note → project "
+                      f"{match.project.get('name')!r})")
+        else:
+            result = f"Dry-run: energy credit note, project {match.status}"
+        return Row(draft_id, None, invoice.supplier_name, supplier_matched,
+                   amount_cell, False, None, "empty", 0, result)
+
+    outcome = service.process(pdf_bytes=pdf_bytes, invoice=invoice,
+                              company=company, draft_id=draft_id, body=draft)
+    if outcome.get("skipped"):
+        _step(f"energy credit note kept draft: {outcome['skipped']}")
+        return Row(draft_id, None, invoice.supplier_name, supplier_matched,
+                   amount_cell, False, None, "empty", 0,
+                   f"Skipped: {outcome['skipped']}")
+    _step(f"created invoice id={outcome.get('invoice_id')} "
+          f"expense id={outcome.get('expense_id')}")
+    return Row(draft_id, outcome.get("invoice_id"), invoice.supplier_name,
+               supplier_matched, amount_cell, False, None, "empty", 0,
+               "Created energy-credit-note invoice (status=created, "
+               f"expense={outcome.get('expense_id')})")
+
+
 def _process_draft(draft: dict, *,
                    moco: MocoClient,
                    purchases: MocoPurchaseClient,
@@ -218,6 +274,7 @@ def _process_draft(draft: dict, *,
                    resolver: MocoProjectResolver,
                    category_resolver: MocoCategoryResolver,
                    supplier_matcher: MocoSupplierMatcher,
+                   energy_credit_note_service: EnergyCreditNoteService | None,
                    apply: bool,
                    idx: int,
                    total: int) -> Row:
@@ -331,6 +388,19 @@ def _process_draft(draft: dict, *,
             full_company = moco.get_company(company_id)
         except Exception as e:
             log.warning("get_company failed id=%s: %s", company_id, e)
+
+    # --- energy credit note detection --------------------------------------
+    # EVU production credit notes (see energy_credit_note_service.py)
+    # short-circuit to their own expense+invoice flow — mirrors the
+    # production webhook's dispatch point exactly (right after the
+    # supplier company is resolved, before Kommission/VAT/category
+    # resolution for the generic purchase path).
+    if energy_credit_note_service is not None and is_energy_credit_note(
+            invoice, full_company):
+        return _process_energy_credit_note(
+            draft, pdf_bytes=pdf_bytes, invoice=invoice, company=full_company,
+            supplier_matched=matched, service=energy_credit_note_service,
+            apply=apply)
 
     # --- Kommission → Moco project ----------------------------------------
     # Resolver-only (Stage 1): we surface the would-be project but DON'T
@@ -663,11 +733,17 @@ def main() -> int:
     # at a time and would spam the chat with one alert per row; the table is
     # the audit surface here. Production webhook traffic still notifies as
     # usual.
+    moco_invoices = MocoInvoiceClient(subdomain=subdomain, api_key=moco_key)
+    energy_credit_note_service = EnergyCreditNoteService(
+        moco=moco, moco_invoices=moco_invoices, purchase_client=purchases,
+        ocr=ocr, matcher=StromproduktionProjectMatcher(all_projects),
+        subdomain=subdomain, telegram=None)
     service = SupplierInvoiceOcrService(
         moco=moco, purchase_client=purchases, ocr=ocr,
         subdomain=subdomain, telegram=None,
         project_resolver=resolver,
-        category_resolver=category_resolver)
+        category_resolver=category_resolver,
+        energy_credit_note=energy_credit_note_service)
 
     rows: list[Row] = []
     for i, draft in enumerate(drafts, start=1):
@@ -676,6 +752,7 @@ def main() -> int:
             service=service, resolver=resolver,
             category_resolver=category_resolver,
             supplier_matcher=supplier_matcher,
+            energy_credit_note_service=energy_credit_note_service,
             apply=args.apply, idx=i, total=len(drafts)))
 
     _print_table(rows)

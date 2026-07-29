@@ -28,8 +28,10 @@ from api.bexio_token_provider import BexioTokenProvider
 from api.kv_client import KVClient
 from api.brevo_api import BrevoAPI
 from api.brevo_contact_sync_service import BrevoContactSyncService
+from api.energy_credit_note_service import EnergyCreditNoteService
 from api.moco_api import MocoAPI
 from api.moco_category_resolver import MocoCategoryResolver
+from api.moco_invoice_client import MocoInvoiceClient
 from api.moco_project_resolver import MocoProjectResolver
 from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_sync_service import MocoSyncService, TargetNotFoundError
@@ -37,6 +39,7 @@ from api.moco_webhook_validator import MocoWebhookValidator
 from api.moco_client import MocoClient
 from api.smartme_energy_expense_service import SmartmeEnergyExpenseService
 from api.smartme_project_matcher import SmartmeProjectMatcher
+from api.stromproduktion_project_matcher import StromproduktionProjectMatcher
 from api.supplier_invoice_ocr_service import SupplierInvoiceOcrService
 from api.telegram_notifier import TelegramNotifier
 
@@ -309,6 +312,24 @@ async def supplier_invoice_ocr_webhook(request: Request) -> dict[str, Any]:
         subdomain=cfg["MOCO_SUBDOMAIN"],
         telegram=notifier,
     )
+    # EVU production credit notes (see energy_credit_note_service.py)
+    # become a project expense + Moco invoice instead of a purchase. The
+    # matcher indexes the Stromproduktion-tagged subset of the same
+    # per-request `projects` list the Kommission resolver uses — no extra
+    # API call.
+    moco_invoices = MocoInvoiceClient(
+        subdomain=cfg["MOCO_SUBDOMAIN"],
+        api_key=cfg["MOCO_API_KEY"],
+    )
+    energy_credit_note_service = EnergyCreditNoteService(
+        moco=moco,
+        moco_invoices=moco_invoices,
+        purchase_client=purchase_client,
+        ocr=ocr,
+        matcher=StromproduktionProjectMatcher(projects),
+        subdomain=cfg["MOCO_SUBDOMAIN"],
+        telegram=notifier,
+    )
     service = SupplierInvoiceOcrService(
         moco=moco,
         purchase_client=purchase_client,
@@ -318,6 +339,7 @@ async def supplier_invoice_ocr_webhook(request: Request) -> dict[str, Any]:
         project_resolver=project_resolver,
         category_resolver=category_resolver,
         smartme=smartme_service,
+        energy_credit_note=energy_credit_note_service,
     )
 
     try:

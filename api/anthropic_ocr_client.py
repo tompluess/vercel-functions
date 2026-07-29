@@ -114,6 +114,34 @@ class EnergyBillData:
     confidence: float
 
 
+@dataclass
+class EnergyCreditNoteData:
+    """Structured fields from the *production credit* section of an EVU
+    statement (e.g. CKW's quarterly "Ihre Gutschrift" PDF).
+
+    These documents often combine a small consumption invoice
+    ("Energiebezug"/"Rechnung") with a much larger production credit
+    ("Rücklieferung"/"Gutschrift") in the SAME PDF, each with its own
+    Objekt / Nettobetrag / Abrechnungszeitraum. Every field here refers
+    to the credit/production section ONLY — the consumption section is
+    irrelevant to this schema and must not leak into these values. Every
+    field except `confidence` is None when not found.
+    """
+
+    # The Objekt line from the Rücklieferung/Gutschrift section
+    # specifically (e.g. "Produktion PVA HEIV Meierhofweg 10") — NOT the
+    # Objekt of a same-document consumption/Eigenbedarf section, which
+    # can differ within the same PDF.
+    objekt: str | None
+    net_amount: float | None    # Nettobetrag of the credit section only, CHF
+    vat_rate: float | None      # decimal, e.g. 0.081
+    period_from: str | None     # Abrechnungszeitraum start of that section, ISO 8601
+    period_to: str | None       # Abrechnungszeitraum end of that section, ISO 8601
+    invoice_date: str | None    # Rechnungsdatum, ISO 8601
+    invoice_number: str | None  # Rechnungs-Nr
+    confidence: float
+
+
 class AnthropicOcrError(Exception):
     """Raised on any non-2xx from Anthropic or on a malformed model response.
 
@@ -257,6 +285,43 @@ ENERGY_BILL_SYSTEM_PROMPT = (
 )
 
 
+ENERGY_CREDIT_NOTE_SYSTEM_PROMPT = (
+    "You are extracting data from a Swiss local energy supplier's (EVU) "
+    "statement PDF addressed to a solar power producer (PVcontracting AG). "
+    "The document is in German. IMPORTANT: these statements often combine "
+    "TWO sections in the same PDF — a small consumption invoice (labeled "
+    "'Energiebezug' / 'Rechnung' / 'Eigenbedarf') and a separate, usually "
+    "much larger, production credit note (labeled 'Rücklieferung' / "
+    "'Gutschrift' / 'Einspeisung' / 'Produktion'). You must extract data "
+    "from the PRODUCTION CREDIT section ONLY — ignore the consumption "
+    "section's own Objekt, Nettobetrag and Abrechnungszeitraum entirely, "
+    "even if they appear first or in a top-level summary. Do NOT use a "
+    "combined/netted total that mixes both sections. Respond ONLY with a "
+    "JSON object — no preamble, no markdown fences.\n\n"
+    "Required fields (null if not found):\n"
+    "{\n"
+    '  "objekt": "string — the Objekt line VERBATIM from the '
+    'Rücklieferung/Gutschrift/production section specifically (e.g. '
+    '\\"Produktion PVA HEIV Meierhofweg 10\\"). If the document also '
+    'shows a different Objekt for an Eigenbedarf/consumption section, '
+    'do NOT use that one.",\n'
+    '  "net_amount": "number — the Nettobetrag in CHF of the '
+    'Rücklieferung/Gutschrift/production section only (EXCLUDING '
+    'Mehrwertsteuer) — NOT the combined/top-level Gutschriftsbetrag that '
+    'nets the consumption invoice against the production credit",\n'
+    '  "vat_rate": "number — VAT rate of that section as a decimal '
+    '(e.g. 0.081) or null",\n'
+    '  "period_from": "string — Abrechnungszeitraum start of the '
+    'production/credit section, ISO 8601 (YYYY-MM-DD)",\n'
+    '  "period_to": "string — Abrechnungszeitraum end of the '
+    'production/credit section, ISO 8601 (YYYY-MM-DD)",\n'
+    '  "invoice_date": "string — Rechnungsdatum as ISO 8601 (YYYY-MM-DD)",\n'
+    '  "invoice_number": "string — Rechnungs-Nr",\n'
+    '  "confidence": "number — your overall extraction confidence 0.0–1.0"\n'
+    "}"
+)
+
+
 class AnthropicOcrClient:
     HTTP_TIMEOUT_SECONDS = 90  # PDF upload + model inference can dominate
     BASE_URL = "https://api.anthropic.com"
@@ -286,6 +351,16 @@ class AnthropicOcrClient:
         data = self._extract_json(pdf_bytes,
                                   system_prompt=ENERGY_BILL_SYSTEM_PROMPT)
         return _to_energy_bill_data(data)
+
+    def extract_energy_credit_note(self, pdf_bytes: bytes) -> EnergyCreditNoteData:
+        """Run OCR with the EVU production-credit-note schema.
+
+        Same transport + parse pipeline as `extract`, different system
+        prompt and result shape. Error contract is identical.
+        """
+        data = self._extract_json(
+            pdf_bytes, system_prompt=ENERGY_CREDIT_NOTE_SYSTEM_PROMPT)
+        return _to_energy_credit_note_data(data)
 
     def _extract_json(self, pdf_bytes: bytes, *, system_prompt: str) -> dict:
         """Send the PDF + prompt, return the model's parsed JSON object."""
@@ -502,6 +577,23 @@ def _to_energy_bill_data(data: dict) -> EnergyBillData:
     return EnergyBillData(
         objekt=_str_or_none(data.get("objekt")),
         net_amount=_float_or_none(data.get("net_amount")),
+        period_from=_str_or_none(data.get("period_from")),
+        period_to=_str_or_none(data.get("period_to")),
+        invoice_date=_str_or_none(data.get("invoice_date")),
+        invoice_number=_str_or_none(data.get("invoice_number")),
+        confidence=_float_or_none(data.get("confidence")) or 0.0,
+    )
+
+
+def _to_energy_credit_note_data(data: dict) -> EnergyCreditNoteData:
+    """Build an `EnergyCreditNoteData` from the parsed JSON.
+
+    Same coercion posture as `_to_energy_bill_data`.
+    """
+    return EnergyCreditNoteData(
+        objekt=_str_or_none(data.get("objekt")),
+        net_amount=_float_or_none(data.get("net_amount")),
+        vat_rate=_float_or_none(data.get("vat_rate")),
         period_from=_str_or_none(data.get("period_from")),
         period_to=_str_or_none(data.get("period_to")),
         invoice_date=_str_or_none(data.get("invoice_date")),
