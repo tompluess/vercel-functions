@@ -516,9 +516,10 @@ def _unmatched_reason(match: StromproduktionProjectMatch) -> str:
     if match.status == "empty":
         return "OCR fand kein Objekt"
     if match.status == "ambiguous":
+        names = ", ".join(repr(p.get("name")) for p in match.candidates[:4])
         return (f"Objekt passt auf {match.candidate_count} Projekte "
-                "(mehrdeutig — Objekt ins Kommission-Feld des Zielprojekts "
-                "eintragen)")
+                f"({names}) (mehrdeutig — Objekt ins Kommission-Feld des "
+                "Zielprojekts eintragen)")
     return ("kein Stromproduktion-Projekt des Lieferanten passt zum Objekt "
             "(Lieferant/Projekt-Zuordnung prüfen oder Objekt ins "
             "Kommission-Feld eintragen)")

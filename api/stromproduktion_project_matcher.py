@@ -48,7 +48,7 @@ semantics as `SmartmeProjectMatcher`).
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from api.moco_project_resolver import _normalize
 
@@ -146,12 +146,17 @@ class StromproduktionProjectMatch:
 
     `status` is one of `"matched"` / `"ambiguous"` / `"no_match"` /
     `"empty"`. `tier` reports which tier decided (`"kommission"` /
-    `"tokens"`; None for no_match/empty).
+    `"tokens"`; None for no_match/empty). `candidates` carries the tied
+    projects on an `"ambiguous"` outcome (or the single winner on
+    `"matched"`) — same diagnostic purpose as `SupplierMatch.candidates`,
+    so callers (Telegram alerts, the batch script) can show *which*
+    projects tied instead of just a count.
     """
     project: dict | None
     status: str
     candidate_count: int
     tier: str | None = None
+    candidates: list[dict] = field(default_factory=list)
 
 
 class StromproduktionProjectMatcher:
@@ -220,10 +225,11 @@ class StromproduktionProjectMatcher:
             pinned = self._dedupe(self._kommission_index.get(objekt_norm, []))
             if len(pinned) == 1:
                 return StromproduktionProjectMatch(pinned[0], "matched", 1,
-                                                    "kommission")
+                                                    "kommission", pinned)
             if len(pinned) > 1:
                 return StromproduktionProjectMatch(None, "ambiguous",
-                                                    len(pinned), "kommission")
+                                                    len(pinned), "kommission",
+                                                    pinned)
 
         objekt_tokens = _addr_tokens(objekt, min_len=self.MIN_TOKEN_LEN)
         if not objekt_tokens:
@@ -256,9 +262,9 @@ class StromproduktionProjectMatcher:
             return StromproduktionProjectMatch(None, "no_match", 0, None)
         if len(winners) == 1:
             return StromproduktionProjectMatch(winners[0], "matched", 1,
-                                                "tokens")
+                                                "tokens", winners)
         return StromproduktionProjectMatch(None, "ambiguous", len(winners),
-                                            "tokens")
+                                            "tokens", winners)
 
     @staticmethod
     def _dedupe(projects: list[dict]) -> list[dict]:

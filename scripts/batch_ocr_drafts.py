@@ -53,7 +53,10 @@ from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_client import MocoClient
 from api.moco_supplier_matcher import MocoSupplierMatcher
-from api.stromproduktion_project_matcher import StromproduktionProjectMatcher
+from api.stromproduktion_project_matcher import (
+    StromproduktionProjectMatch,
+    StromproduktionProjectMatcher,
+)
 from api.supplier_invoice_ocr_service import (
     CONFIDENCE_THRESHOLD,
     SupplierInvoiceOcrService,
@@ -216,6 +219,32 @@ def _format_kommission_log(raw: str | None, match: ProjectMatch) -> str:
     return f"{label} → no project match"
 
 
+def _format_stromproduktion_match_log(objekt: str | None,
+                                      match: StromproduktionProjectMatch) -> str:
+    """Build the per-draft Stromproduktion project-resolution live-log line.
+
+    Mirrors `_format_kommission_log`'s style, but additionally names the
+    tied candidates on an `ambiguous` outcome (not just a count) — same
+    diagnostic depth as the supplier-lookup log's ambiguous branch, so the
+    operator can see at a glance which projects tied and why (e.g. a
+    generic short token like a bare house number colliding across two
+    unrelated projects).
+    """
+    if match.status == "empty":
+        return "Stromproduktion project: OCR returned no Objekt"
+    label = f"Stromproduktion project for Objekt {objekt!r}"
+    if match.status == "matched":
+        proj = match.project or {}
+        return (f"{label} → project '{proj.get('name')}' "
+                f"(id={proj.get('id')}, {match.tier} tier)")
+    if match.status == "ambiguous":
+        names = ", ".join(repr(p.get("name")) for p in match.candidates[:4])
+        return (f"{label} → ambiguous ({match.candidate_count} candidates "
+                f"at {match.tier} tier: {names} — leaving project empty)")
+    return (f"{label} → no match (no Stromproduktion project of this "
+            "supplier overlaps the Objekt)")
+
+
 def _process_energy_credit_note(draft: dict, *, pdf_bytes: bytes, invoice,
                                 company: dict | None,
                                 supplier_matched: bool,
@@ -240,12 +269,23 @@ def _process_energy_credit_note(draft: dict, *, pdf_bytes: bytes, invoice,
     _step(f"energy credit note: objekt={credit.objekt!r} "
           f"net={credit.net_amount} confidence={credit.confidence:.0%}")
 
+    # Resolved here (not just inside service.process()) so the diagnostic
+    # log line prints in BOTH dry-run and apply mode — pure/cheap
+    # (in-memory only), so recomputing it in apply mode alongside the
+    # service's own internal call is not wasteful.
+    match = service._matcher.match(supplier_name=invoice.supplier_name,
+                                   objekt=credit.objekt)
+    _step(_format_stromproduktion_match_log(credit.objekt, match))
+
     if not apply:
-        match = service._matcher.match(supplier_name=invoice.supplier_name,
-                                       objekt=credit.objekt)
         if match.status == "matched":
             result = ("Dry-run OK (energy credit note → project "
                       f"{match.project.get('name')!r})")
+        elif match.status == "ambiguous":
+            names = ", ".join(repr(p.get("name"))
+                              for p in match.candidates[:4])
+            result = (f"Dry-run: energy credit note, ambiguous "
+                      f"({match.candidate_count}: {names})")
         else:
             result = f"Dry-run: energy credit note, project {match.status}"
         return Row(draft_id, None, invoice.supplier_name, supplier_matched,
