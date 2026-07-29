@@ -186,3 +186,25 @@ def test_has_stromproduktion_tag_case_insensitive():
     assert has_stromproduktion_tag({"tags": ["ZEV"]}) is False
     assert has_stromproduktion_tag({"tags": None}) is False
     assert has_stromproduktion_tag({}) is False
+
+
+# --- has_candidate_for_supplier --------------------------------------------
+# Real-world regression: EGBB's *supplier* company record ("...
+# (Lieferant)", the one MocoSupplierMatcher links) has `tags: []` — only
+# its *customer* record is tagged EVU. Detection can't rely on the
+# supplier's tag alone; this cheap existence check is the fallback signal.
+
+def test_has_candidate_for_supplier_true_on_name_match():
+    m = StromproduktionProjectMatcher(PROJECTS)
+    assert m.has_candidate_for_supplier(CKW_SUPPLIER_NAME) is True
+
+
+def test_has_candidate_for_supplier_false_for_unrelated_supplier():
+    m = StromproduktionProjectMatcher(PROJECTS)
+    assert m.has_candidate_for_supplier("Irgendein Unbekannter EVU AG") is False
+
+
+def test_has_candidate_for_supplier_false_for_blank_name():
+    m = StromproduktionProjectMatcher(PROJECTS)
+    assert m.has_candidate_for_supplier(None) is False
+    assert m.has_candidate_for_supplier("") is False

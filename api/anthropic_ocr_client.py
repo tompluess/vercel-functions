@@ -133,7 +133,14 @@ class EnergyCreditNoteData:
     # Objekt of a same-document consumption/Eigenbedarf section, which
     # can differ within the same PDF.
     objekt: str | None
-    net_amount: float | None    # Nettobetrag of the credit section only, CHF
+    # Nettobetrag of the credit section only, CHF. Always normalized to a
+    # POSITIVE magnitude (the amount owed TO PVcontracting) regardless of
+    # how the source EVU prints the sign — confirmed live that some
+    # suppliers (EGBB) frame their entire statement as a negative
+    # payout/deduction figure (e.g. "Elektrizität Rücklieferung -908.25")
+    # while others (CKW) print it as a plain positive total. See
+    # `_to_energy_credit_note_data`.
+    net_amount: float | None
     vat_rate: float | None      # decimal, e.g. 0.081
     period_from: str | None     # Abrechnungszeitraum start of that section, ISO 8601
     period_to: str | None       # Abrechnungszeitraum end of that section, ISO 8601
@@ -308,7 +315,12 @@ ENERGY_CREDIT_NOTE_SYSTEM_PROMPT = (
     '  "net_amount": "number — the Nettobetrag in CHF of the '
     'Rücklieferung/Gutschrift/production section only (EXCLUDING '
     'Mehrwertsteuer) — NOT the combined/top-level Gutschriftsbetrag that '
-    'nets the consumption invoice against the production credit",\n'
+    'nets the consumption invoice against the production credit. ALWAYS '
+    'return a POSITIVE number (the amount owed TO PVcontracting for the '
+    'production credit), even if the source document prints every figure '
+    'as negative because it frames the whole statement as a payout/refund '
+    '(e.g. \\"Elektrizität Rücklieferung -908.25\\" on an EGBB-style '
+    'statement) — use the absolute value.",\n'
     '  "vat_rate": "number — VAT rate of that section as a decimal '
     '(e.g. 0.081) or null",\n'
     '  "period_from": "string — Abrechnungszeitraum start of the '
@@ -588,11 +600,16 @@ def _to_energy_bill_data(data: dict) -> EnergyBillData:
 def _to_energy_credit_note_data(data: dict) -> EnergyCreditNoteData:
     """Build an `EnergyCreditNoteData` from the parsed JSON.
 
-    Same coercion posture as `_to_energy_bill_data`.
+    Same coercion posture as `_to_energy_bill_data`. `net_amount` is
+    additionally normalized to a positive magnitude in code (not just via
+    prompt wording) — a hard guarantee independent of model compliance,
+    same posture as `_normalize_iban`/`_normalize_qr_reference` enforcing
+    invariants at the parsing boundary rather than trusting the prompt
+    alone.
     """
     return EnergyCreditNoteData(
         objekt=_str_or_none(data.get("objekt")),
-        net_amount=_float_or_none(data.get("net_amount")),
+        net_amount=_abs_or_none(_float_or_none(data.get("net_amount"))),
         vat_rate=_float_or_none(data.get("vat_rate")),
         period_from=_str_or_none(data.get("period_from")),
         period_to=_str_or_none(data.get("period_to")),
@@ -631,6 +648,10 @@ def _float_or_none(value) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _abs_or_none(value: float | None) -> float | None:
+    return None if value is None else abs(value)
 
 
 QR_REFERENCE_LENGTH = 27

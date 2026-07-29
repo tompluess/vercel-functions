@@ -394,9 +394,15 @@ def _process_draft(draft: dict, *,
     # short-circuit to their own expense+invoice flow — mirrors the
     # production webhook's dispatch point exactly (right after the
     # supplier company is resolved, before Kommission/VAT/category
-    # resolution for the generic purchase path).
-    if energy_credit_note_service is not None and is_energy_credit_note(
-            invoice, full_company):
+    # resolution for the generic purchase path). Two independent signals,
+    # either sufficient — see the identical check in
+    # supplier_invoice_ocr_service.py.
+    is_energy_credit = energy_credit_note_service is not None and (
+        is_energy_credit_note(invoice, full_company)
+        or (invoice.is_credit_note
+            and energy_credit_note_service.has_matching_project(
+                invoice.supplier_name)))
+    if is_energy_credit:
         return _process_energy_credit_note(
             draft, pdf_bytes=pdf_bytes, invoice=invoice, company=full_company,
             supplier_matched=matched, service=energy_credit_note_service,

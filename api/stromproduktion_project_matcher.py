@@ -190,6 +190,26 @@ class StromproduktionProjectMatcher:
         """Number of Stromproduktion-tagged projects in the index."""
         return len(self._candidates)
 
+    def has_candidate_for_supplier(self, supplier_name: str | None) -> bool:
+        """Cheap existence check: does ANY `Stromproduktion` project's
+        customer plausibly match `supplier_name`?
+
+        Used as a detection fallback (see `EnergyCreditNoteService.
+        has_matching_project` / `is_energy_credit_note`'s call sites) for
+        when a supplier's Moco company record isn't (yet) tagged
+        `Lokaler Energieversorger (EVU)`. Confirmed live: Moco can hold
+        the EVU tag on one of an entity's two company records but not the
+        other (EGBB's `type: "customer"` record was tagged, its
+        `type: "supplier"` "(Lieferant)" record — the one
+        `MocoSupplierMatcher` actually links — had `tags: []`). Relying on
+        "does a Stromproduktion project actually exist for this supplier"
+        instead of a possibly-incomplete tag is both more robust and
+        operationally exact: it can only be true when there's a real
+        project to route to.
+        """
+        return any(_names_match(supplier_name, customer_name)
+                   for _, customer_name, _ in self._candidates)
+
     def match(self, *, supplier_name: str | None,
              objekt: str | None) -> StromproduktionProjectMatch:
         # Tier 0 — operator-pinned Kommission equality against the full

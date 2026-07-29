@@ -138,6 +138,11 @@ def is_energy_credit_note(invoice: InvoiceData, company: dict | None) -> bool:
     return EVU_TAG.casefold() in tags
 ```
 
+The tag check alone is not sufficient in practice — see **D4** below: a
+second, independent signal (`EnergyCreditNoteService.has_matching_project`)
+is OR'd in at both call sites so a missing/incomplete tag doesn't drop a
+real credit note.
+
 Hooked in right after the existing `company = self._fetch_company(company_id)`
 step, before VAT/category resolution for the normal purchase path.
 
@@ -242,3 +247,29 @@ confidence gate blocks creation), but the Telegram success message uses a
 risk than it would otherwise be specifically because of D2 — nothing is
 sent to the EVU or cascaded to Bexio without a human looking at the created
 invoice first.
+
+**D4 — Detection uses TWO independent signals, not just the EVU tag.**
+Live-tested against 5 real drafts and found a second real EVU (EGBB) whose
+*supplier*-side Moco company record — the one `MocoSupplierMatcher` actually
+links — has `tags: []`, while only its *customer*-side record (a different
+company id, same pattern as CKW) carries `Lokaler Energieversorger (EVU)`.
+Relying on the tag alone silently missed this draft. Fix:
+`StromproduktionProjectMatcher.has_candidate_for_supplier(supplier_name)`
+(a cheap existence check reusing the matcher's own tier-1 customer-name
+filter, exposed via `EnergyCreditNoteService.has_matching_project`) is now
+checked as a second, independent signal — either the EVU tag OR an actual
+matching `Stromproduktion` project is sufficient. This is strictly more
+robust than the tag (it can only be true when there is a real project to
+route to) and doesn't require clean tag data on every supplier record.
+
+**D5 — `EnergyCreditNoteData.net_amount` is always normalized to a
+positive magnitude.** Live-tested and found EGBB's statement format frames
+its *entire* invoice as negative (e.g. `"Elektrizität Rücklieferung
+-908.25"`, net `-840.20`) because the document reads from the payer's
+perspective (`"Der Betrag wird Ihnen ... ausbezahlt"` — a payout), unlike
+CKW's plain-positive convention. `net_amount` always represents the amount
+owed TO PVcontracting, so `_to_energy_credit_note_data` applies `abs()`
+unconditionally — a hard code-level guarantee, not just prompt wording
+(the prompt is also updated to ask for a positive value, belt-and-suspenders,
+same posture as the IBAN/QR-reference normalization in `_normalize_iban`/
+`_normalize_qr_reference`).

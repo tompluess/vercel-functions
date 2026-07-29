@@ -240,6 +240,15 @@ def test_is_energy_credit_note_true_despite_different_company_id_than_project_cu
     assert is_energy_credit_note(make_invoice(is_credit_note=True), COMPANY) is True
 
 
+def test_has_matching_project_delegates_to_matcher():
+    """The fallback detection signal — used when the supplier's own
+    company record isn't tagged EVU (real EGBB regression, see
+    stromproduktion_project_matcher's has_candidate_for_supplier)."""
+    s = build_service()
+    assert s.has_matching_project("CKW AG (Lieferant)") is True
+    assert s.has_matching_project("Irgendein Unbekannter EVU AG") is False
+
+
 # --- happy path ---------------------------------------------------------------
 
 def test_happy_path_creates_expense_and_invoice():
@@ -593,9 +602,16 @@ class DispatchFakeOcr:
 
 
 class FakeEnergyCreditNoteService:
-    def __init__(self, *, http_error: Exception | None = None):
+    def __init__(self, *, http_error: Exception | None = None,
+                 has_matching_project_result: bool = False):
         self.calls: list[dict] = []
         self.http_error = http_error
+        self.has_matching_project_result = has_matching_project_result
+        self.has_matching_project_calls: list[str | None] = []
+
+    def has_matching_project(self, supplier_name: str | None) -> bool:
+        self.has_matching_project_calls.append(supplier_name)
+        return self.has_matching_project_result
 
     def process(self, *, pdf_bytes, invoice, company, draft_id, body) -> dict:
         self.calls.append({"pdf_bytes": pdf_bytes, "invoice": invoice,
@@ -628,6 +644,59 @@ def test_energy_credit_note_draft_is_delegated_not_purchased():
     assert ecn.calls[0]["company"]["id"] == COMPANY["id"]
     # The generic OCR→purchase path never ran.
     assert purchases.creates == []
+
+
+def test_untagged_supplier_still_delegated_via_project_match_fallback():
+    """Real-world regression (draft 3143992, EGBB): the matched *supplier*
+    company record can have `tags: []` (only the *customer* record is
+    tagged EVU). Detection must still succeed via the second signal —
+    an actual Stromproduktion project existing for this supplier."""
+    untagged_company = {"id": 762340520,
+                        "name": "EGBB Elektrizitäts Genossenschaft Boswil "
+                                "Bünzen (Lieferant)", "tags": []}
+    moco = DispatchFakeMoco()
+    moco.suppliers = [untagged_company]
+    moco.companies = {untagged_company["id"]: untagged_company}
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(
+        supplier_name="EGBB Elektrizitäts Genossenschaft Boswil Bünzen "
+                      "(Lieferant)",
+        is_credit_note=True))
+    ecn = FakeEnergyCreditNoteService(has_matching_project_result=True)
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn)
+
+    result = s.process("create", DRAFT_BODY)
+
+    assert result == {"energy_credit_note": True, "draft_id": 3143995,
+                      "invoice_id": 7900001}
+    assert len(ecn.calls) == 1
+    assert purchases.creates == []
+    assert ecn.has_matching_project_calls == [
+        "EGBB Elektrizitäts Genossenschaft Boswil Bünzen (Lieferant)"]
+
+
+def test_untagged_supplier_without_project_match_falls_through_to_purchase():
+    """The fallback signal only fires when a project actually exists —
+    an untagged, unrelated credit-note sender must still fall through to
+    the generic purchase path, not get swept into the energy branch."""
+    untagged_company = {"id": 1, "name": "Irgendein Anderer AG", "tags": []}
+    moco = DispatchFakeMoco()
+    moco.suppliers = [untagged_company]
+    moco.companies = {untagged_company["id"]: untagged_company}
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(supplier_name="Irgendein Anderer AG",
+                                       is_credit_note=True))
+    ecn = FakeEnergyCreditNoteService(has_matching_project_result=False)
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn)
+
+    s.process("create", DRAFT_BODY)
+
+    assert ecn.calls == []
+    assert len(purchases.creates) == 1
 
 
 def test_non_energy_credit_note_falls_through_to_generic_purchase_path():

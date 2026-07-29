@@ -86,6 +86,14 @@ def is_energy_credit_note(invoice: InvoiceData, company: dict | None) -> bool:
     so detection necessarily happens after the general OCR + supplier
     lookup `SupplierInvoiceOcrService.process` already runs for every
     draft.
+
+    This is one of TWO independent detection signals — callers should
+    also check `EnergyCreditNoteService.has_matching_project` and treat
+    either as sufficient. The EVU tag alone is not reliable: confirmed
+    live that Moco can hold the tag on one of an entity's two company
+    records but not the other (see `has_candidate_for_supplier`'s
+    docstring in `stromproduktion_project_matcher.py`), so a real EVU
+    credit note can arrive with `company.tags == []`.
     """
     if not invoice.is_credit_note or company is None:
         return False
@@ -107,6 +115,13 @@ class EnergyCreditNoteService:
         self._matcher = matcher
         self._subdomain = subdomain
         self._telegram = telegram
+
+    def has_matching_project(self, supplier_name: str | None) -> bool:
+        """Second detection signal — see `is_energy_credit_note`'s
+        docstring. True when a `Stromproduktion` project's customer
+        plausibly matches `supplier_name`, regardless of whether the
+        supplier's own Moco company record carries the EVU tag."""
+        return self._matcher.has_candidate_for_supplier(supplier_name)
 
     def process(self, *, pdf_bytes: bytes, invoice: InvoiceData,
                 company: dict, draft_id: int, body: dict) -> dict[str, Any]:
