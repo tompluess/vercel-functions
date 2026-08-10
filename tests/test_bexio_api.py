@@ -45,6 +45,34 @@ def test_authorization_header_is_bearer(bexio_calls):
     assert headers["Accept"] == "application/json"
 
 
+def test_token_provider_resolved_lazily_once(bexio_calls):
+    """With a token_provider, the access token is fetched on the first request
+    and reused (memoized) for subsequent ones — one resolution per instance."""
+    class FakeProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def get_access_token(self):
+            self.calls += 1
+            return "oauth_access_token"
+
+    provider = FakeProvider()
+    api = BexioAPI(token_provider=provider)
+    assert provider.calls == 0  # nothing resolved at construction
+
+    api.search_contact_by_name("Foo")
+    api.create_bill({"title": "X"})
+
+    assert provider.calls == 1  # resolved once, then cached
+    for call in bexio_calls["calls"]:
+        assert call["headers"]["Authorization"] == "Bearer oauth_access_token"
+
+
+def test_requires_a_token_or_provider():
+    with pytest.raises(ValueError):
+        BexioAPI()
+
+
 def test_search_contact_posts_filter_array(bexio_calls):
     BexioAPI(api_token="t").search_contact_by_name("FLYERALARM")
 

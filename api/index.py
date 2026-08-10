@@ -24,6 +24,8 @@ from api.anthropic_ocr_client import AnthropicOcrClient, AnthropicOcrError
 from api.bexio_api import BexioAPI
 from api.bexio_expense_sync_service import BexioExpenseSyncService
 from api.bexio_invoice_sync_service import BexioInvoiceSyncService
+from api.bexio_token_provider import BexioTokenProvider
+from api.kv_client import KVClient
 from api.brevo_api import BrevoAPI
 from api.brevo_contact_sync_service import BrevoContactSyncService
 from api.moco_api import MocoAPI
@@ -54,9 +56,13 @@ REQUIRED_ENV_MOCO_SYNC = [
     *REQUIRED_ENV_TELEGRAM,
 ]
 
+# Bexio auth is OAuth2 (Keycloak). The rotating refresh token can't live in an
+# env var, so we keep the client credentials here and the token state in KV
+# (Upstash). See BexioTokenProvider / scripts/bexio_oauth_bootstrap.py.
 REQUIRED_ENV_BEXIO_SYNC = [
-    "MOCO_WEBHOOK_SECRET", "MOCO_SUBDOMAIN",
-    "MOCO_API_KEY", "BEXIO_API_TOKEN",
+    "MOCO_WEBHOOK_SECRET", "MOCO_SUBDOMAIN", "MOCO_API_KEY",
+    "BEXIO_CLIENT_ID", "BEXIO_CLIENT_SECRET",
+    "KV_REST_API_URL", "KV_REST_API_TOKEN",
     *REQUIRED_ENV_TELEGRAM,
 ]
 
@@ -171,7 +177,7 @@ async def bexio_expense_sync_webhook(request: Request) -> dict[str, Any]:
         expected_target="Purchase",
         upstream_label="bexio",
         build_service=lambda cfg, notifier: BexioExpenseSyncService(
-            bexio=BexioAPI(api_token=cfg["BEXIO_API_TOKEN"]),
+            bexio=_build_bexio_api(cfg),
             moco=MocoClient(
                 subdomain=cfg["MOCO_SUBDOMAIN"],
                 api_key=cfg["MOCO_API_KEY"],
@@ -190,7 +196,7 @@ async def bexio_invoice_sync_webhook(request: Request) -> dict[str, Any]:
         expected_target="Invoice",
         upstream_label="bexio",
         build_service=lambda cfg, notifier: BexioInvoiceSyncService(
-            bexio=BexioAPI(api_token=cfg["BEXIO_API_TOKEN"]),
+            bexio=_build_bexio_api(cfg),
             moco=MocoClient(
                 subdomain=cfg["MOCO_SUBDOMAIN"],
                 api_key=cfg["MOCO_API_KEY"],
@@ -419,6 +425,20 @@ def _build_notifier(cfg: dict[str, str]) -> TelegramNotifier:
         bot_token=cfg["TELEGRAM_BOT_TOKEN"],
         chat_id=cfg["TELEGRAM_CHAT_ID"],
     )
+
+
+def _build_bexio_api(cfg: dict[str, str]) -> BexioAPI:
+    """BexioAPI backed by an OAuth token provider (see BexioTokenProvider).
+
+    The token is resolved lazily on the first Bexio call, so a refresh failure
+    surfaces inside `service.sync()` and rides the endpoint's 2xx/5xx + Telegram
+    error mapping rather than escaping as a bare 500.
+    """
+    return BexioAPI(token_provider=BexioTokenProvider(
+        client_id=cfg["BEXIO_CLIENT_ID"],
+        client_secret=cfg["BEXIO_CLIENT_SECRET"],
+        kv=KVClient(url=cfg["KV_REST_API_URL"], token=cfg["KV_REST_API_TOKEN"]),
+    ))
 
 
 def _app_error(notifier: TelegramNotifier, request: Request, event: str,
