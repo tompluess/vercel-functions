@@ -80,12 +80,14 @@ def test_unmatched_falls_back_to_defaults_end_to_end(client, stub_target_api):
     assert payload["task_id"] == 25339113
 
 
-def test_wrong_user_is_rejected_with_422(client, stub_target_api):
+def test_wrong_user_is_skipped_with_200(client, stub_target_api):
+    # A non-filtered user's activity is a routine skip: ACK 200 so Moco stops
+    # retrying (a 4xx would make it retry), and never touch the target API.
     body = (FIXTURES_DIR / "activity_create_wrong_user.json").read_bytes()
     r = post(client, body, signed_headers(body))
 
-    assert r.status_code == 422
-    assert r.json()["detail"] == "user_filter: 555555555"
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "event": "create", "skipped": "user_filter"}
     assert stub_target_api["calls"] == []  # never reached the target API
 
 

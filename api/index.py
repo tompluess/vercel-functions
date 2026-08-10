@@ -120,9 +120,12 @@ async def moco_sync_webhook(request: Request) -> dict[str, Any]:
     if event != "delete":
         user_id = (body.get("user") or {}).get("id")
         if str(user_id) != cfg["MOCO_USER_ID_FILTER"]:
-            logger.warning("rejecting: user_filter (user_id=%s body_keys=%s)",
-                           user_id, sorted(body.keys()))
-            raise HTTPException(422, f"user_filter: {user_id}")
+            # Routine gate: fires on every activity from a non-filtered user.
+            # A retry can't change the user, so ACK with 200 (a 4xx would make
+            # Moco retry — only 2xx stops it) and skip silently (no Telegram).
+            logger.info("skipping: user_filter (user_id=%s body_keys=%s)",
+                        user_id, sorted(body.keys()))
+            return {"ok": True, "event": event, "skipped": "user_filter"}
 
     api = MocoAPI(
         subdomain=cfg["MOCO_TARGET_SUBDOMAIN"],
