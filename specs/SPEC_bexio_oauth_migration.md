@@ -37,10 +37,15 @@ offline session — so serializing refreshes is a correctness requirement, not a
 nicety.
 
 **Decisions locked:**
-- Storage: **Upstash Redis** (via Vercel Marketplace), talked to over its REST API
-  with `urllib` so we add **no new pip dependency**.
+- Storage: **Redis** (via Vercel Marketplace), so we add **no new pip dependency**.
 - Bootstrap: a one-time **local operator script** runs the Authorization Code Flow
-  and seeds the initial refresh token into Upstash.
+  and seeds the initial refresh token into Redis.
+
+> **Implementation note (updated during build):** the Marketplace Redis integration
+> injects a single native connection string, `REDIS_URL` (`rediss://…`), not an HTTP
+> REST endpoint. So `KVClient` speaks the RESP protocol over a `socket`/`ssl` (stdlib,
+> still no dependency) instead of `urllib`, and the required env var is `REDIS_URL`
+> (not `KV_REST_API_URL` / `KV_REST_API_TOKEN` as written below).
 
 ---
 

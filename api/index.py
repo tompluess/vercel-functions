@@ -57,12 +57,12 @@ REQUIRED_ENV_MOCO_SYNC = [
 ]
 
 # Bexio auth is OAuth2 (Keycloak). The rotating refresh token can't live in an
-# env var, so we keep the client credentials here and the token state in KV
-# (Upstash). See BexioTokenProvider / scripts/bexio_oauth_bootstrap.py.
+# env var, so we keep the client credentials here and the token state in Redis
+# (`REDIS_URL`, the single connection string from the Marketplace integration).
+# See BexioTokenProvider / scripts/bexio_oauth_bootstrap.py.
 REQUIRED_ENV_BEXIO_SYNC = [
     "MOCO_WEBHOOK_SECRET", "MOCO_SUBDOMAIN", "MOCO_API_KEY",
-    "BEXIO_CLIENT_ID", "BEXIO_CLIENT_SECRET",
-    "KV_REST_API_URL", "KV_REST_API_TOKEN",
+    "BEXIO_CLIENT_ID", "BEXIO_CLIENT_SECRET", "REDIS_URL",
     *REQUIRED_ENV_TELEGRAM,
 ]
 
@@ -437,7 +437,7 @@ def _build_bexio_api(cfg: dict[str, str]) -> BexioAPI:
     return BexioAPI(token_provider=BexioTokenProvider(
         client_id=cfg["BEXIO_CLIENT_ID"],
         client_secret=cfg["BEXIO_CLIENT_SECRET"],
-        kv=KVClient(url=cfg["KV_REST_API_URL"], token=cfg["KV_REST_API_TOKEN"]),
+        kv=KVClient(url=cfg["REDIS_URL"]),
     ))
 
 

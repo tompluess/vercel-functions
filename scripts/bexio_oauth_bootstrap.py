@@ -19,7 +19,7 @@ Config is read from the environment (source .env.local first, or export inline):
     set -a; source .env.local; set +a
     python scripts/bexio_oauth_bootstrap.py
 
-Needs: BEXIO_CLIENT_ID, BEXIO_CLIENT_SECRET, KV_REST_API_URL, KV_REST_API_TOKEN.
+Needs: BEXIO_CLIENT_ID, BEXIO_CLIENT_SECRET, REDIS_URL.
 Optional: BEXIO_OAUTH_REDIRECT_URI, BEXIO_OAUTH_SCOPES.
 """
 
@@ -51,14 +51,13 @@ DEFAULT_REDIRECT_URI = "http://localhost:8737/callback"
 def main() -> int:
     client_id = os.environ.get("BEXIO_CLIENT_ID", "")
     client_secret = os.environ.get("BEXIO_CLIENT_SECRET", "")
-    kv_url = os.environ.get("KV_REST_API_URL", "")
-    kv_token = os.environ.get("KV_REST_API_TOKEN", "")
+    redis_url = os.environ.get("REDIS_URL", "")
     redirect_uri = os.environ.get("BEXIO_OAUTH_REDIRECT_URI", DEFAULT_REDIRECT_URI)
     extra_scopes = os.environ.get("BEXIO_OAUTH_SCOPES", "").split()
 
     missing = [name for name, val in [
         ("BEXIO_CLIENT_ID", client_id), ("BEXIO_CLIENT_SECRET", client_secret),
-        ("KV_REST_API_URL", kv_url), ("KV_REST_API_TOKEN", kv_token),
+        ("REDIS_URL", redis_url),
     ] if not val]
     if missing:
         print(f"Missing required env vars: {', '.join(missing)}", file=sys.stderr)
@@ -103,7 +102,7 @@ def main() -> int:
         "refresh_token": refresh_token,
         "expires_at": time.time() + tokens.get("expires_in", 3600),
     }
-    KVClient(url=kv_url, token=kv_token).set(OAUTH_KEY, json.dumps(blob))
+    KVClient(url=redis_url).set(OAUTH_KEY, json.dumps(blob))
 
     print(f"\n✅ Seeded '{OAUTH_KEY}' in KV. The Bexio integration is live.")
     print("Backup — store this refresh token somewhere safe if you like:\n")

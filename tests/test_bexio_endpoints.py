@@ -59,10 +59,6 @@ def stub_pipeline(monkeypatch):
         if "api.telegram.org" in url:
             return _resp({"ok": True, "result": {"message_id": 1}})
 
-        # --- KV (Upstash REST) — BexioTokenProvider token store ---
-        if "upstash.io" in url:
-            return _kv_response(payload, state)
-
         # --- Bexio OAuth IdP (only hit when the cached token is stale) ---
         if "auth.bexio.com" in url:
             return _resp({"access_token": "refreshed_access_token",
@@ -115,23 +111,27 @@ def stub_pipeline(monkeypatch):
     import api.moco_client as src_mod
     monkeypatch.setattr(bexio_mod.urlrequest, "urlopen", fake_urlopen)
     monkeypatch.setattr(src_mod.urlrequest, "urlopen", fake_urlopen)
+
+    # KV speaks native RESP over a socket, not urlopen — fake it at the method
+    # level so BexioTokenProvider gets the seeded (fresh) token without a socket.
+    import api.kv_client as kv_mod
+
+    def fake_kv_get(self, key):
+        if key == "bexio:oauth":
+            return json.dumps(state["kv_oauth"])
+        return None
+
+    monkeypatch.setattr(kv_mod.KVClient, "get", fake_kv_get)
+    monkeypatch.setattr(kv_mod.KVClient, "set",
+                        lambda self, k, v, *, ex=None: None)
+    monkeypatch.setattr(kv_mod.KVClient, "set_nx",
+                        lambda self, k, v, *, ex: True)
+    monkeypatch.setattr(kv_mod.KVClient, "delete", lambda self, k: None)
     return state
 
 
 def _resp(body) -> FakeUrlopenResponse:
     return FakeUrlopenResponse(json.dumps(body).encode())
-
-
-def _kv_response(payload, state) -> FakeUrlopenResponse:
-    """Fake the Upstash REST protocol: a command is a JSON array, the reply is
-    `{"result": <value>}`. GET bexio:oauth returns the seeded token blob (as a
-    JSON string, like Redis stores it); SET/DEL just ack."""
-    cmd = payload[0].upper() if isinstance(payload, list) and payload else ""
-    if cmd == "GET" and len(payload) > 1 and payload[1] == "bexio:oauth":
-        return _resp({"result": json.dumps(state["kv_oauth"])})
-    if cmd == "GET":
-        return _resp({"result": None})
-    return _resp({"result": "OK"})
 
 
 @pytest.fixture
@@ -291,12 +291,8 @@ def test_invoice_bexio_502_surfaces_as_502(bexio_client, monkeypatch):
         url = req.full_url
         if "api.bexio.com" in url:
             raise urlerror.HTTPError(url, 500, "bexio kaboom", {}, fp=None)
-        # KV must serve a fresh cached token so the token provider resolves
-        # before the (failing) Bexio call is reached.
-        if "upstash.io" in url:
-            blob = {"access_token": "t", "refresh_token": "r",
-                    "expires_at": 9_999_999_999}
-            return FakeUrlopenResponse(json.dumps({"result": json.dumps(blob)}).encode())
+        # (KV is faked at the KVClient method level by stub_pipeline, so the
+        # token provider resolves without hitting urlopen.)
         # Source-Moco project fetch happens first; it must succeed so the
         # service reaches the failing Bexio call.
         if "/projects/" in url:
