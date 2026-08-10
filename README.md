@@ -153,7 +153,8 @@ Telegram is intentionally **not** wired into the batch script (one alert per row
 - [`api/moco_webhook_validator.py`](api/moco_webhook_validator.py) — `MocoWebhookValidator`: HMAC-SHA256 signature check, ±300s timestamp window, account allowlist. Pure, no I/O.
 - [`api/moco_api.py`](api/moco_api.py) / [`api/moco_sync_service.py`](api/moco_sync_service.py) — target-Moco transport and the Activity replication logic.
 - [`api/moco_client.py`](api/moco_client.py) — read-only/comment-only client for the attached Moco account (companies, projects, comments, signed file downloads).
-- [`api/bexio_api.py`](api/bexio_api.py) — Bearer-auth Bexio REST wrapper covering contacts, accounts, bills, invoices (incl. state transitions), files (multipart upload), document templates.
+- [`api/bexio_api.py`](api/bexio_api.py) — Bearer-auth Bexio REST wrapper covering contacts, accounts, bills, invoices (incl. state transitions), files (multipart upload), document templates. The bearer token is a short-lived OAuth2 access token from `BexioTokenProvider`, resolved lazily per request.
+- [`api/bexio_token_provider.py`](api/bexio_token_provider.py) / [`api/kv_client.py`](api/kv_client.py) — OAuth2 token management. Bexio rotates the refresh token on every refresh, so the token state lives in a Redis blob (`bexio:oauth`, via the native `REDIS_URL` — `KVClient` speaks RESP over a socket, no `redis-py` dep); the provider caches the access token, refreshes under a KV lock, and persists the rotated refresh token. Seed the initial token once with [`scripts/bexio_oauth_bootstrap.py`](scripts/bexio_oauth_bootstrap.py).
 - [`api/bexio_config.py`](api/bexio_config.py) — non-secret Bexio numeric IDs (user, owner, bank, defaults) and the label → revenue-account mapping. Hardcoded since they change rarely and aren't credentials.
 - [`api/bexio_expense_sync_service.py`](api/bexio_expense_sync_service.py) / [`api/bexio_invoice_sync_service.py`](api/bexio_invoice_sync_service.py) — pure business logic; all HTTP transport delegated to the two collaborators above.
 - [`api/brevo_api.py`](api/brevo_api.py) — `api-key`-auth Brevo (ex-Sendinblue) REST wrapper covering contact lookup/create/update and list-add. Maps 404 from the contact lookup to `None` so the service can branch without exceptions.
@@ -229,7 +230,9 @@ Required environment variables (configure in the Vercel project, then `vercel en
 | Variable | Purpose |
 | --- | --- |
 | `MOCO_API_KEY` | API token for the Moco account (used to fetch companies/projects and post comments back) |
-| `BEXIO_API_TOKEN` | Bexio API v3 token (sent as `Authorization: Bearer …`) |
+| `BEXIO_CLIENT_ID` | Bexio OAuth2 app client id (Authorization Code Flow with `offline_access`). |
+| `BEXIO_CLIENT_SECRET` | Bexio OAuth2 app client secret. |
+| `REDIS_URL` | Native Redis connection string (`rediss://default:<token>@host:6379`) from the Vercel Marketplace Redis integration. Durable store for the rotating Bexio OAuth token (`bexio:oauth`). |
 | `BEXIO_MANUAL_BANK_MAP` | *Optional.* JSON map of Moco user first name → Bexio `bank_account_id` for non-IBAN bills. Example: `{"default": 3, "Alice": 5, "Bob": 4}`. Falls back to `bexio_config.BANK_ACCOUNT_ID` when missing. |
 | `BEXIO_OUTGOING_PAYMENT_SENDER` | JSON object with the own-company sender fields embedded in every Bexio outgoing payment created by the expense flow. Expected keys: `name`, `iban`, `bank_name`, `bc_no`, `street`, `house_no`, `postcode`, `city`, `country_code`, `bank_account_id` (int). IBAN must be contiguous (no spaces). When missing/malformed, the book+pay step is skipped and a Telegram alert fires — the bill itself is still created. Not used by the invoice flow. |
 

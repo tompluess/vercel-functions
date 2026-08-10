@@ -37,6 +37,11 @@ def stub_pipeline(monkeypatch):
         "project": {"customer": {"id": 1, "name": "Muster AG"},
                     "labels": ["Stromproduktion"],
                     "billing_address": "Muster AG\nMusterstrasse 123\n8000 Zürich"},
+        # OAuth token blob served from KV; far-future expiry so BexioTokenProvider
+        # returns the cached access token without hitting the IdP.
+        "kv_oauth": {"access_token": "test_access_token",
+                     "refresh_token": "test_refresh_token",
+                     "expires_at": 9_999_999_999},
         "calls": [],
     }
 
@@ -53,6 +58,12 @@ def stub_pipeline(monkeypatch):
         # --- Telegram (error + skip notifications) ---
         if "api.telegram.org" in url:
             return _resp({"ok": True, "result": {"message_id": 1}})
+
+        # --- Bexio OAuth IdP (only hit when the cached token is stale) ---
+        if "auth.bexio.com" in url:
+            return _resp({"access_token": "refreshed_access_token",
+                          "refresh_token": "rotated_refresh_token",
+                          "expires_in": 3600})
 
         # --- Bexio ---
         if "api.bexio.com" in url:
@@ -100,6 +111,22 @@ def stub_pipeline(monkeypatch):
     import api.moco_client as src_mod
     monkeypatch.setattr(bexio_mod.urlrequest, "urlopen", fake_urlopen)
     monkeypatch.setattr(src_mod.urlrequest, "urlopen", fake_urlopen)
+
+    # KV speaks native RESP over a socket, not urlopen — fake it at the method
+    # level so BexioTokenProvider gets the seeded (fresh) token without a socket.
+    import api.kv_client as kv_mod
+
+    def fake_kv_get(self, key):
+        if key == "bexio:oauth":
+            return json.dumps(state["kv_oauth"])
+        return None
+
+    monkeypatch.setattr(kv_mod.KVClient, "get", fake_kv_get)
+    monkeypatch.setattr(kv_mod.KVClient, "set",
+                        lambda self, k, v, *, ex=None: None)
+    monkeypatch.setattr(kv_mod.KVClient, "set_nx",
+                        lambda self, k, v, *, ex: True)
+    monkeypatch.setattr(kv_mod.KVClient, "delete", lambda self, k: None)
     return state
 
 
@@ -264,6 +291,8 @@ def test_invoice_bexio_502_surfaces_as_502(bexio_client, monkeypatch):
         url = req.full_url
         if "api.bexio.com" in url:
             raise urlerror.HTTPError(url, 500, "bexio kaboom", {}, fp=None)
+        # (KV is faked at the KVClient method level by stub_pipeline, so the
+        # token provider resolves without hitting urlopen.)
         # Source-Moco project fetch happens first; it must succeed so the
         # service reaches the failing Bexio call.
         if "/projects/" in url:
@@ -287,8 +316,8 @@ def test_invoice_bexio_502_surfaces_as_502(bexio_client, monkeypatch):
     assert "bexio_error: 500" in r.json()["detail"]
 
 
-def test_missing_bexio_token_returns_500(bexio_client, monkeypatch):
-    monkeypatch.delenv("BEXIO_API_TOKEN", raising=False)
+def test_missing_bexio_credentials_returns_500(bexio_client, monkeypatch):
+    monkeypatch.delenv("BEXIO_CLIENT_ID", raising=False)
     client, _ = bexio_client
     raw = _moco_envelope(load_fixture("invoice_sent.json"))
     r = client.post(

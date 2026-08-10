@@ -21,11 +21,31 @@ class BexioAPI:
     HTTP_TIMEOUT_SECONDS = 30  # multipart upload of a PDF can take a few seconds
     BASE_URL = "https://api.bexio.com"
 
-    def __init__(self, *, api_token: str):
-        self._auth_headers = {
-            "Authorization": f"Bearer {api_token}",
-            "Accept": "application/json",
-        }
+    def __init__(self, *, api_token: str | None = None, token_provider=None):
+        """Auth is either a static token (`api_token`) or an OAuth token
+        provider (`token_provider`, anything exposing `get_access_token()`).
+
+        With a provider the access token is resolved lazily on the first
+        request and memoized for the instance's life — a fresh BexioAPI is built
+        per webhook, so that's one token resolution per request, and it happens
+        *inside* the service call where the endpoint's error mapping can catch a
+        failed refresh (a static token would leak the error out of that arm).
+        """
+        if api_token is None and token_provider is None:
+            raise ValueError("BexioAPI requires api_token or token_provider")
+        self._static_token = api_token
+        self._token_provider = token_provider
+        self._cached_auth_headers: dict | None = None
+
+    def _auth(self) -> dict:
+        if self._cached_auth_headers is None:
+            token = (self._static_token if self._static_token is not None
+                     else self._token_provider.get_access_token())
+            self._cached_auth_headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            }
+        return self._cached_auth_headers
 
     def search_contact_by_name(self, name: str) -> list[dict]:
         """POST /2.0/contact/search — `like` match on name_1.
@@ -113,7 +133,7 @@ class BexioAPI:
                                file_field="attachment", filename=filename,
                                file_bytes=content, file_mime=mime)
         headers = {
-            **self._auth_headers,
+            **self._auth(),
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Content-Length": str(len(body)),
         }
@@ -125,7 +145,7 @@ class BexioAPI:
     # --- private transport helpers ------------------------------------------------
 
     def _get(self, path: str):
-        req = urlrequest.Request(f"{self.BASE_URL}{path}", headers=self._auth_headers)
+        req = urlrequest.Request(f"{self.BASE_URL}{path}", headers=self._auth())
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
 
@@ -136,7 +156,7 @@ class BexioAPI:
         return self._send_json(path, payload, method="PUT")
 
     def _send_json(self, path: str, payload, *, method: str):
-        headers = {**self._auth_headers, "Content-Type": "application/json"}
+        headers = {**self._auth(), "Content-Type": "application/json"}
         data = json.dumps(payload).encode() if payload is not None else b""
         req = urlrequest.Request(f"{self.BASE_URL}{path}",
                                  data=data, method=method, headers=headers)
