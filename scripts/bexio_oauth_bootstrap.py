@@ -12,8 +12,10 @@ Prerequisites (registered in Bexio's developer portal):
   - an OAuth app → BEXIO_CLIENT_ID / BEXIO_CLIENT_SECRET
   - its redirect URI must equal BEXIO_OAUTH_REDIRECT_URI (default
     http://localhost:8737/callback)
-  - the API scopes the app needs, in BEXIO_OAUTH_SCOPES (openid + offline_access
-    are always added)
+  - the API scopes the app needs must be enabled on the app. This script
+    requests DEFAULT_API_SCOPES (below) unless BEXIO_OAUTH_SCOPES overrides;
+    openid + offline_access are always added. A token minted without any API
+    scope authenticates but 401s ("Invalid token.") on every api.bexio.com call.
 
 Config is read from the environment (source .env.local first, or export inline):
     set -a; source .env.local; set +a
@@ -47,13 +49,31 @@ logger = logging.getLogger("bexio_oauth_bootstrap")
 AUTH_URL = "https://auth.bexio.com/realms/bexio/protocol/openid-connect/auth"
 DEFAULT_REDIRECT_URI = "http://localhost:8737/callback"
 
+# The Bexio API scopes this integration actually needs, one per endpoint area
+# the sync services touch. Write scopes imply read. These must ALSO be enabled
+# on the OAuth app in Bexio's developer portal, or the IdP rejects the request
+# with `invalid_scope`. Override with BEXIO_OAUTH_SCOPES if the app's enabled
+# scopes differ. `openid` + `offline_access` are always added on top.
+#
+# NB: a token minted with only `openid offline_access` authenticates but is
+# authorized for NO API area — every api.bexio.com call then 401s
+# ("Invalid token."). That's the footgun this default guards against.
+DEFAULT_API_SCOPES = [
+    "contact_edit",     # /2.0/contact[/search]
+    "kb_invoice_edit",  # /2.0/kb_invoice (+ /issue, /comment)
+    "kb_bill_edit",     # /4.0/purchase/bills
+    "accounting",       # /2.0/accounts/search, /4.0/payment/outgoing-payments
+    "note_edit",        # comments
+    "file",             # /3.0/files upload
+]
+
 
 def main() -> int:
     client_id = os.environ.get("BEXIO_CLIENT_ID", "")
     client_secret = os.environ.get("BEXIO_CLIENT_SECRET", "")
     redis_url = os.environ.get("REDIS_URL", "")
     redirect_uri = os.environ.get("BEXIO_OAUTH_REDIRECT_URI", DEFAULT_REDIRECT_URI)
-    extra_scopes = os.environ.get("BEXIO_OAUTH_SCOPES", "").split()
+    extra_scopes = os.environ.get("BEXIO_OAUTH_SCOPES", "").split() or DEFAULT_API_SCOPES
 
     missing = [name for name, val in [
         ("BEXIO_CLIENT_ID", client_id), ("BEXIO_CLIENT_SECRET", client_secret),
@@ -64,8 +84,10 @@ def main() -> int:
         return 2
 
     # openid + offline_access are mandatory (offline_access is what mints the
-    # long-lived refresh token); the app's API scopes come from env.
+    # long-lived refresh token); the API scopes authorize actual api.bexio.com
+    # calls.
     scopes = ["openid", "offline_access", *extra_scopes]
+    print(f"Requesting scopes: {' '.join(scopes)}\n")
     state = secrets.token_urlsafe(16)
 
     parsed = urlparse.urlparse(redirect_uri)
