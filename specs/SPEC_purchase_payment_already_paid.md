@@ -89,10 +89,33 @@ hold:
 |---|---|
 | `company_id` is not None | `MocoSupplierMatcher` produced a unique tiered match. Also means Bexio's own `no_company` gate can't fire downstream. |
 | `category_id` is not None | An expense account was determined. See the already-paid rule below. Also means Bexio's `no_account` gate can't fire. |
-| `invoice.confidence >= CONFIDENCE_THRESHOLD` (0.85) | **My addition — see D2.** The only signal that speaks to whether the *amount* and *IBAN* were read correctly. |
+| `invoice.confidence >= AUTO_RELEASE_CONFIDENCE` (0.90) | **My addition — see D2.** The only signal that speaks to whether the *amount* and *IBAN* were read correctly. |
 | `not invoice.is_credit_note` | Credit notes always need a human to check the sign; today's Telegram alert says so unconditionally. |
 
 Anything else keeps `Review pending` and behaves exactly as today.
+
+**Tags.** `OCR_TAGS` is replaced by three constants — `OCR_TAG = "OCR"`,
+`REVIEW_PENDING_TAG = "Review pending"`, `AUTO_TAG = "Auto"` — assembled per
+purchase:
+
+| outcome | tags |
+|---|---|
+| auto-released | `["OCR", "Auto"]` |
+| held for review | `["OCR", "Review pending"]` |
+| credit note (always held) | `["OCR", "Review pending", "Gutschrift"]` |
+
+The `Auto` tag exists so Moco's UI can filter everything that bypassed human
+review — the spot-check list once this is live. Without it, an auto-released
+purchase is indistinguishable from one a human reviewed and cleared (both are
+just `["OCR"]`). Nothing downstream reads it; `BexioExpenseSyncService` looks
+only for `Review pending` (D11).
+
+**Confidence constant.** `AUTO_RELEASE_CONFIDENCE = 0.90` is a *new* constant,
+deliberately separate from the existing `CONFIDENCE_THRESHOLD = 0.85`. The two
+do different jobs — one picks a Telegram emoji, the other can let money move —
+so tuning alert noise must not silently retune the money gate. It starts
+stricter than the alert bar; lower it once the batch preview (§8) shows the
+real distribution (D10).
 
 **The already-paid category rule is unchanged and load-bearing.**
 `MocoCategoryResolver`'s chain is project `Aufwandkonto` → supplier
@@ -110,6 +133,30 @@ auto-releasing; leave it unset and they keep going through review.
 `int | None`; it changes to return the full `CategoryDecision` (which already
 carries `.source` ∈ `project` / `supplier` / `default` / `already_paid`) so
 the tag decision can be logged with its reason.
+
+**The policy itself lives in a new pure collaborator**, `api/purchase_review_gate.py`
+— one class per file, same shape as `MocoCategoryResolver` /
+`MocoSupplierMatcher`: no I/O, fully unit-testable, and reusable by the two
+operator scripts that already hold every input it needs (D9).
+
+```python
+@dataclass(frozen=True)
+class ReviewDecision:
+    review_pending: bool
+    reasons: list[str]   # operator-facing, e.g. ["keine Firma", "Konfidenz 0.72"]
+    tags: list[str]      # the final tag list for the purchase
+
+class PurchaseReviewGate:
+    def __init__(self, *, min_confidence: float = AUTO_RELEASE_CONFIDENCE): ...
+    def evaluate(self, *, invoice: InvoiceData, company_id: int | None,
+                 category: CategoryDecision) -> ReviewDecision: ...
+```
+
+`reasons` is what makes a held purchase self-explanatory in the log, the
+Telegram message, and the batch script's column — the operator sees *which*
+condition held it, not just that it was held. Having the gate own `tags` keeps
+the assembly in one place; `_build_create_payload` takes the finished list
+rather than re-deriving policy.
 
 **Open point for review — D1.** For an already-paid receipt the resolver
 accepts a *project* `Aufwandkonto` as well as a supplier one. Your note said
@@ -197,12 +244,31 @@ credit-note and low-confidence branches are untouched.
 
 ```python
 "review_pending": bool      # was the tag applied
+"review_reasons": list[str] # why it was held (empty when auto-released)
 "payment_registered": bool  # did POST /purchases/payments succeed
 ```
 
-so `scripts/batch_ocr_drafts.py` can show both per draft — useful for
-sanity-checking the auto-release rate against real drafts before this goes
-live.
+### 8. Batch-script preview column (same PR)
+
+`scripts/batch_ocr_drafts.py` gains a `REVIEW` column showing what the gate
+*would* decide for each historical draft, plus the reasons when held. The
+script already resolves the supplier match and calls
+`category_resolver.resolve()` itself (line ~512), so this is one
+`PurchaseReviewGate.evaluate()` call on data it already has — and because it
+calls the same collaborator the service does, the preview cannot drift from
+the real rule (D12).
+
+```
+DRAFT   SUPPLIER      KATEGORIE   KONF   REVIEW
+3143995 CKW AG        6500(supp)  0.94   AUTO
+3143993 Digitec       4000(dflt)  0.91   AUTO
+3144001 Brack.ch      -           0.88   HOLD (kein Konto, Konfidenz)
+3144007 Unknown GmbH  4000(dflt)  0.72   HOLD (keine Firma, Konfidenz)
+```
+
+This is the rollout gate: run it over recent drafts and read the column
+**before** enabling auto-release in production, so the historical hit rate is
+known rather than discovered.
 
 ### 7. Idempotency
 
@@ -235,9 +301,9 @@ Already-paid card receipts carry none of this risk: the money is already
 gone, and with no IBAN their Bexio bill takes the **MANUAL** branch, which
 skips book + outgoing-payment silently.
 
-Suggested rollout: run `scripts/batch_ocr_drafts.py` over recent drafts first
-and read the new `review_pending` column — it shows exactly which historical
-invoices *would* have auto-released, before any of them can.
+Rollout: run `scripts/batch_ocr_drafts.py` over recent drafts first and read
+the new `REVIEW` column (§8) — it shows exactly which historical invoices
+*would* have auto-released, before any of them can.
 
 ---
 
@@ -271,21 +337,33 @@ Service-level, existing in-memory fakes in
 5. `create_payment` raises `HTTPError(422)` → sync still ok,
    `payment_registered` False, Telegram contains "Zahlung nicht registriert".
 
-*Review tag*
-6. company + category + confidence 0.95 → tags are `["OCR"]`,
+*Review tag (service level — the wiring)*
+6. company + category + confidence 0.95 → tags are `["OCR", "Auto"]`,
    `review_pending` False, Telegram says "Automatisch freigegeben".
-7. company resolved, `category_id` None → `Review pending` applied.
-8. category resolved, `company_id` None → `Review pending` applied.
-9. confidence 0.60 with both resolved → `Review pending` applied.
-10. `is_credit_note=True` with everything resolved → `Review pending`
-    applied, Gutschrift alert unchanged.
-11. already-paid receipt whose supplier has no `Aufwandkonto` → category
-    None → `Review pending` applied (guards the 4000-default rule).
-12. already-paid receipt whose supplier *has* an `Aufwandkonto` → category
-    resolved → auto-released **and** payment registered.
+7. confidence 0.88 with both resolved → `Review pending` applied — the
+   regression test for `AUTO_RELEASE_CONFIDENCE` being 0.90, *not* the 0.85
+   alert threshold (D10).
+8. already-paid receipt whose supplier has no `Aufwandkonto` → category
+   None → `Review pending` applied (guards the 4000-default rule, D1).
+9. already-paid receipt whose supplier *has* an `Aufwandkonto` → category
+   resolved → auto-released **and** payment registered.
+
+*Gate (unit level — the policy), `tests/test_purchase_review_gate.py`*
+10. all four conditions met → `review_pending` False, `tags == ["OCR", "Auto"]`,
+    `reasons` empty.
+11. each condition failing on its own → held, with that condition named in
+    `reasons` (four cases: no company, no category, low confidence, credit
+    note).
+12. multiple failures → all named in `reasons`.
+13. credit note with everything else resolved → held, `Gutschrift` tag still
+    appended.
 
 Wrapper-level (`tests/test_moco_purchase_client.py`): `create_payment` POSTs
 to `/api/v1/purchases/payments` with the three-field JSON body.
+
+Script-level: `scripts/batch_ocr_drafts.py` is exercised by hand over real
+drafts as the rollout gate (§8), not unit-tested — consistent with the other
+operator scripts.
 
 ---
 
@@ -300,6 +378,19 @@ to `/api/v1/purchases/payments` with the three-field JSON body.
   the amount was read correctly; confidence is the only signal that covers
   it, and auto-release for transfer bills can move money. **Strike this and
   the gate is exactly your original rule.**
+- **D9 — the gate is a pure collaborator, not a private method.** Both
+  operator scripts need the same policy to preview it, and a duplicated copy
+  in the batch script would drift from the real rule — defeating the point of
+  the preview. Also keeps the 1457-line service from taking a fourth job.
+- **D10 — `AUTO_RELEASE_CONFIDENCE` is separate from `CONFIDENCE_THRESHOLD`.**
+  Different jobs (emoji vs. money), so they must be tunable independently.
+  Starts at 0.90, stricter than the 0.85 alert bar, pending the batch preview.
+- **D11 — auto-released purchases carry an `Auto` tag.** Otherwise they're
+  indistinguishable in Moco's UI from purchases a human reviewed and cleared,
+  and there'd be no way to audit what bypassed review.
+- **D12 — the batch preview column ships in the same PR.** It's the rollout
+  gate; shipping auto-release without it means enabling the behaviour before
+  its historical hit rate is known.
 - **D3 — payment registered at creation, in the OCR service.** No new
   endpoint, no new Moco webhook, no new env vars.
 - **D4 — `payment_method == "credit_card"` (via `already_paid_by_card`) is
