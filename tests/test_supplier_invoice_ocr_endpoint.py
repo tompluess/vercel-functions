@@ -223,7 +223,14 @@ def test_happy_path_creates_real_purchase_with_attachment(client, stub_pipeline)
     payload = post_calls[0][2]
     assert payload["currency"] == "CHF"
     assert payload["payment_method"] == "bank_transfer_swiss_qr_esr"
-    assert payload["tags"] == ["OCR", "Review pending"]
+    # Auto-released: company matched (555), confidence 0.92 >= 0.90, not a
+    # credit note, and the category resolved via the trusted 4000 default.
+    # This is the bank-transfer case where the category condition doesn't
+    # bite — the fallback nearly always resolves, so the effective gate is
+    # company + confidence (SPEC_purchase_payment_already_paid.md, D1).
+    assert payload["tags"] == ["OCR", "Auto"]
+    assert body["review_pending"] is False
+    assert body["review_reasons"] == []
     assert payload["company_id"] == 555
     # SAMPLE_OCR carries vat_rate=0.081 → matched to vat_codes[id=11, value=8.1].
     assert payload["items"][0]["vat_code_id"] == 11

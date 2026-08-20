@@ -14,6 +14,8 @@ Endpoints used:
                                               OCR service to map `vat_rate`
                                               to `vat_code_id`)
   - POST  /api/v1/purchases                 — create the real purchase
+  - POST  /api/v1/purchases/payments        — settle an already-paid
+                                              purchase (card / TWINT / POS)
   - POST  /api/v1/comments                  — comment with the OCR summary
 
 Auth: `Authorization: Token token={MOCO_API_KEY}`.
@@ -183,6 +185,40 @@ class MocoPurchaseClient:
         }
         if expense_id is not None:
             payload["expense_id"] = expense_id
+        data = json.dumps(payload).encode()
+        req = urlrequest.Request(url, data=data, method="POST", headers=headers)
+        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
+            raw = resp.read()
+        return json.loads(raw) if raw else {}
+
+    def create_payment(self, *, purchase_id: int, date: str,
+                       total: float) -> dict:
+        """POST /purchases/payments — register a payment against a purchase.
+
+        Note the URL space: purchase payments are a **top-level** collection
+        (`/purchases/payments`), not a sub-resource of one purchase — the
+        purchase is named by the `purchase_id` field in the body instead.
+
+        Used by the OCR flow for receipts the document says were already
+        settled at the point of sale (card / TWINT / POS terminal), so the
+        purchase doesn't sit in Moco showing an open balance on money that
+        already left the account.
+
+        Mandatory fields per the docs are `date` and `total`; `purchase_id`
+        is optional only in the sense that a payment may instead carry a
+        free-text `description` (a use we have no need for).
+
+        Two consequences worth knowing at the call site: the endpoint has no
+        idempotency key, so a duplicate POST over-settles the purchase; and
+        once any payment exists, `DELETE /purchases/{id}` is refused.
+        """
+        url = f"{self._base_url}/purchases/payments"
+        headers = {**self._auth_headers, "Content-Type": "application/json"}
+        payload = {
+            "purchase_id": purchase_id,
+            "date": date,
+            "total": total,
+        }
         data = json.dumps(payload).encode()
         req = urlrequest.Request(url, data=data, method="POST", headers=headers)
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:

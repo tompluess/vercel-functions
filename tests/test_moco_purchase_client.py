@@ -270,3 +270,40 @@ def test_post_comment_propagates_http_errors(client, calls):
 def test_subdomain_is_used_in_base_url():
     c = MocoPurchaseClient(subdomain="staging-acct", api_key="k")
     assert "https://staging-acct.mocoapp.com/api/v1" in c._base_url
+
+
+# --- purchase payments ------------------------------------------------------
+
+
+def test_create_payment_posts_to_top_level_payments_collection(client, calls):
+    """Purchase payments live at /purchases/payments, NOT under a single
+    purchase — the purchase is named by the `purchase_id` body field."""
+    calls["next_response"] = json.dumps(
+        {"id": 90001, "date": "2026-08-01", "total": "249.05"}).encode()
+
+    result = client.create_payment(purchase_id=4001234, date="2026-08-01",
+                                   total=249.05)
+
+    assert result == {"id": 90001, "date": "2026-08-01", "total": "249.05"}
+    call = calls["calls"][0]
+    assert call["url"] == "https://solar.mocoapp.com/api/v1/purchases/payments"
+    assert call["method"] == "POST"
+    assert call["payload"] == {"purchase_id": 4001234, "date": "2026-08-01",
+                               "total": 249.05}
+    headers = {k.lower(): v for k, v in call["headers"].items()}
+    assert headers["content-type"] == "application/json"
+    assert headers["authorization"] == "Token token=test_source_key"
+
+
+def test_create_payment_returns_empty_dict_on_empty_response(client, calls):
+    calls["next_response"] = b""
+    assert client.create_payment(purchase_id=1, date="2026-01-01",
+                                 total=1.0) == {}
+
+
+def test_create_payment_propagates_http_errors(client, calls):
+    """A 422 must surface so the service can soft-fail it with a warning
+    rather than silently believing the purchase was settled."""
+    calls["next_status"] = 422
+    with pytest.raises(urlerror.HTTPError):
+        client.create_payment(purchase_id=1, date="2026-01-01", total=1.0)
