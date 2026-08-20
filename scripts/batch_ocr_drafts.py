@@ -19,8 +19,9 @@ dry-run the row only reports that the draft would be deleted.
 
 Usage (from the repo root):
     vercel env pull .env.local
-    .venv/bin/python scripts/batch_ocr_drafts.py --max 5          # dry-run
-    .venv/bin/python scripts/batch_ocr_drafts.py --max 5 --apply  # real writes
+    .venv/bin/python scripts/batch_ocr_drafts.py --max 5              # dry-run
+    .venv/bin/python scripts/batch_ocr_drafts.py --max 5 --apply      # real writes
+    .venv/bin/python scripts/batch_ocr_drafts.py --draft-id 3143995   # one draft, dry-run
 
 Required env (same as test_ocr_create_purchase.py):
     MOCO_SUBDOMAIN    source subdomain (e.g. "solar")
@@ -683,6 +684,12 @@ def main() -> int:
     parser.add_argument("--max", dest="max_drafts", type=int, default=10,
                         help="Maximum number of drafts to process "
                              "(newest first). Default: 10.")
+    parser.add_argument("--draft-id", type=int, default=None,
+                        help="Process exactly this draft (bypasses the "
+                             "listing) — the way to dry-run one specific "
+                             "draft through the full webhook dispatch "
+                             "(generic purchase / Gutschrift / energy "
+                             "credit note routing all included).")
     parser.add_argument("--apply", action="store_true",
                         help="Actually POST /purchases for each draft "
                              "(default: dry-run, OCR only, no Moco writes).")
@@ -711,20 +718,28 @@ def main() -> int:
     purchases = MocoPurchaseClient(subdomain=subdomain, api_key=moco_key)
     ocr = AnthropicOcrClient(api_key=anthropic_key, model=args.model)
 
-    # Always fetch the full draft pool (up to 100) so the --max N cap is
-    # applied to the freshest N AFTER newest-first sorting. Limiting the
-    # API call directly would just take whatever order Moco returns the
-    # first N in, which isn't guaranteed to be newest-first.
-    print(f"Listing drafts from "
-          f"https://{subdomain}.mocoapp.com/api/v1/purchases/drafts …")
-    try:
-        drafts = purchases.list_purchase_drafts(limit=DRAFT_FETCH_CAP)
-    except Exception as e:
-        print(f"Failed to list drafts: {e}", file=sys.stderr)
-        return 3
-    drafts = _newest_first(drafts)[:args.max_drafts]
-    print(f"Got {len(drafts)} draft(s) (newest first, capped at --max="
-          f"{args.max_drafts}). "
+    if args.draft_id is not None:
+        print(f"Fetching draft {args.draft_id} …")
+        try:
+            drafts = [purchases.get_purchase_draft(args.draft_id)]
+        except Exception as e:
+            print(f"Failed to fetch draft {args.draft_id}: {e}",
+                  file=sys.stderr)
+            return 3
+    else:
+        # Always fetch the full draft pool (up to 100) so the --max N cap
+        # is applied to the freshest N AFTER newest-first sorting. Limiting
+        # the API call directly would just take whatever order Moco
+        # returns the first N in, which isn't guaranteed to be newest-first.
+        print(f"Listing drafts from "
+              f"https://{subdomain}.mocoapp.com/api/v1/purchases/drafts …")
+        try:
+            drafts = purchases.list_purchase_drafts(limit=DRAFT_FETCH_CAP)
+        except Exception as e:
+            print(f"Failed to list drafts: {e}", file=sys.stderr)
+            return 3
+        drafts = _newest_first(drafts)[:args.max_drafts]
+    print(f"Got {len(drafts)} draft(s). "
           f"Mode: {'APPLY (real writes)' if args.apply else 'DRY-RUN'}")
 
     # Build the Kommission → Moco project resolver once per run. The
