@@ -59,6 +59,7 @@ def make_credit(**overrides) -> EnergyCreditNoteData:
     # specs/SPEC_energy_credit_note.md, decision D6).
     base = dict(
         objekt="Produktion PVA HEIV Meierhofweg 10",
+        objekt_top_level="Eigenbedarf PVA HEIV Meierhofweg 10",
         gross_amount=3785.65,
         vat_rate=0.081,
         period_from="2026-04-01",
@@ -332,6 +333,78 @@ def test_low_confidence_success_flags_review_in_telegram():
     assert "bitte prüfen" in tg.messages[0]
 
 
+# --- objekt fallback (top-level summary) ----------------------------------
+
+def test_objekt_fallback_matches_when_primary_objekt_is_generic():
+    """Real-world regression (draft 3143993, CKW vZEV Krugel 1 Oberkirch):
+    the production-section Objekt can be a generic label with no site
+    identifier ("vZEV Überschuss") — when that misses (`no_match`), the
+    top-level summary Objekt is tried as a fallback and used if it hits."""
+    tg = FakeTelegram()
+    ocr = FakeOcr(result=make_credit(
+        objekt="vZEV Überschuss",
+        objekt_top_level="Eigenbedarf PVA HEIV Meierhofweg 10"))
+    s = build_service(ocr=ocr, telegram=tg)
+
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=3143993, body=DRAFT_BODY)
+
+    assert result["project_id"] == 947264448
+    assert result["objekt_matched"] == "Eigenbedarf PVA HEIV Meierhofweg 10"
+    assert "Top-Level-Fallback" in tg.messages[0]
+    assert "Eigenbedarf PVA HEIV Meierhofweg 10" in tg.messages[0]
+
+
+def test_objekt_fallback_not_used_when_primary_matches():
+    """The primary (production-section) Objekt wins when it already
+    matches — the fallback is never consulted, let alone allowed to
+    override a successful primary match."""
+    tg = FakeTelegram()
+    ocr = FakeOcr(result=make_credit())  # default: primary objekt matches
+    s = build_service(ocr=ocr, telegram=tg)
+
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=3143995, body=DRAFT_BODY)
+
+    assert result["objekt_matched"] == "Produktion PVA HEIV Meierhofweg 10"
+    assert "Top-Level-Fallback" not in tg.messages[0]
+
+
+def test_objekt_fallback_not_retried_when_primary_ambiguous():
+    """An ambiguous primary result is not retried with the fallback
+    Objekt — even when the fallback Objekt would have resolved uniquely,
+    proving the retry genuinely doesn't happen (not just that this
+    particular fallback also fails)."""
+    projects = [
+        {"id": 1, "name": "Blumenrain 1 Contracting/Einspeisung",
+         "tags": ["Stromproduktion"], "customer": {"id": 1, "name": "CKW AG"}},
+        {"id": 2, "name": "Blumenrain 3 Contracting/Einspeisung",
+         "tags": ["Stromproduktion"], "customer": {"id": 1, "name": "CKW AG"}},
+    ]
+    ocr = FakeOcr(result=make_credit(
+        objekt="Produktion Blumenrain",
+        # Would uniquely match project id=1 (2 shared tokens vs project
+        # id=2's 1) if it were ever tried — it must not be.
+        objekt_top_level="Produktion Blumenrain 1"))
+    s = build_service(ocr=ocr, projects=projects)
+
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+
+    assert result["skipped"] == "energy_credit_note_project_ambiguous"
+
+
+def test_objekt_fallback_skipped_when_top_level_objekt_missing():
+    """No `objekt_top_level` to fall back to — stays `no_match`, doesn't
+    raise."""
+    ocr = FakeOcr(result=make_credit(objekt="Solarpark Zermatt",
+                                     objekt_top_level=None))
+    s = build_service(ocr=ocr)
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+    assert result["skipped"] == "energy_credit_note_project_no_match"
+
+
 # --- net-amount derivation -----------------------------------------------------
 
 def test_derive_net_amount_matches_worked_example():
@@ -372,11 +445,16 @@ def test_leistungszeitraum_quarter_boundaries(period_from, period_to, expected):
 # --- keep-draft paths ---------------------------------------------------------
 
 def test_no_matching_project_keeps_draft():
+    """Both the primary AND the top-level-fallback Objekt miss — a real
+    no-match, not just a primary-source miss (see
+    test_objekt_fallback_matches_when_primary_objekt_is_generic for the
+    fallback-succeeds case)."""
     moco = FakeMoco()
     moco_invoices = FakeMocoInvoices()
     purchases = FakePurchaseClient()
     tg = FakeTelegram()
-    ocr = FakeOcr(result=make_credit(objekt="Solarpark Zermatt"))
+    ocr = FakeOcr(result=make_credit(objekt="Solarpark Zermatt",
+                                     objekt_top_level="Solarpark Zermatt"))
     s = build_service(moco=moco, moco_invoices=moco_invoices,
                       purchases=purchases, ocr=ocr, telegram=tg)
 
@@ -477,7 +555,8 @@ def test_failed_draft_comment_is_swallowed():
     moco = FakeMoco()
     moco.comment_error = _http_error(422)
     tg = FakeTelegram()
-    ocr = FakeOcr(result=make_credit(objekt="Solarpark Zermatt"))
+    ocr = FakeOcr(result=make_credit(objekt="Solarpark Zermatt",
+                                     objekt_top_level="Solarpark Zermatt"))
     s = build_service(moco=moco, ocr=ocr, telegram=tg)
     result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
                        company=COMPANY, draft_id=1, body=DRAFT_BODY)

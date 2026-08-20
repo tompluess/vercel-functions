@@ -593,6 +593,7 @@ def test_extract_energy_bill_tolerates_reasoning_preamble(client, calls):
 
 SAMPLE_CREDIT_NOTE_OCR = {
     "objekt": "Produktion PVA HEIV Meierhofweg 10",
+    "objekt_top_level": "Eigenbedarf PVA HEIV Meierhofweg 10",
     "gross_amount": 3785.65,
     "vat_rate": 0.081,
     "period_from": "2026-04-01",
@@ -621,6 +622,7 @@ def test_extract_energy_credit_note_parses_all_fields(client, calls):
         json.dumps(SAMPLE_CREDIT_NOTE_OCR))
     credit = client.extract_energy_credit_note(PDF_BYTES)
     assert credit.objekt == "Produktion PVA HEIV Meierhofweg 10"
+    assert credit.objekt_top_level == "Eigenbedarf PVA HEIV Meierhofweg 10"
     assert credit.gross_amount == 3785.65
     assert credit.vat_rate == pytest.approx(0.081)
     assert credit.period_from == "2026-04-01"
@@ -628,6 +630,20 @@ def test_extract_energy_credit_note_parses_all_fields(client, calls):
     assert credit.invoice_date == "2026-07-31"
     assert credit.invoice_number == "600949594"
     assert credit.confidence == 0.93
+
+
+def test_extract_energy_credit_note_objekt_top_level_can_differ_from_objekt(
+        client, calls):
+    """Real-world regression (draft 3143993, CKW vZEV Krugel 1 Oberkirch):
+    the production section's Objekt can be a generic label ("vZEV
+    Überschuss") while the top-level summary's Objekt carries the actual
+    site name — the two fields must be extracted independently."""
+    payload = {**SAMPLE_CREDIT_NOTE_OCR, "objekt": "vZEV Überschuss",
+               "objekt_top_level": "vZEV Krugel 1 Oberkirch"}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    credit = client.extract_energy_credit_note(PDF_BYTES)
+    assert credit.objekt == "vZEV Überschuss"
+    assert credit.objekt_top_level == "vZEV Krugel 1 Oberkirch"
 
 
 def test_extract_energy_credit_note_normalizes_negative_gross_amount():
@@ -662,6 +678,7 @@ def test_extract_energy_credit_note_missing_fields_default_safely(client, calls)
     calls["next_response"] = _anthropic_response(json.dumps({}))
     credit = client.extract_energy_credit_note(PDF_BYTES)
     assert credit.objekt is None
+    assert credit.objekt_top_level is None
     assert credit.gross_amount is None
     assert credit.vat_rate is None
     assert credit.period_from is None

@@ -13,15 +13,20 @@ lookup — there is no cheap pre-download signal here, unlike smart-me) and
 delegates here instead. This service:
 
   1. Runs a second, targeted OCR pass (`extract_energy_credit_note`) to
-     pull the Objekt (production section) / top-level gross Gutschriftsbetrag
-     (inkl. MWST) / VAT rate / Abrechnungszeitraum. The bookable ex-VAT
-     amount is then DERIVED, not OCR'd: `net_amount = gross_amount /
-     (1 + vat_rate)` — the top-level gross figure already nets the
-     consumption section against the production section, so it (not either
-     subsection's own Nettobetrag) is the correct basis (see
+     pull the Objekt (production section, PRIMARY) / Objekt (top-level
+     summary, FALLBACK) / top-level gross Gutschriftsbetrag (inkl. MWST) /
+     VAT rate / Abrechnungszeitraum. The bookable ex-VAT amount is then
+     DERIVED, not OCR'd: `net_amount = gross_amount / (1 + vat_rate)` —
+     the top-level gross figure already nets the consumption section
+     against the production section, so it (not either subsection's own
+     Nettobetrag) is the correct basis (see
      `specs/SPEC_energy_credit_note.md`, decision D6).
   2. Matches the Objekt + supplier to exactly one `Stromproduktion`-tagged
-     Moco project (`StromproduktionProjectMatcher`).
+     Moco project (`StromproduktionProjectMatcher`, via `_match_project`) —
+     tries the production-section Objekt first, falling back once to the
+     top-level summary Objekt when the primary attempt is `no_match`/
+     `empty` (some vZEV community statements print a generic, non-site-
+     specific Objekt on the production section; see decision D7).
   3. Creates a project expense via `POST /projects/{id}/expenses` with the
      field conventions the operator uses manually: quantity 1, unit "x",
      unit_price = derived net amount, unit_cost 0, billable, NOT
@@ -139,23 +144,24 @@ class EnergyCreditNoteService:
         """
         credit = self._ocr.extract_energy_credit_note(pdf_bytes)
         logger.info("energy_credit_note: extracted draft_id=%s confidence=%.2f "
-                    "objekt=%r gross=%r vat_rate=%r period=%r..%r",
+                    "objekt=%r objekt_top_level=%r gross=%r vat_rate=%r "
+                    "period=%r..%r",
                     draft_id, credit.confidence, credit.objekt,
-                    credit.gross_amount, credit.vat_rate,
-                    credit.period_from, credit.period_to)
+                    credit.objekt_top_level, credit.gross_amount,
+                    credit.vat_rate, credit.period_from, credit.period_to)
 
-        match = self._matcher.match(supplier_name=invoice.supplier_name,
-                                    objekt=credit.objekt)
+        match, objekt_used = self._match_project(invoice.supplier_name,
+                                                  credit, draft_id=draft_id)
         if match.status != "matched":
             logger.warning("energy_credit_note: draft %s objekt=%r not "
                            "matched (status=%s candidates=%d)",
-                           draft_id, credit.objekt, match.status,
+                           draft_id, objekt_used, match.status,
                            match.candidate_count)
             return self._keep_draft(
                 draft_id, credit=credit,
                 reason=_unmatched_reason(match),
                 skipped=f"energy_credit_note_project_{match.status}",
-                extra={"match_status": match.status, "objekt": credit.objekt})
+                extra={"match_status": match.status, "objekt": objekt_used})
         net_amount = _derive_net_amount(credit.gross_amount, credit.vat_rate)
         if net_amount is None:
             if credit.gross_amount is None:
@@ -170,7 +176,7 @@ class EnergyCreditNoteService:
                            credit.gross_amount, credit.vat_rate)
             return self._keep_draft(
                 draft_id, credit=credit, reason=reason, skipped=skipped,
-                extra={"objekt": credit.objekt})
+                extra={"objekt": objekt_used})
         leistungszeitraum = _format_leistungszeitraum(credit.period_from)
         if not credit.period_from or not credit.period_to or leistungszeitraum is None:
             logger.warning("energy_credit_note: draft %s has no usable "
@@ -179,7 +185,7 @@ class EnergyCreditNoteService:
                 draft_id, credit=credit,
                 reason="OCR fand keinen (lesbaren) Abrechnungszeitraum",
                 skipped="energy_credit_note_no_period",
-                extra={"objekt": credit.objekt})
+                extra={"objekt": objekt_used})
 
         project = match.project
         project_id = project.get("id")
@@ -212,7 +218,7 @@ class EnergyCreditNoteService:
             base64_content=base64.b64encode(pdf_bytes).decode("ascii"))
 
         self._delete_draft_after_create(draft_id, invoice_id)
-        self._notify_success(project, credit, invoice_id)
+        self._notify_success(project, credit, invoice_id, objekt_used)
 
         return {
             "energy_credit_note": True,
@@ -225,7 +231,42 @@ class EnergyCreditNoteService:
             "net_amount": net_amount,
             "leistungszeitraum": leistungszeitraum,
             "confidence": credit.confidence,
+            "objekt_matched": objekt_used,
         }
+
+    # --- project matching ------------------------------------------------
+
+    def _match_project(self, supplier_name: str | None,
+                       credit: EnergyCreditNoteData, *,
+                       draft_id: int
+                       ) -> tuple[StromproduktionProjectMatch, str | None]:
+        """Match the credit note to a `Stromproduktion` project.
+
+        Tries the production-section Objekt (`credit.objekt`) first — the
+        primary, better-evidenced signal. Only when that comes back
+        `no_match` or `empty` does it retry once with the top-level summary
+        Objekt (`credit.objekt_top_level`). An `ambiguous` primary result is
+        NOT retried — it already gets its own keep-draft + Telegram alert
+        telling the operator which Kommission field to pin, and retrying
+        with a different Objekt on an already-ambiguous case would just add
+        an unpredictable second axis to reason about (see
+        `specs/SPEC_energy_credit_note.md`, decision D7).
+
+        Returns the winning match plus the Objekt string that produced it
+        (for logging/diagnostics and for the `_keep_draft`/`_notify_success`
+        display).
+        """
+        match = self._matcher.match(supplier_name=supplier_name,
+                                    objekt=credit.objekt)
+        if match.status in ("no_match", "empty") and credit.objekt_top_level:
+            fallback = self._matcher.match(supplier_name=supplier_name,
+                                           objekt=credit.objekt_top_level)
+            logger.info("energy_credit_note: draft %s primary objekt %r "
+                       "(%s) -> retrying with top-level objekt %r (%s)",
+                       draft_id, credit.objekt, match.status,
+                       credit.objekt_top_level, fallback.status)
+            return fallback, credit.objekt_top_level
+        return match, credit.objekt
 
     # --- vat code resolution -------------------------------------------
 
@@ -336,17 +377,23 @@ class EnergyCreditNoteService:
         )
 
     def _notify_success(self, project: dict, credit: EnergyCreditNoteData,
-                        invoice_id: int) -> None:
+                        invoice_id: int, objekt_used: str | None) -> None:
         confidence_note = (""
                            if credit.confidence >= CONFIDENCE_THRESHOLD
                            else " — bitte prüfen")
         icon = "✅" if credit.confidence >= CONFIDENCE_THRESHOLD else "⚠️"
+        # Flag it when the top-level-summary Objekt won the match rather
+        # than the (primary) production-section one — worth a glance since
+        # it means the production section's own Objekt was unusable for
+        # this statement (see `_match_project`).
+        fallback_note = ("" if objekt_used == credit.objekt else
+                         f" (Objekt via Top-Level-Fallback: {objekt_used!r})")
         invoice_line = ("Rechnung (Status: erstellt — bitte prüfen und "
                         f"manuell auf \"versendet\" setzen): "
                         f"{self._invoice_url(invoice_id)}")
         self._notify(
             f"{icon} Energie-Gutschrift verbucht ({credit.confidence:.0%})"
-            f"{confidence_note} — {project.get('name')}\n"
+            f"{confidence_note} — {project.get('name')}{fallback_note}\n"
             + _credit_summary_lines(credit)
             + invoice_line
         )

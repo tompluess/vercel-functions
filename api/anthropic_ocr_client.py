@@ -129,15 +129,27 @@ class EnergyCreditNoteData:
     `specs/SPEC_energy_credit_note.md`, decision D6). `objekt` is the
     exception: it still comes from the production/credit section
     specifically, since that's what identifies the site for project
-    matching. Every field except `confidence` is None when not found.
+    matching — with `objekt_top_level` as a fallback (decision D7) for
+    documents where the production section's own Objekt is a generic
+    label with no site identifier (e.g. vZEV community "Überschuss"
+    pages). Every field except `confidence` is None when not found.
     """
 
     # The Objekt line from the Rücklieferung/Gutschrift section
     # specifically (e.g. "Produktion PVA HEIV Meierhofweg 10") — NOT the
     # Objekt of a same-document consumption/Eigenbedarf section, which
-    # can differ within the same PDF. Extracting Objekt from the top-level
-    # summary instead is not reliable across EVUs, unlike the amount.
+    # can differ within the same PDF. This is the PRIMARY project-matching
+    # signal (see `EnergyCreditNoteService.process`'s fallback to
+    # `objekt_top_level` below when this one fails to match).
     objekt: str | None
+    # The Objekt line from the document's TOP-LEVEL summary (e.g. "Ihre
+    # Gutschrift" / "Objekt: vZEV Krugel 1 Oberkirch") — a FALLBACK
+    # project-matching signal, tried only when `objekt` fails to match.
+    # Confirmed live (draft 3143993) that some vZEV community statements
+    # print a generic, non-site-specific Objekt on the production section
+    # ("vZEV Überschuss") while the top-level summary's Objekt carries the
+    # actual site name — see `specs/SPEC_energy_credit_note.md`, D7.
+    objekt_top_level: str | None
     # The document's TOP-LEVEL Gutschriftsbetrag (inkl. MWST) — e.g. "Ihre
     # Gutschrift CHF 3'785.65" — NOT the production section's own
     # Nettobetrag. Always normalized to a POSITIVE magnitude (the amount
@@ -308,18 +320,27 @@ ENERGY_CREDIT_NOTE_SYSTEM_PROMPT = (
     "TWO sections in the same PDF — a small consumption invoice (labeled "
     "'Energiebezug' / 'Rechnung' / 'Eigenbedarf') and a separate, usually "
     "much larger, production credit note (labeled 'Rücklieferung' / "
-    "'Gutschrift' / 'Einspeisung' / 'Produktion'). The two fields below "
-    "come from DIFFERENT places in the document — read this carefully:\n"
+    "'Gutschrift' / 'Einspeisung' / 'Produktion'). The document also has a "
+    "TOP-LEVEL summary (usually the first page, headed 'Ihre Gutschrift' or "
+    "similar) that sits above both sections. The fields below come from "
+    "DIFFERENT places in the document — read this carefully:\n"
     "  - The bookable AMOUNT (`gross_amount`) is the document's TOP-LEVEL "
     "summary total (e.g. 'Ihre Gutschrift' / 'Gutschriftsbetrag (inkl. "
     "MWST)'), which already nets the consumption section against the "
     "production section. Do NOT use either subsection's own Nettobetrag "
     "for this field — the top-level summary is correct here.\n"
-    "  - The `objekt` field, in contrast, MUST come from the production/"
-    "credit section specifically (labeled 'Rücklieferung' / 'Gutschrift' / "
-    "'Einspeisung' / 'Produktion') — ignore the consumption section's own "
-    "Objekt for this field, even if a top-level summary shows a different "
-    "one.\n"
+    "  - The `objekt` field MUST come from the production/credit section "
+    "specifically (labeled 'Rücklieferung' / 'Gutschrift' / 'Einspeisung' / "
+    "'Produktion') — ignore the consumption section's own Objekt for this "
+    "field, even if a top-level summary shows a different one.\n"
+    "  - The `objekt_top_level` field is DIFFERENT from `objekt`: it is the "
+    "Objekt line printed in the document's TOP-LEVEL summary specifically "
+    "(the same summary the gross amount comes from), extracted "
+    "independently of which section's Objekt you used for `objekt`. Some "
+    "statements print the SAME Objekt in both places; others print a "
+    "site-specific name at the top level but a generic label (e.g. 'vZEV "
+    "Überschuss') on the production section — extract both exactly as "
+    "printed, do not try to reconcile them.\n"
     "Respond ONLY with a JSON object — no preamble, no markdown fences.\n\n"
     "Required fields (null if not found):\n"
     "{\n"
@@ -328,6 +349,10 @@ ENERGY_CREDIT_NOTE_SYSTEM_PROMPT = (
     '\\"Produktion PVA HEIV Meierhofweg 10\\"). If the document also '
     'shows a different Objekt for an Eigenbedarf/consumption section, '
     'do NOT use that one.",\n'
+    '  "objekt_top_level": "string — the Objekt line VERBATIM from the '
+    'document\'s TOP-LEVEL summary (e.g. the \\"Ihre Gutschrift\\" page), '
+    'independent of the `objekt` field above. null if the top-level '
+    'summary has no Objekt line of its own.",\n'
     '  "gross_amount": "number — the document\'s TOP-LEVEL gross credit '
     'total in CHF, INCLUDING Mehrwertsteuer (e.g. the \\"Ihre Gutschrift\\" '
     '/ \\"Gutschriftsbetrag (inkl. MWST)\\" summary figure) — this is the '
@@ -626,6 +651,7 @@ def _to_energy_credit_note_data(data: dict) -> EnergyCreditNoteData:
     """
     return EnergyCreditNoteData(
         objekt=_str_or_none(data.get("objekt")),
+        objekt_top_level=_str_or_none(data.get("objekt_top_level")),
         gross_amount=_abs_or_none(_float_or_none(data.get("gross_amount"))),
         vat_rate=_float_or_none(data.get("vat_rate")),
         period_from=_str_or_none(data.get("period_from")),

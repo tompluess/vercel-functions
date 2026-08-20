@@ -263,23 +263,32 @@ def _process_energy_credit_note(draft: dict, *, pdf_bytes: bytes, invoice,
 
     Reuses the `Row.purchase_id` column for the created invoice's id
     (labeled explicitly in the `result` text) rather than adding a new
-    table column for this one row type.
+    table column for this one row type. Likewise reuses the KOMMISSION
+    column for the credit note's OCR'd Objekt + the
+    `StromproduktionProjectMatcher` outcome — same `matched`/`ambiguous`/
+    `no_match`/`empty` vocabulary as the generic Kommission→project
+    resolver, so `_kommission_cell`'s existing rendering (✓/✗ ambiguous
+    (N)/plain) applies unchanged.
     """
     draft_id = draft.get("id")
     credit = service._ocr.extract_energy_credit_note(pdf_bytes)
     net_amount = _derive_net_amount(credit.gross_amount, credit.vat_rate)
     amount_cell = _format_amount("CHF", net_amount)
     _step(f"energy credit note: objekt={credit.objekt!r} "
+          f"objekt_top_level={credit.objekt_top_level!r} "
           f"gross={credit.gross_amount} vat_rate={credit.vat_rate} "
           f"net={net_amount} confidence={credit.confidence:.0%}")
 
     # Resolved here (not just inside service.process()) so the diagnostic
     # log line prints in BOTH dry-run and apply mode — pure/cheap
     # (in-memory only), so recomputing it in apply mode alongside the
-    # service's own internal call is not wasteful.
-    match = service._matcher.match(supplier_name=invoice.supplier_name,
-                                   objekt=credit.objekt)
-    _step(_format_stromproduktion_match_log(credit.objekt, match))
+    # service's own internal call is not wasteful. Uses the service's own
+    # `_match_project` (production-section Objekt first, top-level-summary
+    # Objekt as fallback — see `specs/SPEC_energy_credit_note.md`, D7) so
+    # the preview matches production behavior exactly.
+    match, objekt_used = service._match_project(invoice.supplier_name,
+                                                 credit, draft_id=draft_id)
+    _step(_format_stromproduktion_match_log(objekt_used, match))
 
     if not apply:
         if match.status == "matched":
@@ -293,19 +302,21 @@ def _process_energy_credit_note(draft: dict, *, pdf_bytes: bytes, invoice,
         else:
             result = f"Dry-run: energy credit note, project {match.status}"
         return Row(draft_id, None, invoice.supplier_name, supplier_matched,
-                   amount_cell, False, None, "empty", 0, result)
+                   amount_cell, False, objekt_used, match.status,
+                   match.candidate_count, result)
 
     outcome = service.process(pdf_bytes=pdf_bytes, invoice=invoice,
                               company=company, draft_id=draft_id, body=draft)
     if outcome.get("skipped"):
         _step(f"energy credit note kept draft: {outcome['skipped']}")
         return Row(draft_id, None, invoice.supplier_name, supplier_matched,
-                   amount_cell, False, None, "empty", 0,
-                   f"Skipped: {outcome['skipped']}")
+                   amount_cell, False, objekt_used, match.status,
+                   match.candidate_count, f"Skipped: {outcome['skipped']}")
     _step(f"created invoice id={outcome.get('invoice_id')} "
           f"expense id={outcome.get('expense_id')}")
     return Row(draft_id, outcome.get("invoice_id"), invoice.supplier_name,
-               supplier_matched, amount_cell, False, None, "empty", 0,
+               supplier_matched, amount_cell, False, objekt_used,
+               match.status, match.candidate_count,
                "Created energy-credit-note invoice (status=created, "
                f"expense={outcome.get('expense_id')})")
 
@@ -576,7 +587,11 @@ def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
     Moco's company list; Betrag gets a leading ✓ on already-paid bills;
     Kommission gets a leading ✓ when the OCR'd value resolved to exactly
     one Moco project, or a trailing `✗ ambiguous (N)` when more than one
-    matched. Kategorie carries the pre-formatted `_format_category_cell`
+    matched. For energy-credit-note rows this column is repurposed to show
+    the credit note's OCR'd Objekt + `StromproduktionProjectMatcher`
+    outcome instead (see `_process_energy_credit_note`) — same status
+    vocabulary, so the same rendering applies unchanged. Kategorie carries
+    the pre-formatted `_format_category_cell`
     outcome (✓ account (source) / ✗ unmapped account / `- paid`).
 
     Truncates Lieferant / Kommission / Result so long values don't blow

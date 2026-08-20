@@ -66,8 +66,40 @@ For this draft: `3785.65 / 1.081 = 3501.99` (rounded to 2dp) — **not**
 `3580.58` (page 4's Nettobetrag, the previous/wrong assumption).
 
 The Objekt used for project matching still comes from the production
-section (page 4, "Produktion PVA HEIV Meierhofweg 10") — that part of the
-design is unchanged; only the bookable-amount source changed.
+section (page 4, "Produktion PVA HEIV Meierhofweg 10") as the PRIMARY
+source — but see the second real example below, where that primary source
+turned out to be insufficient on its own.
+
+**Draft `3143993`** (verified against live Moco data): a second CKW AG PDF
+from the same batch, `260731 CKW Krugel1 Rechnung 660 588 806.pdf`, for the
+`Krugel1_Oberkirch - Contracting/Einspeisung` vZEV community. Same 4-page
+shape, but the Objekt differs by section in a way draft `3143995` did not
+show:
+
+- **Top-level summary (page 1)**: `Objekt: vZEV Krugel 1 Oberkirch` — the
+  site name.
+- **Consumption section (page 3)**: `Objekt: vZEV Krugel 1 Oberkirch` —
+  same as the top level.
+- **Production/credit section (page 4)**: `Objekt: vZEV Überschuss`
+  ("surplus") — a GENERIC label with no site identifier at all. Every
+  vZEV community's surplus page likely reads this way.
+
+Matching on the production-section Objekt alone (`"vZEV Überschuss"`)
+finds zero token overlap against any Stromproduktion project name →
+`no_match`, even though the top-level Objekt (`"vZEV Krugel 1 Oberkirch"`)
+would uniquely match `Krugel1_Oberkirch - Contracting/Einspeisung` (shared
+tokens `krugel`/`1`/`oberkirch`). Notably, the top-level Objekt would
+*also* have matched draft `3143995` correctly (its top-level Objekt,
+`"Eigenbedarf PVA HEIV Meierhofweg 10"`, shares the same site tokens as
+the production section's) — so the top-level line is evidence-backed as a
+reliable *fallback* signal, without yet being trusted as sufficient
+evidence to replace the primary source outright (see **D7**).
+
+A Kommission pin is deliberately NOT the fix for this case: Tier 0 checks
+the Kommission field against *all* `Stromproduktion` projects regardless
+of supplier, so pinning the generic `"vZEV Überschuss"` string to
+`Krugel1_Oberkirch` would risk hijacking any *other* EVU's future
+statement that happens to print the same generic surplus wording.
 
 **Precedent invoice** (`GET /invoices/7812757`, `Meierhofweg10_Emmen
 Contracting/Einspeisung` project, quarter 2026/Q1):
@@ -132,24 +164,30 @@ disambiguated from the OCR'd Objekt by address token overlap (e.g.
 
 New `EnergyCreditNoteData` dataclass + `extract_energy_credit_note()` on
 `AnthropicOcrClient`, mirroring `EnergyBillData`/`extract_energy_bill`.
-Fields: `objekt`, `gross_amount`, `vat_rate`, `period_from`, `period_to`,
-`invoice_date`, `invoice_number`, `confidence`.
+Fields: `objekt`, `objekt_top_level`, `gross_amount`, `vat_rate`,
+`period_from`, `period_to`, `invoice_date`, `invoice_number`, `confidence`.
 
 - `gross_amount` — the document's **top-level** Gutschriftsbetrag (inkl.
   MWST), e.g. "Ihre Gutschrift" / "Gutschriftsbetrag (inkl. MWST)". This is
   the actual net cash amount transferred, already netting any offsetting
   consumption-section invoice — **not** a subsection's own Nettobetrag.
-- `objekt` still comes from the production/credit section specifically
-  (needed for project disambiguation — see "Real example" above);
-  extracting it from the top-level summary is not reliable across EVUs.
+- `objekt` — the Objekt line from the production/credit section
+  specifically, the PRIMARY project-matching signal (needed for project
+  disambiguation — see "Real example" above).
+- `objekt_top_level` — the Objekt line from the document's top-level
+  summary ("Ihre Gutschrift" / "Objekt: …"), a FALLBACK project-matching
+  signal used when `objekt` fails to match (see §3, D7). Extracted
+  separately rather than substituted for `objekt` because the production
+  section's Objekt is still the better-evidenced primary source when it
+  does carry a site identifier.
 - `vat_rate` — the applicable rate (e.g. `0.081`), used both for
   `vat_code_id` resolution (§5) and for deriving the bookable net amount
   (§5, `net_amount = gross_amount / (1 + vat_rate)`).
 
 The prompt explicitly warns about the two-section-per-PDF shape and
 instructs the model to extract the top-level gross summary figure (not
-either subsection's own Nettobetrag) together with the production
-section's Objekt.
+either subsection's own Nettobetrag), the production section's Objekt,
+AND the top-level summary's own Objekt line separately.
 
 ### 2. Detection
 
@@ -193,6 +231,19 @@ Modeled on `SmartmeProjectMatcher`, with an extra required filter tier:
   `no_match`, never a fallback across all Stromproduktion projects — an
   unrelated EVU's credit must never land on someone else's project.
 
+**Objekt fallback (D7)**: the caller (`EnergyCreditNoteService.process`)
+runs `matcher.match(supplier_name=.., objekt=credit.objekt)` first
+(production-section Objekt, the primary/better-evidenced source). Only
+when that result's `status` is `no_match` or `empty` does it retry once
+with `objekt=credit.objekt_top_level` (the top-level summary Objekt) and
+use that result instead. An `ambiguous` result from the primary attempt is
+NOT retried — ambiguity already gets its own keep-draft + Telegram alert
+telling the operator which Kommission field to pin, and retrying with a
+different Objekt on an already-ambiguous case would just add an
+unpredictable second axis to reason about. This stays entirely inside the
+matcher-calling layer — `StromproduktionProjectMatcher.match()` itself is
+unchanged and still takes exactly one `objekt` string per call.
+
 ### 4. Moco invoice API (confirmed via the OpenAPI spec)
 
 - `POST /invoices` — `status` defaults when omitted; explicit `"created"`
@@ -233,8 +284,12 @@ Modeled on `SmartmeProjectMatcher`, with an extra required filter tier:
 
 ### 6. Failure paths
 
-Mirrors `SmartmeEnergyExpenseService._keep_draft` exactly: project
-`no_match`/`ambiguous`/`empty`, or missing `gross_amount`/`vat_rate`/period → comment on
+Project resolution here means "after the Objekt fallback attempt in §3" —
+i.e. the keep-draft gate only fires once BOTH the production-section and
+top-level-summary Objekt attempts have failed to produce a `matched`
+result. Otherwise mirrors `SmartmeEnergyExpenseService._keep_draft`
+exactly: project `no_match`/`ambiguous`/`empty`, or missing
+`gross_amount`/`vat_rate`/period → comment on
 the draft (`commentable_type="PurchaseDraft"`) + Telegram alert, draft
 **stays** in the inbox (not deleted), webhook ACKs `ok=true`. Expense/
 invoice/attachment `HTTPError`s are **not** internally swallowed (same
@@ -323,3 +378,23 @@ worked example — not `3580.58`. This changes §1 (OCR schema:
 `expense_ids` item now use the derived `net_amount`), and §6 (failure
 gate now keys on missing `gross_amount`/`vat_rate` instead of
 `net_amount`).
+
+**D7 — Objekt project-matching has a fallback source: the top-level
+summary Objekt, tried only when the production-section Objekt misses.**
+Live-tested against draft `3143993` (see "Real example" above) and found
+that some EVU statements (vZEV community surplus pages specifically) print
+a GENERIC production-section Objekt (`"vZEV Überschuss"`) with no site
+identifier, while the document's top-level summary Objekt
+(`"vZEV Krugel 1 Oberkirch"`) does carry one. The production section
+remains the PRIMARY source (not replaced) because it correctly matched
+draft `3143995` and is the more semantically precise field per-document —
+this is a fallback for when it fails, not a wholesale swap. Only two real
+documents have been examined so far, which is why the top-level Objekt is
+being added as a fallback (used on retry) rather than substituted in as
+the primary source outright — a wholesale swap would be a larger, less
+evidence-backed behavior change than adding a safety net. A Kommission pin
+was considered and rejected for this specific case (see "Real example" —
+Tier 0 checks across ALL Stromproduktion projects regardless of supplier,
+so pinning a generic label like `"vZEV Überschuss"` risks hijacking an
+unrelated EVU's future statement that happens to print the same generic
+wording).
