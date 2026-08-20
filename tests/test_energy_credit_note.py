@@ -799,6 +799,116 @@ def test_untagged_supplier_still_delegated_via_project_match_fallback():
         "EGBB Elektrizitäts Genossenschaft Boswil Bünzen (Lieferant)"]
 
 
+def test_no_supplier_company_at_all_still_delegated_via_project_match_fallback():
+    """Real-world regression (draft 3154913, BKW Energie AG, Häbern 118):
+    unlike CKW/EGBB, BKW has only ONE Moco company record at all, and it's
+    `type: "customer"` (correctly EVU-tagged) — there is no `type:
+    "supplier"` "(Lieferant)" counterpart. `MocoSupplierMatcher`/
+    `list_suppliers()` (type=supplier only, by design — see
+    `moco_client.py`) therefore finds NOTHING and `company` stays None,
+    a step further than the EGBB case above (which at least had an
+    untagged supplier-type record). Detection must still succeed via the
+    D4 fallback signal ALONE — a THIRD independent real-world EVU
+    confirming the fallback generalizes regardless of whether any
+    supplier-type company record exists.
+
+    NOTE: as of this writing no Stromproduktion-tagged project with
+    customer.name="BKW Energie AG" exists in the live Moco account for
+    this site — draft 3154913 currently falls through to the generic
+    Gutschrift-purchase path for that reason. That is an operator-side
+    Moco data gap (create/tag the right project), not a code gap; see
+    `specs/SPEC_energy_credit_note.md`. This test proves the code is
+    already ready for it — `test_bkw_credit_note_processed_correctly_once_project_exists`
+    below proves the full expense+invoice flow using this draft's real
+    extracted field values."""
+    moco = DispatchFakeMoco()
+    moco.suppliers = []  # BKW has no type=supplier company record at all
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(
+        supplier_name="BKW Energie AG",
+        is_credit_note=True,
+        total_amount=-304.3,
+        commission="Nr. 684868, Häbern 118, 3538 Röthenbach im Emmental"))
+    ecn = FakeEnergyCreditNoteService(has_matching_project_result=True)
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn)
+
+    result = s.process("create", DRAFT_BODY)
+
+    assert result == {"energy_credit_note": True, "draft_id": 3143995,
+                      "invoice_id": 7900001}
+    assert len(ecn.calls) == 1
+    assert ecn.calls[0]["company"] is None
+    assert ecn.has_matching_project_calls == ["BKW Energie AG"]
+    assert purchases.creates == []
+
+
+def test_bkw_credit_note_processed_correctly_once_project_exists():
+    """Companion to the dispatch test above — proves the full expense +
+    invoice pipeline correctly handles a real BKW document once a
+    Stromproduktion project exists for it (the operator-side gap noted
+    above), using LIVE-EXTRACTED field values from draft 3154913 rather
+    than synthetic ones. This is a different EVU document format than
+    every other real example this feature has been tested against: BKW
+    has no "Objekt:" label at all (site identifier is a "Bezugsstelle:"
+    field instead) and frames every line item as negative with a separate
+    positive "Zu Ihren Gunsten" payout total (same EGBB-style negative
+    convention as D5, confirmed live to generalize to a third EVU).
+    `AnthropicOcrClient.extract_energy_credit_note` was confirmed live to
+    correctly parse this format without any prompt changes:
+    gross_amount=304.30, vat_rate=0.081, objekt=objekt_top_level=
+    'Nr. 684868, Häbern 118, 3538 Röthenbach im Emmental,
+    Photovoltaikanlage' (BKW's Bezugsstelle, recognized as the site
+    identifier), period 2026-05-07..2026-06-30."""
+    bkw_project = {
+        "id": 900000001,
+        "name": "Häbern 118, Röthenbach - BKW Einspeisung",
+        "tags": ["Contracting", "Stromproduktion"],
+        "customer": {"id": 763576517, "name": "BKW Energie AG"},
+        "billing_address": "BKW Energie AG\nViktoriaplatz 2\n3013 Bern\nSchweiz",
+        "custom_properties": {"Kommission": None},
+    }
+    credit = EnergyCreditNoteData(
+        objekt="Nr. 684868, Häbern 118, 3538 Röthenbach im Emmental, "
+              "Photovoltaikanlage",
+        objekt_top_level="Nr. 684868, Häbern 118, 3538 Röthenbach im "
+                         "Emmental, Photovoltaikanlage",
+        gross_amount=304.30,
+        vat_rate=0.081,
+        period_from="2026-05-07",
+        period_to="2026-06-30",
+        invoice_date="2026-07-28",
+        invoice_number="751 600 263 080",
+        confidence=0.82,
+    )
+    moco = FakeMoco()
+    moco_invoices = FakeMocoInvoices()
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=credit)
+    s = build_service(moco=moco, moco_invoices=moco_invoices,
+                      purchases=purchases, ocr=ocr, projects=[bkw_project])
+
+    result = s.process(
+        pdf_bytes=PDF_BYTES,
+        invoice=make_invoice(supplier_name="BKW Energie AG"),
+        company=None,  # no supplier-type company record exists — see above
+        draft_id=3154913, body=DRAFT_BODY)
+
+    assert result["project_id"] == 900000001
+    assert result["net_amount"] == 281.5  # 304.30 / 1.081, rounded to 2dp
+    assert result["leistungszeitraum"] == "2026/Q2"
+
+    project_id, expense_payload = moco.expenses[0]
+    assert project_id == 900000001
+    assert expense_payload["unit_price"] == 281.5
+    assert expense_payload["service_period_from"] == "2026-05-07"
+
+    invoice_payload = moco_invoices.invoices[0]
+    assert invoice_payload["customer_id"] == 763576517
+    assert invoice_payload["items"][0]["unit_price"] == 281.5
+
+
 def test_untagged_supplier_without_project_match_falls_through_to_purchase():
     """The fallback signal only fires when a project actually exists —
     an untagged, unrelated credit-note sender must still fall through to
