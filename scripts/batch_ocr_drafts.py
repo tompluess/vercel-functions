@@ -363,10 +363,17 @@ def _process_draft(draft: dict, *,
     Inlining the pipeline (rather than calling `service.process()` for
     apply mode) lets us emit each operator-facing log line at exactly the
     moment it's relevant AND avoids a double-OCR cost. For apply mode the
-    post-create steps (comments, draft delete) are delegated to the
-    service's own methods so the live behavior matches the webhook
-    exactly — comment text / delete fallback / soft-failure semantics
-    stay in one place.
+    post-create steps (comments, project assign, payment registration,
+    draft delete) are delegated to the service's own methods so the live
+    behavior matches the webhook exactly — comment text / delete fallback
+    / soft-failure semantics stay in one place.
+
+    **Maintenance hazard**: because the pipeline is inlined, any NEW
+    post-create step added to `service.process()` must be mirrored in the
+    apply block below or this script silently diverges from production.
+    That already bit once — `_register_payment` was added to the service
+    and not here, so `--apply` created purchases without settling
+    already-paid receipts.
     """
     draft_id = draft.get("id")
     file_url = draft.get("file_url")
@@ -600,6 +607,15 @@ def _process_draft(draft: dict, *,
         if assign_warnings:
             for w in assign_warnings:
                 _step(f"assign warning: {w}")
+        # Settle already-paid receipts, same as the webhook flow. Must stay
+        # in this list: every post-create step `process()` grows has to be
+        # mirrored here or apply mode silently diverges from production.
+        registered, payment_warning = service._register_payment(created,
+                                                                invoice)
+        if registered:
+            _step("payment registered (already paid)")
+        elif payment_warning:
+            _step(f"payment warning: {payment_warning}")
         service._delete_draft_after_create(draft_id, new_purchase_id)
         _step(f"created purchase id={new_purchase_id}")
     return Row(draft_id, new_purchase_id, invoice.supplier_name, matched,
@@ -609,9 +625,9 @@ def _process_draft(draft: dict, *,
                category=category_cell, review=review_cell)
 
 
-SUPPLIER_MAX_CHARS = 32   # ample for typical Swiss supplier names, fits 80-col
-KOMMISSION_MAX_CHARS = 28  # raw OCR'd value can run long with "BV-XYZ" prefixes
-REVIEW_MAX_CHARS = 40     # HOLD can name up to four failing conditions
+SUPPLIER_MAX_CHARS = 20  # ample for typical Swiss supplier names, fits 80-col
+KOMMISSION_MAX_CHARS = 20  # raw OCR'd value can run long with "BV-XYZ" prefixes
+REVIEW_MAX_CHARS = 15     # HOLD can name up to four failing conditions
 
 # Upper bound on how many drafts we fetch from Moco before sorting + applying
 # --max N. Fixed (not configurable) because 100 covers the realistic backlog
