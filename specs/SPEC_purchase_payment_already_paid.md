@@ -323,8 +323,12 @@ Company and category resolution say nothing about the amount — that is
 exactly why the confidence condition is there (D2).
 
 Already-paid card receipts carry none of this risk: the money is already
-gone, and with no IBAN their Bexio bill takes the **MANUAL** branch, which
-skips book + outgoing-payment silently.
+gone, and with no IBAN `_try_book_and_pay` returns early
+(`bexio_expense_sync_service.py:273`), so their Bexio bill is created as
+**DRAFT and never booked** — no outgoing payment, and you still book it in
+Bexio by hand. Auto-releasing a card receipt therefore cannot move money; it
+only saves the Moco review click. The confidence condition still applies to
+them anyway (D2).
 
 Rollout: run `scripts/batch_ocr_drafts.py` over recent drafts first and read
 the new `REVIEW` column (§8) — it shows exactly which historical invoices
@@ -411,11 +415,14 @@ operator scripts.
   confidence. Card receipts stay strict — they auto-release only when their
   supplier (or a strongly-matched project) carries an explicit `Aufwandkonto`.
   The resolver itself needs no change.
-- **D2 — confidence is part of the auto-release gate.** My addition, not in
-  your proposal. Company and category resolution are orthogonal to whether
-  the amount was read correctly; confidence is the only signal that covers
-  it, and auto-release for transfer bills can move money. **Strike this and
-  the gate is exactly your original rule.**
+- **D2 — confidence is part of the auto-release gate, uniformly.** Company and
+  category resolution are orthogonal to whether the *amount* was read
+  correctly; confidence is the only signal that covers it, and auto-release
+  for transfer bills can move money. Considered and rejected: dropping the
+  condition for already-paid receipts specifically, on the grounds that they
+  cannot move money (see the risk section). Rejected in favour of one uniform
+  rule — no payment-method branch in the gate, one number to reason about and
+  to test. A card receipt at 0.88 with a supplier `Aufwandkonto` is held.
 - **D9 — the gate is a pure collaborator, not a private method.** Both
   operator scripts need the same policy to preview it, and a duplicated copy
   in the batch script would drift from the real rule — defeating the point of
