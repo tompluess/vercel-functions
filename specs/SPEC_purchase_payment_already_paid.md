@@ -1,44 +1,43 @@
-# SPEC: Register a Moco payment for already-paid purchases
+# SPEC: Auto-release resolved purchases + register payments for already-paid ones
 
-Spec for automatically registering a **purchase payment** (German: "Ausgaben
-/ Zahlungen") in Moco when a purchase was already settled at the point of
-sale — credit card, debit card / EC-Karte, Maestro, Visa, Mastercard, TWINT,
-or a POS / EFT terminal slip.
+Two coupled changes to `SupplierInvoiceOcrService`, no new endpoint:
 
-Read `CLAUDE.md` first for project conventions. This feature adds a sixth
-webhook endpoint whose downstream is Moco itself (same as
-`/api/supplier-invoice-ocr`), reusing the existing
-`_handle_moco_dispatch_webhook` plumbing unchanged.
+1. **Conditional review tag** — stamp `Review pending` only when the OCR
+   result could *not* be fully resolved automatically. Fully-resolved
+   purchases are released straight to the existing Bexio expense sync.
+2. **Automatic purchase payment** — when a created purchase was already
+   settled at the point of sale (card / TWINT / POS terminal), register a
+   Moco purchase payment right after `POST /purchases`, so the purchase
+   doesn't sit in Moco with a phantom open balance.
+
+Read `CLAUDE.md` first. Everything below lives inside the existing
+`/api/supplier-invoice-ocr` flow and its collaborators.
 
 ---
 
 ## Problem
 
-`SupplierInvoiceOcrService` already detects already-settled card receipts:
-`InvoiceData.already_paid_by_card` drives `payment_method="credit_card"`,
-suppresses `due_date` / `iban` / `reference`, and makes
-`MocoCategoryResolver` decline to guess a Buchhaltungs-Konto.
+**Payments.** `InvoiceData.already_paid_by_card` already drives
+`payment_method="credit_card"` and suppresses `due_date` / `iban` /
+`reference`. But the purchase lands with `payments: []`, so Moco shows an
+open balance on money that already left the account. The operator settles
+every card receipt by hand.
 
-But the purchase still lands in Moco with `payments: []` — Moco believes the
-money is still owed and the purchase shows an open balance. The operator has
-to register the payment by hand on every card receipt, which is pure
-bookkeeping noise: the receipt itself is proof the money already left the
-account. The same applies to card purchases entered by hand in Moco's UI.
+**Review.** Every OCR'd purchase is stamped `["OCR", "Review pending"]`, and
+`BexioExpenseSyncService` refuses to sync until a human strips the tag. When
+OCR resolved everything — supplier company matched, expense account
+determined — that review is busywork.
 
 ---
 
 ## Moco API (confirmed against the official docs)
 
-Purchase payments are a **top-level** collection, not a sub-resource of a
-purchase:
+Purchase payments are a **top-level** collection, not a sub-resource:
 
 ```
-GET    /api/v1/purchases/payments          (filters: purchase_id, date_from, date_to)
-GET    /api/v1/purchases/payments/{id}
-POST   /api/v1/purchases/payments
-POST   /api/v1/purchases/payments/bulk
-PUT    /api/v1/purchases/payments/{id}
-DELETE /api/v1/purchases/payments/{id}
+GET/POST  /api/v1/purchases/payments
+POST      /api/v1/purchases/payments/bulk
+GET/PUT/DELETE /api/v1/purchases/payments/{id}
 ```
 
 `POST /purchases/payments` fields:
@@ -52,40 +51,15 @@ DELETE /api/v1/purchases/payments/{id}
 
 Source: <https://everii-group.github.io/mocoapp-api-docs/sections/purchase_payments.html>
 
-### Two constraints that shape the whole design
+Two facts that shape the design:
 
 1. **A purchase's `status` is NOT a payment status.** It is `pending`
-   (= Inbox) or `archived` (= Archive), nothing else. Registering a payment
-   does not change `status`; Moco derives the open balance from
-   `sum(payments)` vs `gross_total`. (An earlier draft of this spec claimed
-   a payment flips the purchase to `paid` — that was wrong.)
-
+   (= Inbox) or `archived` (= Archive). Registering a payment does not
+   change it; Moco derives the open balance from `sum(payments)` vs
+   `gross_total`.
 2. **A purchase with a payment can no longer be deleted.** Per the docs,
    `DELETE /purchases/{id}` *"is possible only if the status is `pending`
-   and no payments have been registered."*
-
-Constraint 2 is why the payment is registered **after** review rather than
-at creation time — see "Trigger" below.
-
-Note there is no idempotency key on `POST /purchases/payments`; a duplicate
-POST creates a second payment row and over-settles the purchase. The
-`payments == []` gate is what makes this safe (see "Idempotency").
-
----
-
-## Interaction with the existing review → Bexio flow (verified, unaffected)
-
-The `Review pending` tag workflow is untouched. `BexioExpenseSyncService.sync`
-reads only `tags`, `company`, `items[0].category.credit_account`,
-`receipt_identifier`, `iban`, `reference`, `date`, `due_date`, `gross_total`,
-`title`, `info`, and `user.firstname`. It never reads `payments` or `status`,
-so a registered payment cannot change its behaviour. Stripping the tag still
-produces a `Purchase:update` with no `Review pending` → the Bexio sync
-proceeds exactly as today.
-
-Also already safe: an already-paid card receipt carries no IBAN (the OCR
-payload suppresses it), so its Bexio bill goes down the **MANUAL** branch,
-which skips book + outgoing-payment silently. No double payment in Bexio.
+   and no payments have been registered."* Accepted cost — see D5.
 
 ---
 
@@ -94,8 +68,7 @@ which skips book + outgoing-payment silently. No double payment in Bexio.
 ### 1. Transport — `MocoPurchaseClient.create_payment`
 
 One new method on `api/moco_purchase_client.py` (purchase-domain write, same
-auth, same `/purchases` URL space). No new client class — a single endpoint,
-pure transport, errors propagate:
+auth, same URL space). Pure transport, errors propagate:
 
 ```python
 def create_payment(self, *, purchase_id: int, date: str,
@@ -103,177 +76,213 @@ def create_payment(self, *, purchase_id: int, date: str,
     """POST /purchases/payments — register a payment against a purchase."""
 ```
 
-### 2. New endpoint — `POST /api/moco-purchase-payment`
+### 2. Review-tag decision
 
-A separate endpoint rather than piggybacking on `/api/bexio-expense-sync`,
-for three reasons: that handler returns early on its own skips (`no_company`,
-`no_account`, `bill_not_draft`) which have nothing to do with settling a card
-receipt; a Bexio outage must not block a Moco-only write; and the repo's
-established shape is one endpoint = one job (`/api/supplier-invoice-ocr` is
-already a Moco→Moco endpoint, so the precedent exists).
+`OCR_TAGS` stops being a constant list. The `OCR` tag is always applied
+(it's the operator's filter for machine-created purchases); `Review pending`
+becomes conditional.
 
-It reuses `_handle_moco_dispatch_webhook` **with no changes to that helper**:
+A purchase is **auto-released** (no `Review pending` tag) only when *all*
+hold:
+
+| condition | rationale |
+|---|---|
+| `company_id` is not None | `MocoSupplierMatcher` produced a unique tiered match. Also means Bexio's own `no_company` gate can't fire downstream. |
+| `category_id` is not None | An expense account was determined. See the already-paid rule below. Also means Bexio's `no_account` gate can't fire. |
+| `invoice.confidence >= CONFIDENCE_THRESHOLD` (0.85) | **My addition — see D2.** The only signal that speaks to whether the *amount* and *IBAN* were read correctly. |
+| `not invoice.is_credit_note` | Credit notes always need a human to check the sign; today's Telegram alert says so unconditionally. |
+
+Anything else keeps `Review pending` and behaves exactly as today.
+
+**The already-paid category rule is unchanged and load-bearing.**
+`MocoCategoryResolver`'s chain is project `Aufwandkonto` → supplier
+`Aufwandkonto` → **already-paid ⇒ omit** → `4000` default. For a card
+receipt the chain short-circuits *before* the default, so `category_id` is
+non-None only when an explicit `Aufwandkonto` override exists. No resolver
+change is needed. This is deliberate: a card receipt must never be
+auto-released on the strength of a guessed 4000 booking.
+
+It also gives the operator a direct lever — set `Aufwandkonto` on a frequent
+card supplier (SBB, a fuel card, a hardware shop) and its receipts start
+auto-releasing; leave it unset and they keep going through review.
+
+`SupplierInvoiceOcrService._resolve_category_id` currently returns a bare
+`int | None`; it changes to return the full `CategoryDecision` (which already
+carries `.source` ∈ `project` / `supplier` / `default` / `already_paid`) so
+the tag decision can be logged with its reason.
+
+**Open point for review — D1.** For an already-paid receipt the resolver
+accepts a *project* `Aufwandkonto` as well as a supplier one. Your note said
+"only set category when resolved by supplier-account". Both are explicit
+operator configuration rather than a guess, so this spec keeps both
+qualifying. Say the word and the auto-release condition tightens to
+`decision.source == "supplier"`.
+
+### 3. Payment registration
+
+Immediately after a successful `POST /purchases`, in the existing
+post-create block of `process()`:
+
+```
+if new_purchase_id:
+    self._post_summary_comments(...)
+    assign_warnings = self._assign_resolved_project(...)
+    payment_result = self._register_payment_if_already_paid(created, invoice)
+    self._delete_draft_after_create(...)
+```
+
+After `assign_to_project` (which mutates line items) and before the draft
+delete — the payment is a leaf write that shouldn't sit between item
+mutations.
+
+**Gate** — register only when all hold:
+
+1. `invoice.already_paid_by_card` — the single "already settled" signal.
+   Deliberately not widened to "no IBAN" or "due date passed": a bill
+   without an IBAN is a MANUAL-transfer bill, not a paid one, and
+   mis-settling an open bill is worse than leaving a settled one open (you
+   see the latter; the former silently vanishes from "was ist offen").
+2. `not invoice.is_credit_note` — a card refund is conceivable but the
+   payment sign convention is unverified and there is no live example.
+3. A positive gross amount is resolvable.
+
+Applies to **every** already-paid receipt, auto-released or not — the chore
+is the same either way. See D5 for the cost when a reviewed receipt's amount
+is later corrected.
+
+**Field mapping:**
+
+| Moco payment field | value |
+|---|---|
+| `purchase_id` | `created["id"]` |
+| `date` | `created["date"]` (the purchase date Moco stored) |
+| `total` | `created["gross_total"]`, falling back to `invoice.total_amount` |
+
+`total` prefers the **create response's** `gross_total` — Moco's own
+server-side figure, recomputed from the line item + VAT code. The open
+balance is measured against it, so an OCR-derived number risks a
+rounding-cent residual. `date` is the purchase date, not today: for a card
+receipt the document date *is* the payment date, and using today would
+mis-date the payment into a later period on a late import.
+
+### 4. Failure posture — best-effort
+
+The created purchase is authoritative; a failed payment must not fail the
+sync. Mirrors `_assign_resolved_project`:
+
+- `HTTPError` → tidy `logger.warning` with status + truncated body (per
+  `feedback_soft_failure_logging`, no traceback), collect a warning string.
+- any other `Exception` → `logger.exception`, collect a warning string.
+- the warning is appended to the existing Telegram outcome message as a line
+  (`⚠️ Zahlung nicht registriert: HTTP 422 …`) — one message per draft stays
+  the rule — and `process()` still returns ok.
+
+### 5. Telegram wording
+
+Auto-release makes the Telegram alert the **only** human touchpoint for
+those purchases, so the message must stop saying "bitte prüfen":
+
+```
+✅ OCR erfolgreich (94%) — Digitec CHF 249.00
+Automatisch freigegeben (Firma + Konto erkannt) → Bexio: <link>
+💳 Zahlung erfasst (bereits per Karte bezahlt)
+```
+
+vs. today's wording, unchanged, when `Review pending` was applied. The
+credit-note and low-confidence branches are untouched.
+
+### 6. Result payload
+
+`process()`'s return dict gains:
 
 ```python
-@app.post("/api/moco-purchase-payment")
-async def moco_purchase_payment_webhook(request: Request) -> dict[str, Any]:
-    return await _handle_moco_dispatch_webhook(
-        request,
-        required_env=REQUIRED_ENV_PURCHASE_PAYMENT,
-        expected_target="Purchase",
-        upstream_label="moco",
-        build_service=lambda cfg, notifier: MocoPurchasePaymentService(
-            purchases=MocoPurchaseClient(
-                subdomain=cfg["MOCO_SUBDOMAIN"],
-                api_key=cfg["MOCO_API_KEY"],
-            ),
-            subdomain=cfg["MOCO_SUBDOMAIN"],
-            telegram=notifier,
-        ),
-    )
+"review_pending": bool      # was the tag applied
+"payment_registered": bool  # did POST /purchases/payments succeed
 ```
 
-`REQUIRED_ENV_PURCHASE_PAYMENT = ["MOCO_WEBHOOK_SECRET", "MOCO_SUBDOMAIN",
-"MOCO_API_KEY", *REQUIRED_ENV_TELEGRAM]` — no new secrets, all four already
-exist in the Vercel project.
+so `scripts/batch_ocr_drafts.py` can show both per draft — useful for
+sanity-checking the auto-release rate against real drafts before this goes
+live.
 
-**Operator step:** a new Moco webhook on `Purchase` / `create`+`update`
-pointing at this path, with `x-moco-target: Purchase`.
+### 7. Idempotency
 
-### 3. Service — `MocoPurchasePaymentService`
+Unchanged from today: a webhook replay re-runs `POST /purchases`, hits
+`receipt_identifier: ["ist bereits vergeben"]` (422), and returns
+`skipped: "moco_rejected"` before reaching the payment step. Receipt-number-
+less drafts would create a duplicate purchase *and* a duplicate payment, but
+the duplicate purchase is the louder problem and already exists today. No
+pre-flight `GET /purchases/payments?purchase_id=…` — it costs a round-trip
+on every card receipt to defend a case that already implies a duplicate
+purchase.
 
-New file `api/moco_purchase_payment_service.py`, one class (per
-`feedback_one_class_per_file`), exposing `sync(body) -> dict` like every other
-dispatch service.
+---
 
-### 4. Gate
+## Risk accepted by auto-release
 
-Register a payment only when **all** hold:
+Stated plainly, because this is the substantive change: a **bank-transfer**
+bill that is auto-released reaches `BexioExpenseSyncService` with no human in
+the loop, and that service does not stop at creating a bill — it books it
+DRAFT→BOOKED and creates an **outgoing payment**. So an OCR error on the
+amount or IBAN of an auto-released transfer bill can queue real money to
+move.
 
-1. `payment_method == "credit_card"` — the marker for "already settled".
-   The OCR flow sets it from `already_paid_by_card`; hand-entered card
-   purchases carry it directly. Deliberately not widened to "no IBAN" or
-   "due date passed": a bill with no IBAN is a MANUAL-transfer bill, not a
-   paid one, and mis-settling an open bill is worse than leaving a settled
-   one open (the operator sees the latter; the former silently disappears
-   from the "was ist offen" view).
-2. `payments == []` — nothing registered yet. This is the idempotency guard.
-3. `"Review pending"` **not** in `tags` — while the OCR result is unreviewed
-   the amount may still change and the operator may want to delete the
-   purchase outright (constraint 2 above). Reuses the same case-insensitive,
-   whitespace-trimmed match as `BexioExpenseSyncService._has_review_pending_tag`;
-   the helper moves to a shared location so both endpoints use one
-   implementation. Hand-entered purchases have no such tag and pass
-   immediately.
-4. `gross_total` is present and `> 0`. Zero is nothing to settle; **negative**
-   means a credit note / refund, where the sign convention for a payment is
-   unverified and no live example exists — skipped deliberately.
+The three conditions in §2 are the mitigation: a unique supplier match, an
+explicitly configured expense account, and the model's own ≥85% confidence.
+Company and category resolution say nothing about the amount — that is
+exactly why the confidence condition is there (D2).
 
-Each failed gate returns a distinct silent skip (`{"skipped": "..."}`, INFO
-log, no Telegram) so Moco ACKs 200 and stops retrying. These fire on most
-`Purchase` webhooks — the endpoint is quiet by design.
+Already-paid card receipts carry none of this risk: the money is already
+gone, and with no IBAN their Bexio bill takes the **MANUAL** branch, which
+skips book + outgoing-payment silently.
 
-### 5. Field mapping
-
-| Moco payment field | value              |
-|--------------------|--------------------|
-| `purchase_id`      | `body["id"]`       |
-| `date`             | `body["date"]`     |
-| `total`            | `body["gross_total"]` |
-
-**`total` uses the webhook's `gross_total`**, i.e. Moco's own server-side
-figure, not an OCR value. Moco recomputes gross from the line item + VAT
-code, and the open balance is `sum(payments)` vs `gross_total`, so any other
-number leaves a rounding-cent residual. Registering after review means this
-is the amount the operator actually approved.
-
-**`date` is the purchase date, not today.** For a card receipt the document
-date *is* the payment date. Using today would mis-date the payment into a
-later accounting period whenever a receipt is imported or reviewed late.
-
-### 6. Failure posture — best-effort
-
-The purchase is the authoritative record; a failed payment registration must
-not break anything:
-
-- `HTTPError` with 4xx → tidy `logger.warning` with status + truncated body
-  (per `feedback_soft_failure_logging` — no traceback), Telegram alert with
-  the Moco purchase deep-link, return `{"skipped": "payment_failed", ...}`
-  so Moco ACKs 200 and doesn't retry.
-- `HTTPError` 5xx / `URLError` → propagate; `_handle_moco_dispatch_webhook`
-  maps them to 502 and Moco retries. Safe to retry: the `payments == []`
-  gate re-evaluates on the retry.
-
-### 7. Result payload
-
-```python
-{"payment_id": int, "purchase_id": int, "total": float}   # registered
-{"skipped": "not_card_payment" | "already_paid" | "review_pending"
-            | "no_amount" | "payment_failed"}
-```
-
-### 8. Idempotency
-
-The `payments == []` gate is the guard, and it is evaluated against the
-webhook body Moco just sent. A webhook replay, a second unrelated
-`Purchase:update` (e.g. the operator edits the title), or a 502 retry all
-re-read `payments` and find the existing row → `{"skipped": "already_paid"}`.
-
-The one true race is two `Purchase:update` webhooks delivered concurrently
-for the same purchase, both observing `payments: []`. Accepted: Moco
-serialises webhook delivery per entity in practice, the operator sees a
-doubled payment immediately in the purchase's balance, and defending against
-it would need a `GET /purchases/payments?purchase_id=…` round-trip on every
-card purchase.
-
-### 9. Telegram
-
-One message on successful registration, so the operator can see settlements
-happening without opening Moco:
-
-```
-💳 Zahlung erfasst — <title> CHF <total>
-Bereits per Karte bezahlt: <purchase link>
-```
-
-Silent on every gate skip (they fire constantly). Alert on registration
-failure only, per §6.
+Suggested rollout: run `scripts/batch_ocr_drafts.py` over recent drafts first
+and read the new `review_pending` column — it shows exactly which historical
+invoices *would* have auto-released, before any of them can.
 
 ---
 
 ## Non-goals
 
-- Payments for bank-transfer purchases. Those are settled by the actual bank
-  transfer, which the Bexio outgoing-payment flow already initiates.
-- Credit notes / refunds (negative `gross_total`) — sign convention unverified.
-- `POST /purchases/payments/bulk`; reconciling, updating, or deleting existing
-  payments.
-- Payments on project expenses (the smart-me and energy-credit-note flows).
-  Those are outgoing revenue; `/purchases/payments` does not apply.
-- Partial payments.
+- Payments for bank-transfer purchases (settled by the actual transfer,
+  which the Bexio outgoing-payment flow already initiates).
+- Credit notes / refunds — sign convention unverified.
+- `POST /purchases/payments/bulk`; updating, reconciling, or deleting
+  existing payments; partial payments.
+- Payments on project expenses (smart-me / energy-credit-note flows) —
+  outgoing revenue, different domain.
+- A post-review payment path. A receipt that goes through review gets its
+  payment at creation like any other (D5).
 
 ---
 
 ## Testing
 
-Service-level (`tests/test_moco_purchase_payment_service.py`) with an
-in-memory `FakeMocoPurchases` + `FakeTelegram`:
+Service-level, existing in-memory fakes in
+`tests/test_supplier_invoice_ocr_service.py`
+(`FakeMocoPurchases` gains a `create_payment` recorder):
 
-1. card purchase, no payments, no review tag → one `create_payment` with
-   `purchase_id` / `date` / `total` from the body; Telegram fired.
-2. `payment_method="bank_transfer"` → `not_card_payment`, no call.
-3. `payments: [{...}]` already present → `already_paid`, no call.
-4. `tags: ["OCR", "Review pending"]` on a card purchase → `review_pending`,
-   no call.
-5. `gross_total` missing / `0` / negative → `no_amount`, no call.
-6. `create_payment` raises `HTTPError(422)` → `payment_failed`, sync returns
-   normally, Telegram alert fired.
-7. tag match is case-insensitive + trimmed (`" review PENDING "`).
+*Payments*
+1. `already_paid_by_card=True` → one `create_payment` with `purchase_id` /
+   `date` / `total` from the create response's `gross_total`.
+2. `already_paid_by_card=False` → no call.
+3. `already_paid_by_card=True` + `is_credit_note=True` → no call.
+4. create response missing `gross_total` → falls back to
+   `invoice.total_amount`.
+5. `create_payment` raises `HTTPError(422)` → sync still ok,
+   `payment_registered` False, Telegram contains "Zahlung nicht registriert".
 
-Endpoint-level (`tests/test_endpoint.py` or a new module), with
-`urlopen` stubbed as elsewhere: signature/target/event rejections behave like
-the sibling endpoints, and a valid card-purchase body returns
-`{"ok": true, "event": "update", "payment_id": ...}`.
+*Review tag*
+6. company + category + confidence 0.95 → tags are `["OCR"]`,
+   `review_pending` False, Telegram says "Automatisch freigegeben".
+7. company resolved, `category_id` None → `Review pending` applied.
+8. category resolved, `company_id` None → `Review pending` applied.
+9. confidence 0.60 with both resolved → `Review pending` applied.
+10. `is_credit_note=True` with everything resolved → `Review pending`
+    applied, Gutschrift alert unchanged.
+11. already-paid receipt whose supplier has no `Aufwandkonto` → category
+    None → `Review pending` applied (guards the 4000-default rule).
+12. already-paid receipt whose supplier *has* an `Aufwandkonto` → category
+    resolved → auto-released **and** payment registered.
 
 Wrapper-level (`tests/test_moco_purchase_client.py`): `create_payment` POSTs
 to `/api/v1/purchases/payments` with the three-field JSON body.
@@ -282,25 +291,26 @@ to `/api/v1/purchases/payments` with the three-field JSON body.
 
 ## Decisions
 
-- **D1 — register after review, not at creation.** `DELETE /purchases/{id}`
-  is refused once a payment exists, so registering at create time would make
-  every OCR'd card receipt undeletable exactly during the review window when
-  binning a bad OCR result is most likely. It would also leave the payment
-  total stale if the operator corrects the amount.
-- **D2 — `payments == []` as the idempotency guard.** Free (already in the
-  webhook body), and correct across replays, retries, and unrelated updates.
-- **D3 — its own endpoint, not a step in bexio-expense-sync.** That handler's
-  early-return skips are unrelated to settling a receipt, and a Bexio outage
-  must not block a Moco-only write.
-- **D4 — fires for any card purchase, not just OCR-created ones.** Matches
-  the intent ("if expenses are created that are already paid"); hand-entered
-  card purchases have the same manual-settlement chore. The `Review pending`
-  gate still protects the OCR path.
-- **D5 — `payment_method == "credit_card"` is the only signal.** Widening it
-  (missing IBAN, past due date) would silently settle genuinely open bills.
-- **D6 — server `gross_total`, not an OCR figure.** The open balance is
+- **D1 — already-paid category via explicit override only, never the 4000
+  default.** Unchanged resolver behaviour, now load-bearing: it stops card
+  receipts from auto-releasing on a guessed booking. Open point above: this
+  spec lets a *project* override qualify alongside a supplier one.
+- **D2 — confidence is part of the auto-release gate.** My addition, not in
+  your proposal. Company and category resolution are orthogonal to whether
+  the amount was read correctly; confidence is the only signal that covers
+  it, and auto-release for transfer bills can move money. **Strike this and
+  the gate is exactly your original rule.**
+- **D3 — payment registered at creation, in the OCR service.** No new
+  endpoint, no new Moco webhook, no new env vars.
+- **D4 — `payment_method == "credit_card"` (via `already_paid_by_card`) is
+  the only settle signal.** Widening it would silently settle open bills.
+- **D5 — accepted cost of registering at creation.** The purchase becomes
+  undeletable (delete the payment first — two clicks), and if a *reviewed*
+  receipt's amount is corrected the payment total goes stale and shows a
+  residual. The alternative — registering only for auto-released purchases —
+  was rejected as a confusing split behaviour that leaves the manual chore
+  in place for exactly the receipts you're already handling by hand.
+- **D6 — server `gross_total`, not the OCR figure.** The open balance is
   computed against it; anything else leaves a residual.
-- **D7 — purchase date, not today.** The receipt's date is the payment date;
-  late review must not drift the payment into the wrong period.
-- **D8 — negative totals excluded.** No live example of a card refund and the
-  payment sign convention is unverified.
+- **D7 — purchase date, not today.** The receipt's date is the payment date.
+- **D8 — negative totals excluded.** No live example of a card refund.
