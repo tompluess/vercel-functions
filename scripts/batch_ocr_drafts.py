@@ -50,6 +50,7 @@ from api.energy_credit_note_service import (
     is_energy_credit_note,
 )
 from api.moco_category_resolver import CategoryDecision, MocoCategoryResolver
+from api.purchase_review_gate import PurchaseReviewGate, ReviewDecision
 from api.moco_invoice_client import MocoInvoiceClient
 from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
@@ -115,6 +116,13 @@ class Row:
     `category` is the pre-formatted KATEGORIE cell (see
     `_format_category_cell`); defaults to "-" for the early-skip rows
     that never reach category resolution.
+
+    `review` is the pre-formatted REVIEW cell (see `_format_review_cell`)
+    showing what `PurchaseReviewGate` would decide — AUTO for a purchase
+    that skips human review, or HOLD plus the failing conditions. This is
+    the pre-flight column: run the script over recent drafts and read it
+    BEFORE enabling auto-release, so the historical hit rate is known
+    rather than discovered.
     """
     draft_id: int
     purchase_id: int | None
@@ -127,6 +135,7 @@ class Row:
     kommission_candidate_count: int
     result: str
     category: str = "-"
+    review: str = "-"
 
 
 def _newest_first(drafts: list[dict]) -> list[dict]:
@@ -180,6 +189,22 @@ def _resolve_vat_code_with_tier(invoice, company: dict | None,
     if account_default is not None:
         return account_default.get("id"), "account default"
     return None, "unresolved — Moco will 422"
+
+
+def _format_review_cell(decision: ReviewDecision) -> str:
+    """Compact REVIEW cell from a ReviewDecision.
+
+    `AUTO` when the purchase would skip human review entirely, otherwise
+    `HOLD (reason, reason)` naming the conditions that held it. Calls the
+    same `PurchaseReviewGate` the webhook service uses, so this preview
+    cannot drift from the real rule — which is the whole point of it.
+    """
+    if not decision.review_pending:
+        return "AUTO"
+    reasons = decision.reason_text()
+    if len(reasons) > REVIEW_MAX_CHARS:
+        reasons = reasons[:REVIEW_MAX_CHARS - 1] + "…"
+    return f"HOLD ({reasons})"
 
 
 def _format_category_cell(decision: CategoryDecision) -> str:
@@ -517,6 +542,16 @@ def _process_draft(draft: dict, *,
           f"({category_decision.reason})")
     category_cell = _format_category_cell(category_decision)
 
+    # --- review gate ------------------------------------------------------
+    # Same collaborator the webhook service uses, on the same inputs, so
+    # the REVIEW column is the real decision rather than a re-implementation.
+    review_decision = PurchaseReviewGate().evaluate(
+        invoice=invoice, company_id=company_id,
+        category=category_decision, project_match=kommission_match)
+    _step(f"review: {'HOLD' if review_decision.review_pending else 'AUTO'}"
+          f"{' — ' + review_decision.reason_text() if review_decision.reasons else ''}")
+    review_cell = _format_review_cell(review_decision)
+
     amount_cell = _format_amount(invoice.currency, invoice.total_amount)
     paid = invoice.already_paid_by_card
 
@@ -525,14 +560,15 @@ def _process_draft(draft: dict, *,
                    paid, kommission_raw, kommission_status,
                    kommission_candidate_count,
                    f"Dry-run OK (would create, confidence={invoice.confidence:.0%})",
-                   category=category_cell)
+                   category=category_cell, review=review_cell)
 
     # --- apply: create + comments + delete draft --------------------------
     payload = _build_create_payload(
         invoice, pdf_bytes, vat_code_id=vat_code_id,
         company_id=company_id, draft_id=draft_id,
         user_id=_user_id_from_draft(draft),
-        category_id=category_decision.category_id)
+        category_id=category_decision.category_id,
+        tags=review_decision.tags)
     try:
         created = purchases.create_purchase(payload)
     except urlerror.HTTPError as e:
@@ -541,14 +577,15 @@ def _process_draft(draft: dict, *,
             return Row(draft_id, None, invoice.supplier_name, matched,
                        amount_cell, paid, kommission_raw, kommission_status,
                        kommission_candidate_count,
-                       f"HTTP {e.code} {e.reason}", category=category_cell)
+                       f"HTTP {e.code} {e.reason}", category=category_cell,
+                       review=review_cell)
         err_body = e.read().decode("utf-8", errors="replace")[:500]
         err_body = err_body.replace("\n", " ")
         _step(f"Moco rejected: {e.code} {err_body}")
         return Row(draft_id, None, invoice.supplier_name, matched, amount_cell,
                    paid, kommission_raw, kommission_status,
                    kommission_candidate_count, f"Moco {e.code}: {err_body}",
-                   category=category_cell)
+                   category=category_cell, review=review_cell)
 
     new_purchase_id = created.get("id")
     if new_purchase_id:
@@ -569,11 +606,12 @@ def _process_draft(draft: dict, *,
                amount_cell, paid, kommission_raw, kommission_status,
                kommission_candidate_count,
                f"Created (confidence={invoice.confidence:.0%})",
-               category=category_cell)
+               category=category_cell, review=review_cell)
 
 
 SUPPLIER_MAX_CHARS = 32   # ample for typical Swiss supplier names, fits 80-col
 KOMMISSION_MAX_CHARS = 28  # raw OCR'd value can run long with "BV-XYZ" prefixes
+REVIEW_MAX_CHARS = 40     # HOLD can name up to four failing conditions
 
 # Upper bound on how many drafts we fetch from Moco before sorting + applying
 # --max N. Fixed (not configurable) because 100 covers the realistic backlog
@@ -582,10 +620,10 @@ DRAFT_FETCH_CAP = 100
 
 
 def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
-    """Aligned seven-column table on stdout.
+    """Aligned eight-column table on stdout.
 
     Columns: DRAFT ID | PURCHASE ID | LIEFERANT | BETRAG | KOMMISSION |
-    KATEGORIE | RESULT.
+    KATEGORIE | REVIEW | RESULT.
     Lieferant gets a leading ✓ when the supplier was uniquely matched in
     Moco's company list; Betrag gets a leading ✓ on already-paid bills;
     Kommission gets a leading ✓ when the OCR'd value resolved to exactly
@@ -595,13 +633,15 @@ def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
     outcome instead (see `_process_energy_credit_note`) — same status
     vocabulary, so the same rendering applies unchanged. Kategorie carries
     the pre-formatted `_format_category_cell`
-    outcome (✓ account (source) / ✗ unmapped account / `- paid`).
+    outcome (✓ account (source) / ✗ unmapped account / `- paid`). Review
+    carries `_format_review_cell` — AUTO when the purchase would skip
+    human review, HOLD (reasons) otherwise.
 
     Truncates Lieferant / Kommission / Result so long values don't blow
     up the layout. Full text stays in the underlying Row objects.
     """
     headers = ("DRAFT ID", "PURCHASE ID", "LIEFERANT", "BETRAG",
-               "KOMMISSION", "KATEGORIE", "RESULT")
+               "KOMMISSION", "KATEGORIE", "REVIEW", "RESULT")
 
     def _supplier_cell(r: Row) -> str:
         if not r.supplier:
@@ -645,6 +685,7 @@ def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
     amount_cells = [_amount_cell(r) for r in rows]
     kommission_cells = [_kommission_cell(r) for r in rows]
     category_cells = [r.category for r in rows]
+    review_cells = [r.review for r in rows]
 
     draft_w = max(len(headers[0]),
                   max((len(str(r.draft_id)) for r in rows), default=0))
@@ -659,6 +700,8 @@ def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
                        max((len(c) for c in kommission_cells), default=0))
     category_w = max(len(headers[5]),
                      max((len(c) for c in category_cells), default=0))
+    review_w = max(len(headers[6]),
+                   max((len(c) for c in review_cells), default=0))
 
     print()
     print(f"{headers[0]:<{draft_w}}  "
@@ -667,14 +710,15 @@ def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
           f"{headers[3]:<{amount_w}}  "
           f"{headers[4]:<{kommission_w}}  "
           f"{headers[5]:<{category_w}}  "
-          f"{headers[6]}")
+          f"{headers[6]:<{review_w}}  "
+          f"{headers[7]}")
     print(f"{'-' * draft_w}  {'-' * purchase_w}  "
           f"{'-' * supplier_w}  {'-' * amount_w}  "
           f"{'-' * kommission_w}  {'-' * category_w}  "
-          f"{'-' * len(headers[6])}")
-    for r, supplier, amount, kommission, category in zip(
+          f"{'-' * review_w}  {'-' * len(headers[7])}")
+    for r, supplier, amount, kommission, category, review in zip(
             rows, supplier_cells, amount_cells, kommission_cells,
-            category_cells):
+            category_cells, review_cells):
         purchase = str(r.purchase_id) if r.purchase_id else "-"
         print(f"{r.draft_id:<{draft_w}}  "
               f"{purchase:<{purchase_w}}  "
@@ -682,6 +726,7 @@ def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
               f"{amount:<{amount_w}}  "
               f"{kommission:<{kommission_w}}  "
               f"{category:<{category_w}}  "
+              f"{review:<{review_w}}  "
               f"{_trim(r.result)}")
 
     created = sum(1 for r in rows if r.purchase_id is not None)
@@ -693,11 +738,13 @@ def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
     paid = sum(1 for r in rows if r.already_paid)
     kommission_matched = sum(1 for r in rows
                              if r.kommission_status == "matched")
+    auto_released = sum(1 for r in rows if r.review == "AUTO")
     print()
     print(f"Total: {len(rows)}   created: {created}   "
           f"dry-run: {dry}   skipped: {skipped}   failed: {failed}   "
           f"supplier-matched: {matched}   already-paid: {paid}   "
-          f"kommission-matched: {kommission_matched}")
+          f"kommission-matched: {kommission_matched}   "
+          f"auto-release: {auto_released}")
 
 
 def main() -> int:

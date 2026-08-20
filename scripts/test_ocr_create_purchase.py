@@ -3,7 +3,8 @@
 
 Drafts can't be patched via the API, so the production flow is:
   draft → download PDF → OCR → POST /purchases (with base64 attachment,
-  tags ["OCR", "Review pending"], optional company_id from supplier lookup)
+  tags from PurchaseReviewGate — ["OCR", "Review pending"] or
+  ["OCR", "Auto"] — optional company_id from supplier lookup)
   → comment on the new purchase with OCR summary.
 
 This script drives that exact pipeline against a real draft id. Two modes:
@@ -52,6 +53,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from api.anthropic_ocr_client import AnthropicOcrClient, AnthropicOcrError
 from api.moco_category_resolver import MocoCategoryResolver
+from api.purchase_review_gate import PurchaseReviewGate
 from api.moco_project_resolver import MocoProjectResolver
 from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_client import MocoClient
@@ -370,6 +372,16 @@ def main() -> int:
     print(f"  category_id={category_decision.category_id} "
           f"({category_decision.reason})")
 
+    # 6b. review gate — same collaborator the webhook service uses, so the
+    # tags printed below are the ones a real run would actually POST.
+    review_decision = PurchaseReviewGate().evaluate(
+        invoice=invoice, company_id=company_id,
+        category=category_decision, project_match=kommission_match)
+    if review_decision.review_pending:
+        print(f"  review: HOLD — {review_decision.reason_text()}")
+    else:
+        print("  review: AUTO (freigegeben, kein 'Review pending'-Tag)")
+
     # 7. show what would be POSTed
     payload = _build_create_payload(
         invoice, pdf_bytes,
@@ -378,6 +390,7 @@ def main() -> int:
         draft_id=args.draft_id,
         user_id=_user_id_from_draft(draft),
         category_id=category_decision.category_id,
+        tags=review_decision.tags,
     )
     email_comment = _format_email_source_comment(
         email_from=draft.get("email_from"),

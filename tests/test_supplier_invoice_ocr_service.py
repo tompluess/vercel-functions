@@ -3,6 +3,7 @@ supplier lookup branches, comment text, and confidence-routed Telegram
 alerts. In-memory fakes for all collaborators."""
 
 import base64
+import io
 from urllib import error as urlerror
 
 import pytest
@@ -10,9 +11,9 @@ import pytest
 from api.anthropic_ocr_client import AnthropicOcrError, InvoiceData
 from api.moco_category_resolver import MocoCategoryResolver
 from api.moco_project_resolver import MocoProjectResolver
+from api.purchase_review_gate import OCR_TAG, REVIEW_PENDING_TAG
 from api.supplier_invoice_ocr_service import (
     CONFIDENCE_THRESHOLD,
-    OCR_TAGS,
     SupplierInvoiceOcrService,
 )
 
@@ -106,6 +107,14 @@ class FakePurchaseClient:
             {"id": 13, "tax": 0.0, "code": "0", "active": True},
         ]
         self.vat_codes_error: Exception | None = None
+        # Each entry: kwargs passed to create_payment.
+        self.payments: list[dict] = []
+        self.payment_error: Exception | None = None
+        self.next_payment_id: int = 90001
+        # When set, the create response carries this `gross_total`, the way
+        # Moco recomputes it from the line item + VAT code. Left None by
+        # default so the OCR-total fallback is what most tests exercise.
+        self.create_gross_total: float | None = None
 
     def list_vat_codes(self) -> list[dict]:
         if self.vat_codes_error:
@@ -126,7 +135,20 @@ class FakePurchaseClient:
             self.next_item_id += 1
             echoed_items.append(echoed)
         echo = {**payload, "items": echoed_items}
-        return {"id": self.next_create_id, **echo}
+        created = {"id": self.next_create_id, **echo}
+        if self.create_gross_total is not None:
+            created["gross_total"] = self.create_gross_total
+        return created
+
+    def create_payment(self, *, purchase_id: int, date: str,
+                       total: float) -> dict:
+        if self.payment_error:
+            raise self.payment_error
+        self.payments.append({"purchase_id": purchase_id, "date": date,
+                              "total": total})
+        payment_id = self.next_payment_id
+        self.next_payment_id += 1
+        return {"id": payment_id}
 
     def delete_purchase_draft(self, draft_id: int) -> None:
         if self.delete_draft_error:
@@ -366,7 +388,7 @@ def test_process_happy_path_creates_purchase_with_full_payload():
     # QR-reference + IBAN present → Swiss QR-bill payment method.
     assert payload["payment_method"] == "bank_transfer_swiss_qr_esr"
     # Tags mark this as an OCR-imported purchase for the human reviewer.
-    assert payload["tags"] == OCR_TAGS
+    assert payload["tags"] == [OCR_TAG, REVIEW_PENDING_TAG]
     # Single line item with gross total, tax_included, and the vat code
     # resolved by matching OCR's vat_rate=0.081 to FakePurchaseClient's
     # default vat_codes list (id=11, value=8.1).
@@ -2048,3 +2070,218 @@ def test_non_smartme_draft_never_touches_smartme_service():
                          "file_url": "https://x/y.pdf"})
     assert smartme.processed == []
     assert len(purchases.creates) == 1
+
+
+# --- payment registration for already-paid receipts -------------------------
+#
+# See specs/SPEC_purchase_payment_already_paid.md. Card / TWINT / POS receipts
+# arrive with the money already gone, so the created purchase is settled
+# immediately via POST /purchases/payments rather than left showing an open
+# balance for the operator to clear by hand.
+
+
+def test_already_paid_receipt_registers_a_payment():
+    purchases = FakePurchaseClient()
+    # Moco recomputes gross from the line item + VAT code; the payment must
+    # use that figure, not the OCR'd one, or the balance keeps a residual.
+    purchases.create_gross_total = 249.05
+    ocr = FakeOcr(result=make_invoice(already_paid_by_card=True,
+                                      total_amount=249.0,
+                                      invoice_date="2026-08-01"))
+    s = build_service(purchases=purchases, ocr=ocr)
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.payments == [{
+        "purchase_id": 4001234,
+        "date": "2026-08-01",   # the purchase date, NOT today
+        "total": 249.05,        # server gross_total, NOT the OCR 249.0
+    }]
+    assert result["payment_registered"] is True
+
+
+def test_payment_total_falls_back_to_ocr_amount_without_gross_total():
+    purchases = FakePurchaseClient()  # create_gross_total stays None
+    ocr = FakeOcr(result=make_invoice(already_paid_by_card=True,
+                                      total_amount=88.50))
+    s = build_service(purchases=purchases, ocr=ocr)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.payments[0]["total"] == 88.50
+
+
+def test_unpaid_bill_registers_no_payment():
+    """An open bill is settled by the actual bank transfer later. Claiming
+    otherwise would hide it from Moco's "was ist offen" view."""
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(already_paid_by_card=False))
+    s = build_service(purchases=purchases, ocr=ocr)
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.payments == []
+    assert result["payment_registered"] is False
+
+
+def test_already_paid_credit_note_registers_no_payment():
+    """A card refund is conceivable but the payment sign convention is
+    unverified and we have no live example — deliberately skipped (D8)."""
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(already_paid_by_card=True,
+                                      is_credit_note=True))
+    s = build_service(purchases=purchases, ocr=ocr)
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.payments == []
+    assert result["payment_registered"] is False
+
+
+def test_payment_skipped_without_a_positive_amount():
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(already_paid_by_card=True,
+                                      total_amount=None))
+    s = build_service(purchases=purchases, ocr=ocr)
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.payments == []
+    assert result["payment_registered"] is False
+
+
+def test_payment_failure_is_soft_and_reported_on_telegram():
+    """The purchase is the authoritative side effect — a failed payment
+    warns and moves on rather than failing the sync."""
+    purchases = FakePurchaseClient()
+    purchases.payment_error = urlerror.HTTPError(
+        "u", 422, "Unprocessable", {}, io.BytesIO(b'{"total":["ungueltig"]}'))
+    telegram = FakeTelegram()
+    ocr = FakeOcr(result=make_invoice(already_paid_by_card=True))
+    s = build_service(purchases=purchases, ocr=ocr, telegram=telegram)
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert result["purchase_id"] == 4001234       # create still succeeded
+    assert result["payment_registered"] is False
+    assert "skipped" not in result
+    assert purchases.deleted_drafts == [1]        # draft cleanup still ran
+    assert any("Zahlung nicht registriert" in m for m in telegram.messages)
+
+
+def test_successful_payment_is_mentioned_on_telegram():
+    purchases = FakePurchaseClient()
+    telegram = FakeTelegram()
+    ocr = FakeOcr(result=make_invoice(already_paid_by_card=True))
+    s = build_service(purchases=purchases, ocr=ocr, telegram=telegram)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert any("Zahlung erfasst" in m for m in telegram.messages)
+
+
+# --- review gate wiring -----------------------------------------------------
+
+
+def test_resolved_purchase_is_auto_released():
+    """Company matched + trusted category + confidence >= 0.90 → no review."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "Digitec Galaxus AG"}]
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(supplier_name="Digitec Galaxus AG",
+                                      confidence=0.94))
+    s = build_service(moco=moco, purchases=purchases, ocr=ocr,
+                      category_resolver=_category_resolver())
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.creates[0]["tags"] == ["OCR", "Auto"]
+    assert result["review_pending"] is False
+    assert result["review_reasons"] == []
+
+
+def test_confidence_below_auto_release_bar_still_holds_for_review():
+    """0.88 clears the 0.85 Telegram threshold but not the 0.90 auto-release
+    bar — the regression test for those two constants being separate (D10)."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "Digitec Galaxus AG"}]
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(supplier_name="Digitec Galaxus AG",
+                                      confidence=0.88))
+    s = build_service(moco=moco, purchases=purchases, ocr=ocr,
+                      category_resolver=_category_resolver())
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.creates[0]["tags"] == ["OCR", "Review pending"]
+    assert result["review_pending"] is True
+    assert result["review_reasons"] == ["Konfidenz 88% (< 90%)"]
+
+
+def test_unmatched_company_holds_for_review():
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(confidence=0.99))
+    s = build_service(purchases=purchases, ocr=ocr,
+                      category_resolver=_category_resolver())
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.creates[0]["tags"] == ["OCR", "Review pending"]
+    assert result["review_reasons"] == ["keine Firma zugeordnet"]
+
+
+def test_already_paid_receipt_without_aufwandkonto_holds_but_still_pays():
+    """The load-bearing card-receipt case: MocoCategoryResolver short-circuits
+    at already_paid before the 4000 default, so a card receipt with no
+    explicit Aufwandkonto has no category and is held. The payment is
+    registered anyway — it does not depend on the review decision (D5)."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "Digitec Galaxus AG"}]
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(supplier_name="Digitec Galaxus AG",
+                                      already_paid_by_card=True,
+                                      confidence=0.99))
+    s = build_service(moco=moco, purchases=purchases, ocr=ocr,
+                      category_resolver=_category_resolver())
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert "category_id" not in purchases.creates[0]["items"][0]
+    assert result["review_pending"] is True
+    assert result["review_reasons"] == ["kein Aufwandkonto"]
+    assert result["payment_registered"] is True
+
+
+def test_already_paid_receipt_with_supplier_aufwandkonto_auto_releases():
+    """The operator's opt-in lever: an Aufwandkonto on the supplier company
+    gives a card receipt a trusted category, so it auto-releases and settles."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "Digitec Galaxus AG"}]
+    moco.companies = {555: {"id": 555, "name": "Digitec Galaxus AG",
+                            "custom_properties": {"Aufwandkonto": "4500"}}}
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(supplier_name="Digitec Galaxus AG",
+                                      already_paid_by_card=True,
+                                      confidence=0.99))
+    s = build_service(moco=moco, purchases=purchases, ocr=ocr,
+                      category_resolver=_category_resolver())
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.creates[0]["items"][0]["category_id"] == 18
+    assert purchases.creates[0]["tags"] == ["OCR", "Auto"]
+    assert result["review_pending"] is False
+    assert result["payment_registered"] is True
+
+
+def test_credit_note_keeps_gutschrift_tag_and_is_held():
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(is_credit_note=True, confidence=0.99))
+    s = build_service(purchases=purchases, ocr=ocr,
+                      category_resolver=_category_resolver())
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.creates[0]["tags"] == ["OCR", "Review pending",
+                                            "Gutschrift"]
+    assert result["review_pending"] is True

@@ -66,11 +66,18 @@ from api.energy_credit_note_service import (
     EnergyCreditNoteService,
     is_energy_credit_note,
 )
-from api.moco_category_resolver import MocoCategoryResolver
+from api.moco_category_resolver import CategoryDecision, MocoCategoryResolver
 from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_client import MocoClient
 from api.moco_supplier_matcher import MocoSupplierMatcher
+from api.purchase_review_gate import (
+    CREDIT_NOTE_TAG,
+    OCR_TAG,
+    REVIEW_PENDING_TAG,
+    PurchaseReviewGate,
+    ReviewDecision,
+)
 from api.smartme_energy_expense_service import (
     SmartmeEnergyExpenseService,
     is_smartme_draft,
@@ -79,8 +86,11 @@ from api.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger("supplier_invoice_ocr_service")
 
+# Picks the Telegram emoji only. The auto-release gate has its own,
+# stricter bar (`purchase_review_gate.AUTO_RELEASE_CONFIDENCE`) so tuning
+# alert noise can't silently retune a gate that lets purchases reach Bexio
+# unreviewed.
 CONFIDENCE_THRESHOLD = 0.85
-OCR_TAGS = ["OCR", "Review pending"]
 
 # Attachment-less drafts whose subject contains one of these are
 # notification emails misrouted into the invoice inbox (e.g. a bank's
@@ -97,6 +107,7 @@ class SupplierInvoiceOcrService:
                  telegram: TelegramNotifier | None = None,
                  project_resolver: MocoProjectResolver | None = None,
                  category_resolver: MocoCategoryResolver | None = None,
+                 review_gate: PurchaseReviewGate | None = None,
                  smartme: SmartmeEnergyExpenseService | None = None,
                  energy_credit_note: EnergyCreditNoteService | None = None):
         self._moco = moco
@@ -126,6 +137,12 @@ class SupplierInvoiceOcrService:
         # already-paid omit → 4000 fallback). Same optional-collaborator
         # pattern.
         self._category_resolver = category_resolver
+        # Decides `Review pending` vs `Auto` on the created purchase.
+        # Defaults to a stock gate rather than None: omitting it must not
+        # silently auto-release everything, and the stock gate holds
+        # anything it can't vouch for (no resolver wired → no trusted
+        # category → held), which is the pre-existing behaviour.
+        self._review_gate = review_gate or PurchaseReviewGate()
 
     def process(self, event: str, body: dict) -> dict[str, Any]:
         """Drive one Purchase webhook through OCR + new-purchase creation.
@@ -250,8 +267,13 @@ class SupplierInvoiceOcrService:
             # post-create `assign_to_project` loop so we don't resolve
             # twice.
             project_match = self._resolve_project_match(invoice)
-            category_id = self._resolve_category_id(invoice, project_match,
-                                                    company)
+            category = self._resolve_category(invoice, project_match, company)
+            review = self._review_gate.evaluate(
+                invoice=invoice,
+                company_id=company_id,
+                category=category,
+                project_match=project_match,
+            )
 
             payload = _build_create_payload(
                 invoice, pdf_bytes,
@@ -259,7 +281,8 @@ class SupplierInvoiceOcrService:
                 company_id=company_id,
                 draft_id=draft_id,
                 user_id=_user_id_from_draft(body),
-                category_id=category_id,
+                category_id=category.category_id if category else None,
+                tags=review.tags,
             )
             created = self._purchases.create_purchase(payload)
         except urlerror.HTTPError as e:
@@ -299,11 +322,15 @@ class SupplierInvoiceOcrService:
                     new_purchase_id, draft_id)
 
         assign_warnings: list[str] = []
+        payment_registered = False
+        payment_warning: str | None = None
         if new_purchase_id:
             self._post_summary_comments(new_purchase_id, invoice,
                                         draft_id, body)
             assign_warnings = self._assign_resolved_project(
                 created, project_match)
+            payment_registered, payment_warning = self._register_payment(
+                created, invoice)
             self._delete_draft_after_create(draft_id, new_purchase_id)
 
         # If we got this far without returning from the energy-credit-note
@@ -315,7 +342,10 @@ class SupplierInvoiceOcrService:
         checked_energy_credit_note = self._energy_credit_note is not None
         self._notify_outcome(new_purchase_id, draft_id, invoice,
                              assign_warnings,
-                             checked_energy_credit_note=checked_energy_credit_note)
+                             checked_energy_credit_note=checked_energy_credit_note,
+                             review=review,
+                             payment_registered=payment_registered,
+                             payment_warning=payment_warning)
 
         assigned_project = (project_match.project
                             if project_match and project_match.status == "matched"
@@ -330,6 +360,9 @@ class SupplierInvoiceOcrService:
             "total_amount": invoice.total_amount,
             "currency": invoice.currency,
             "already_paid_by_card": invoice.already_paid_by_card,
+            "review_pending": review.review_pending,
+            "review_reasons": review.reasons,
+            "payment_registered": payment_registered,
             "assigned_project_id": (assigned_project.get("id")
                                     if assigned_project else None),
             "assigned_project_name": (assigned_project.get("name")
@@ -507,18 +540,21 @@ class SupplierInvoiceOcrService:
             return None
         return self._project_resolver.resolve(invoice.commission)
 
-    def _resolve_category_id(self, invoice: InvoiceData,
-                              project_match: ProjectMatch | None,
-                              supplier_company: dict | None
-                              ) -> int | None:
-        """Decide which `category_id` to set on the purchase's line item.
+    def _resolve_category(self, invoice: InvoiceData,
+                          project_match: ProjectMatch | None,
+                          supplier_company: dict | None
+                          ) -> CategoryDecision | None:
+        """Decide which category goes on the purchase's line item.
 
-        Returns None whenever the caller should OMIT `category_id` from
-        the payload (already-paid bill without an override, override
-        miss, no 4000-fallback, or no resolver wired). The category
-        resolver owns the chain (project Aufwandkonto → supplier
-        Aufwandkonto → already-paid omit → 4000); this method just
-        bridges to it.
+        Returns the resolver's full `CategoryDecision` rather than a bare
+        id, because `PurchaseReviewGate` trusts a category by its
+        `.source` (supplier / project / default / already_paid), not
+        merely by the id being set. `.category_id` is None whenever the
+        caller should OMIT the field from the payload (already-paid bill
+        without an override, override miss, no 4000-fallback).
+
+        None (no decision at all) when no resolver is wired — the gate
+        treats that as untrusted and holds the purchase for review.
         """
         if self._category_resolver is None:
             return None
@@ -531,7 +567,7 @@ class SupplierInvoiceOcrService:
             supplier=supplier_company)
         logger.info("ocr: category_id=%s (%s)",
                     decision.category_id, decision.reason)
-        return decision.category_id
+        return decision
 
     # --- project assignment -------------------------------------------------
 
@@ -597,12 +633,89 @@ class SupplierInvoiceOcrService:
                 warnings.append(f"Item {item_id}: {e}")
         return warnings
 
+    # --- payment registration -----------------------------------------------
+
+    def _register_payment(self, created: dict,
+                          invoice: InvoiceData) -> tuple[bool, str | None]:
+        """Settle a purchase the document says was already paid.
+
+        Card / TWINT / POS receipts arrive with the money already gone, but
+        the created purchase would still show an open balance in Moco until
+        someone registers a payment by hand. This does that automatically.
+
+        Returns `(registered, warning)`. Best-effort, mirroring
+        `_assign_resolved_project`: the purchase is the authoritative side
+        effect, so any failure logs, hands back a short warning string for
+        the Telegram alert, and leaves the sync reporting ok.
+
+        Skipped when:
+          - the bill wasn't already settled (`already_paid_by_card` false) —
+            an open bill is settled by the actual bank transfer later, and
+            claiming otherwise would hide it from "was ist offen";
+          - it's a credit note — a card refund is conceivable but the
+            payment sign convention is unverified and we have no live
+            example;
+          - no positive amount is resolvable.
+
+        `total` prefers Moco's own `gross_total` from the create response
+        over the OCR'd figure: Moco recomputes gross from the line item and
+        VAT code, and the open balance is measured against that number, so
+        anything else can leave a rounding-cent residual. `date` is the
+        purchase date rather than today — for a receipt the document date
+        *is* the payment date, and using today would mis-date the payment
+        into a later period whenever a receipt is imported late.
+        """
+        if not invoice.already_paid_by_card:
+            return False, None
+        if invoice.is_credit_note:
+            logger.info("ocr: skipping payment for credit note purchase=%s",
+                        created.get("id"))
+            return False, None
+
+        purchase_id = created.get("id")
+        total = created.get("gross_total")
+        if total is None:
+            total = invoice.total_amount
+        if total is None or total <= 0:
+            logger.warning("ocr: already-paid purchase=%s has no positive "
+                           "amount (gross_total=%r, ocr total=%r) — "
+                           "skipping payment", purchase_id,
+                           created.get("gross_total"), invoice.total_amount)
+            return False, "kein Betrag für Zahlung"
+
+        date = created.get("date") or _today()
+        try:
+            payment = self._purchases.create_payment(
+                purchase_id=purchase_id, date=date, total=total)
+        except urlerror.HTTPError as e:
+            err_body = "<unreadable>"
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")[:200]
+            except Exception:
+                pass
+            logger.warning("ocr: create_payment failed for purchase=%s: "
+                           "HTTP %s %s", purchase_id, e.code, err_body)
+            return False, f"HTTP {e.code} {err_body}"
+        except Exception as e:
+            logger.exception("ocr: create_payment error for purchase=%s",
+                             purchase_id)
+            return False, str(e)
+
+        logger.info("ocr: registered payment id=%s on purchase=%s "
+                    "date=%s total=%s",
+                    payment.get("id") if isinstance(payment, dict) else None,
+                    purchase_id, date, total)
+        return True, None
+
     # --- telegram routing ---------------------------------------------------
 
     def _notify_outcome(self, purchase_id: int | None, draft_id: int,
                         invoice: InvoiceData,
                         assign_warnings: list[str] | None = None,
-                        checked_energy_credit_note: bool = False) -> None:
+                        checked_energy_credit_note: bool = False,
+                        review: ReviewDecision | None = None,
+                        payment_registered: bool = False,
+                        payment_warning: str | None = None) -> None:
         if not self._telegram:
             return
         link = (self._purchase_url(purchase_id) if purchase_id
@@ -619,6 +732,12 @@ class SupplierInvoiceOcrService:
             suffix = ("\n⚠️ Projektzuweisung teilweise fehlgeschlagen "
                       f"({len(assign_warnings)}): "
                       + "; ".join(assign_warnings[:3]))
+        # Payment state rides on the same message rather than a second one:
+        # one Telegram per draft stays the rule.
+        if payment_registered:
+            suffix += "\n💳 Zahlung erfasst (bereits bezahlt)"
+        elif payment_warning:
+            suffix += f"\n⚠️ Zahlung nicht registriert: {payment_warning}"
         if invoice.is_credit_note:
             # Gutschrift always triggers the alert regardless of confidence:
             # the reviewer must flip the sign on the total before approving.
@@ -647,12 +766,24 @@ class SupplierInvoiceOcrService:
                 f"{suffix}{hint}"
             )
             return
-        if invoice.confidence >= CONFIDENCE_THRESHOLD:
+        if review is not None and not review.review_pending:
+            # Auto-released: nobody is going to open this in Moco, so this
+            # message is the only human touchpoint. Say so explicitly
+            # instead of the "bitte prüfen" that no longer applies.
+            self._telegram.notify(
+                f"✅ OCR erfolgreich ({invoice.confidence:.0%}) — "
+                f"{supplier} {amount}\n"
+                f"Automatisch freigegeben (Firma + Konto erkannt): {link}"
+                f"{suffix}"
+            )
+        elif invoice.confidence >= CONFIDENCE_THRESHOLD:
+            held = (f"\nZur Prüfung zurückgehalten: {review.reason_text()}"
+                    if review and review.reasons else "")
             self._telegram.notify(
                 f"✅ OCR erfolgreich ({invoice.confidence:.0%}) — "
                 f"{supplier} {amount}\n"
                 f"Moco-Purchase erstellt, bitte prüfen: {link}"
-                f"{suffix}"
+                f"{suffix}{held}"
             )
         else:
             self._telegram.notify(
@@ -840,7 +971,8 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
                           company_id: int | None,
                           draft_id: int,
                           user_id: int | None = None,
-                          category_id: int | None = None) -> dict[str, Any]:
+                          category_id: int | None = None,
+                          tags: list[str] | None = None) -> dict[str, Any]:
     """Construct the POST /purchases body.
 
     Moco requires: `date`, `currency`, `payment_method`, and `items` with
@@ -884,13 +1016,15 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
     payment_method = _payment_method_for(invoice)
     reference_value, info_value = _resolve_reference_and_info(
         invoice, payment_method)
-    # "Gutschrift" alongside the standard OCR markers when the model
-    # identified a credit note — easy to filter in Moco's UI and a
-    # second visual cue for the reviewer (on top of the negative total
-    # and the comment warning).
-    tags = list(OCR_TAGS)
-    if invoice.is_credit_note:
-        tags.append("Gutschrift")
+    # Tags are decided by `PurchaseReviewGate` (OCR + Review pending/Auto,
+    # plus Gutschrift on a credit note) and passed in finished, so tag
+    # policy lives in one place. The fallback keeps this builder usable
+    # standalone — e.g. from the operator scripts — and matches the
+    # pre-gate behaviour of holding everything for review.
+    if tags is None:
+        tags = [OCR_TAG, REVIEW_PENDING_TAG]
+        if invoice.is_credit_note:
+            tags.append(CREDIT_NOTE_TAG)
     payload: dict[str, Any] = {
         "date": invoice.invoice_date or _today(),
         "currency": invoice.currency or "CHF",
