@@ -837,6 +837,47 @@ def test_non_energy_credit_note_falls_through_to_generic_purchase_path():
     assert len(purchases.creates) == 1
 
 
+def test_flipped_consumption_dominant_invoice_falls_through_to_purchase():
+    """Real-world regression (purchase 3734115, CKW vZEV Krugel 1
+    Oberkirch, period 2025/11-12): when the consumption/Rechnungsbetrag
+    (net CHF 1'696.74) exceeds the production Gutschrift (net CHF 39.17),
+    CKW's own document flips from "Ihre Gutschrift" to "Ihre
+    Stromrechnung" — a genuine payable, not PVcontracting's own outgoing
+    revenue. Live-tested `AnthropicOcrClient.extract` against the real PDF
+    and confirmed it correctly returns `is_credit_note=False` (not fooled
+    by the word "Gutschrift" appearing in the invoice's own netting
+    breakdown) with `total_amount=1791.85`, `commission='vZEV Krugel 1
+    Oberkirch'` — the exact field values reproduced here.
+
+    Both `is_energy_credit_note()` and its EVU-tag/project-match OR
+    fallback hard-require `invoice.is_credit_note == True` with no rescue
+    path — so this must fall straight through to the generic
+    OCR->Purchase pipeline, exactly like the real purchase was booked
+    historically (as a plain Purchase, not via this feature), EVEN
+    THOUGH the supplier is EVU-tagged and a matching Stromproduktion
+    project exists (`has_matching_project_result=True` proves the
+    fallback is never even consulted)."""
+    moco = DispatchFakeMoco()
+    moco.suppliers = [COMPANY]
+    moco.companies = {COMPANY["id"]: COMPANY}
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(
+        supplier_name="CKW AG (Lieferant)",
+        is_credit_note=False,
+        total_amount=1791.85,
+        commission="vZEV Krugel 1 Oberkirch"))
+    ecn = FakeEnergyCreditNoteService(has_matching_project_result=True)
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn)
+
+    s.process("create", DRAFT_BODY)
+
+    assert ecn.calls == []
+    assert ecn.has_matching_project_calls == []
+    assert len(purchases.creates) == 1
+
+
 def test_energy_credit_note_without_service_falls_through():
     """energy_credit_note=None (default) — legacy behavior on the same body."""
     moco = DispatchFakeMoco()
