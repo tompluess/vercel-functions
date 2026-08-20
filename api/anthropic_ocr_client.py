@@ -121,27 +121,36 @@ class EnergyCreditNoteData:
 
     These documents often combine a small consumption invoice
     ("Energiebezug"/"Rechnung") with a much larger production credit
-    ("Rücklieferung"/"Gutschrift") in the SAME PDF, each with its own
-    Objekt / Nettobetrag / Abrechnungszeitraum. Every field here refers
-    to the credit/production section ONLY — the consumption section is
-    irrelevant to this schema and must not leak into these values. Every
-    field except `confidence` is None when not found.
+    ("Rücklieferung"/"Gutschrift") in the SAME PDF. The bookable amount is
+    the document's TOP-LEVEL gross total (e.g. "Ihre Gutschrift" /
+    "Gutschriftsbetrag (inkl. MWST)") — it already nets the two sections
+    together and is the actual amount that moves; a subsection's own
+    Nettobetrag would overstate or understate the credit (see
+    `specs/SPEC_energy_credit_note.md`, decision D6). `objekt` is the
+    exception: it still comes from the production/credit section
+    specifically, since that's what identifies the site for project
+    matching. Every field except `confidence` is None when not found.
     """
 
     # The Objekt line from the Rücklieferung/Gutschrift section
     # specifically (e.g. "Produktion PVA HEIV Meierhofweg 10") — NOT the
     # Objekt of a same-document consumption/Eigenbedarf section, which
-    # can differ within the same PDF.
+    # can differ within the same PDF. Extracting Objekt from the top-level
+    # summary instead is not reliable across EVUs, unlike the amount.
     objekt: str | None
-    # Nettobetrag of the credit section only, CHF. Always normalized to a
-    # POSITIVE magnitude (the amount owed TO PVcontracting) regardless of
-    # how the source EVU prints the sign — confirmed live that some
-    # suppliers (EGBB) frame their entire statement as a negative
-    # payout/deduction figure (e.g. "Elektrizität Rücklieferung -908.25")
-    # while others (CKW) print it as a plain positive total. See
-    # `_to_energy_credit_note_data`.
-    net_amount: float | None
-    vat_rate: float | None      # decimal, e.g. 0.081
+    # The document's TOP-LEVEL Gutschriftsbetrag (inkl. MWST) — e.g. "Ihre
+    # Gutschrift CHF 3'785.65" — NOT the production section's own
+    # Nettobetrag. Always normalized to a POSITIVE magnitude (the amount
+    # owed TO PVcontracting) regardless of how the source EVU prints the
+    # sign — confirmed live that some suppliers (EGBB) frame their entire
+    # statement as a negative payout/deduction figure (e.g. "Elektrizität
+    # Rücklieferung -908.25") while others (CKW) print it as a plain
+    # positive total. See `_to_energy_credit_note_data`. The bookable
+    # ex-VAT amount is DERIVED from this, not OCR'd — see
+    # `_derive_net_amount` in `energy_credit_note_service.py`:
+    # `net_amount = gross_amount / (1 + vat_rate)`.
+    gross_amount: float | None
+    vat_rate: float | None      # decimal, e.g. 0.081 — also drives the net-amount derivation above
     period_from: str | None     # Abrechnungszeitraum start of that section, ISO 8601
     period_to: str | None       # Abrechnungszeitraum end of that section, ISO 8601
     invoice_date: str | None    # Rechnungsdatum, ISO 8601
@@ -299,12 +308,19 @@ ENERGY_CREDIT_NOTE_SYSTEM_PROMPT = (
     "TWO sections in the same PDF — a small consumption invoice (labeled "
     "'Energiebezug' / 'Rechnung' / 'Eigenbedarf') and a separate, usually "
     "much larger, production credit note (labeled 'Rücklieferung' / "
-    "'Gutschrift' / 'Einspeisung' / 'Produktion'). You must extract data "
-    "from the PRODUCTION CREDIT section ONLY — ignore the consumption "
-    "section's own Objekt, Nettobetrag and Abrechnungszeitraum entirely, "
-    "even if they appear first or in a top-level summary. Do NOT use a "
-    "combined/netted total that mixes both sections. Respond ONLY with a "
-    "JSON object — no preamble, no markdown fences.\n\n"
+    "'Gutschrift' / 'Einspeisung' / 'Produktion'). The two fields below "
+    "come from DIFFERENT places in the document — read this carefully:\n"
+    "  - The bookable AMOUNT (`gross_amount`) is the document's TOP-LEVEL "
+    "summary total (e.g. 'Ihre Gutschrift' / 'Gutschriftsbetrag (inkl. "
+    "MWST)'), which already nets the consumption section against the "
+    "production section. Do NOT use either subsection's own Nettobetrag "
+    "for this field — the top-level summary is correct here.\n"
+    "  - The `objekt` field, in contrast, MUST come from the production/"
+    "credit section specifically (labeled 'Rücklieferung' / 'Gutschrift' / "
+    "'Einspeisung' / 'Produktion') — ignore the consumption section's own "
+    "Objekt for this field, even if a top-level summary shows a different "
+    "one.\n"
+    "Respond ONLY with a JSON object — no preamble, no markdown fences.\n\n"
     "Required fields (null if not found):\n"
     "{\n"
     '  "objekt": "string — the Objekt line VERBATIM from the '
@@ -312,17 +328,18 @@ ENERGY_CREDIT_NOTE_SYSTEM_PROMPT = (
     '\\"Produktion PVA HEIV Meierhofweg 10\\"). If the document also '
     'shows a different Objekt for an Eigenbedarf/consumption section, '
     'do NOT use that one.",\n'
-    '  "net_amount": "number — the Nettobetrag in CHF of the '
-    'Rücklieferung/Gutschrift/production section only (EXCLUDING '
-    'Mehrwertsteuer) — NOT the combined/top-level Gutschriftsbetrag that '
-    'nets the consumption invoice against the production credit. ALWAYS '
-    'return a POSITIVE number (the amount owed TO PVcontracting for the '
-    'production credit), even if the source document prints every figure '
-    'as negative because it frames the whole statement as a payout/refund '
-    '(e.g. \\"Elektrizität Rücklieferung -908.25\\" on an EGBB-style '
-    'statement) — use the absolute value.",\n'
-    '  "vat_rate": "number — VAT rate of that section as a decimal '
-    '(e.g. 0.081) or null",\n'
+    '  "gross_amount": "number — the document\'s TOP-LEVEL gross credit '
+    'total in CHF, INCLUDING Mehrwertsteuer (e.g. the \\"Ihre Gutschrift\\" '
+    '/ \\"Gutschriftsbetrag (inkl. MWST)\\" summary figure) — this is the '
+    'actual net amount transferred, already netting the consumption '
+    'invoice against the production credit. Do NOT use a subsection\'s own '
+    'Nettobetrag for this field. ALWAYS return a POSITIVE number (the '
+    'amount owed TO PVcontracting), even if the source document prints '
+    'every figure as negative because it frames the whole statement as a '
+    'payout/refund (e.g. \\"Elektrizität Rücklieferung -908.25\\" on an '
+    'EGBB-style statement) — use the absolute value.",\n'
+    '  "vat_rate": "number — VAT rate applicable to the production/credit '
+    'section, as a decimal (e.g. 0.081) or null",\n'
     '  "period_from": "string — Abrechnungszeitraum start of the '
     'production/credit section, ISO 8601 (YYYY-MM-DD)",\n'
     '  "period_to": "string — Abrechnungszeitraum end of the '
@@ -600,7 +617,7 @@ def _to_energy_bill_data(data: dict) -> EnergyBillData:
 def _to_energy_credit_note_data(data: dict) -> EnergyCreditNoteData:
     """Build an `EnergyCreditNoteData` from the parsed JSON.
 
-    Same coercion posture as `_to_energy_bill_data`. `net_amount` is
+    Same coercion posture as `_to_energy_bill_data`. `gross_amount` is
     additionally normalized to a positive magnitude in code (not just via
     prompt wording) — a hard guarantee independent of model compliance,
     same posture as `_normalize_iban`/`_normalize_qr_reference` enforcing
@@ -609,7 +626,7 @@ def _to_energy_credit_note_data(data: dict) -> EnergyCreditNoteData:
     """
     return EnergyCreditNoteData(
         objekt=_str_or_none(data.get("objekt")),
-        net_amount=_abs_or_none(_float_or_none(data.get("net_amount"))),
+        gross_amount=_abs_or_none(_float_or_none(data.get("gross_amount"))),
         vat_rate=_float_or_none(data.get("vat_rate")),
         period_from=_str_or_none(data.get("period_from")),
         period_to=_str_or_none(data.get("period_to")),

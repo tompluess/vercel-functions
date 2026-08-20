@@ -39,19 +39,35 @@ on the `Meierhofweg10_Emmen Contracting/Einspeisung` project — see
 **Draft `3143995`**: a CKW AG PDF titled `260731 CKW Meierhofweg10 Rechnung
 600 949 594.pdf`. The PDF's 4 pages:
 
-1. Summary: "Ihre Gutschrift" — CHF 3'785.65, netting page 3 against page 4.
+1. Summary: "Ihre Gutschrift" — **Gutschriftsbetrag (inkl. MWST) CHF
+   3'785.65** — the actual net amount CKW transfers to PVcontracting,
+   already netting page 3 against page 4.
 2. Stromkennzeichnung (regulatory disclosure, irrelevant).
 3. **Consumption** section: Objekt "Eigenbedarf PVA HEIV Meierhofweg 10",
    Abrechnungszeitraum 01.04.2026–30.06.2026, Rechnungsbetrag CHF 84.94
    (incl. MWST), Nettobetrag CHF 78.58.
 4. **Production credit** section: Objekt "Produktion PVA HEIV Meierhofweg
    10", same Abrechnungszeitraum, Vergütung 91'904 kWh @ 0.03896,
-   **Nettobetrag CHF 3'580.58**, MWST 8.1% CHF 290.03, Gutschriftsbetrag
+   Nettobetrag CHF 3'580.58, MWST 8.1% CHF 290.03, Gutschriftsbetrag
    incl. MWST CHF 3'870.61.
 
-Only page 4's figures matter for this feature. The top-level "Ihre
-Gutschrift CHF 3'785.65" nets both sections together and must **not** be
-used as the bookable amount.
+**Corrected assumption**: the bookable amount is derived from page 1's
+top-level **gross** figure (CHF 3'785.65, inkl. MWST) — the amount that
+actually moves — not page 4's production-only Nettobetrag in isolation.
+Booking page 4 alone would overstate the credit by ignoring the offsetting
+consumption charge from page 3. The ex-VAT amount PVcontracting invoices
+back to CKW is derived with:
+
+```
+net_amount = gross_amount / (1 + vat_rate)
+```
+
+For this draft: `3785.65 / 1.081 = 3501.99` (rounded to 2dp) — **not**
+`3580.58` (page 4's Nettobetrag, the previous/wrong assumption).
+
+The Objekt used for project matching still comes from the production
+section (page 4, "Produktion PVA HEIV Meierhofweg 10") — that part of the
+design is unchanged; only the bookable-amount source changed.
 
 **Precedent invoice** (`GET /invoices/7812757`, `Meierhofweg10_Emmen
 Contracting/Einspeisung` project, quarter 2026/Q1):
@@ -116,10 +132,24 @@ disambiguated from the OCR'd Objekt by address token overlap (e.g.
 
 New `EnergyCreditNoteData` dataclass + `extract_energy_credit_note()` on
 `AnthropicOcrClient`, mirroring `EnergyBillData`/`extract_energy_bill`.
-Fields: `objekt`, `net_amount`, `vat_rate`, `period_from`, `period_to`,
-`invoice_date`, `invoice_number`, `confidence`. The prompt explicitly warns
-about the two-section-per-PDF shape and instructs the model to extract only
-the production/credit section (see "Real example" above).
+Fields: `objekt`, `gross_amount`, `vat_rate`, `period_from`, `period_to`,
+`invoice_date`, `invoice_number`, `confidence`.
+
+- `gross_amount` — the document's **top-level** Gutschriftsbetrag (inkl.
+  MWST), e.g. "Ihre Gutschrift" / "Gutschriftsbetrag (inkl. MWST)". This is
+  the actual net cash amount transferred, already netting any offsetting
+  consumption-section invoice — **not** a subsection's own Nettobetrag.
+- `objekt` still comes from the production/credit section specifically
+  (needed for project disambiguation — see "Real example" above);
+  extracting it from the top-level summary is not reliable across EVUs.
+- `vat_rate` — the applicable rate (e.g. `0.081`), used both for
+  `vat_code_id` resolution (§5) and for deriving the bookable net amount
+  (§5, `net_amount = gross_amount / (1 + vat_rate)`).
+
+The prompt explicitly warns about the two-section-per-PDF shape and
+instructs the model to extract the top-level gross summary figure (not
+either subsection's own Nettobetrag) together with the production
+section's Objekt.
 
 ### 2. Detection
 
@@ -182,7 +212,7 @@ Modeled on `SmartmeProjectMatcher`, with an extra required filter tier:
 | Expense `title` | `"Stromproduktion {leistungszeitraum}"` (e.g. `"Stromproduktion 2026/Q2"`) |
 | Expense `unit` | `"x"` (decision below) |
 | Expense `quantity` | `1` |
-| Expense `unit_price` | `credit.net_amount` |
+| Expense `unit_price` | `net_amount` (derived, see below) |
 | Expense `unit_cost` | `0` |
 | Expense `billable` | `true` |
 | Expense `budget_relevant` | `false` |
@@ -196,14 +226,15 @@ Modeled on `SmartmeProjectMatcher`, with an extra required filter tier:
 | Invoice `currency` | `"CHF"` |
 | Invoice `tags` | `["Stromproduktion"]` |
 | Invoice `vat_code_id` | OCR `vat_rate` matched against `GET /vat_code_sales`, else the entry with `tax == 8.1` (account standard, matches every precedent), else the first active entry |
-| Invoice item | `type="item"`, `title="Stromproduktion {leistungszeitraum} ({from.month:02d} – {to.month:02d}/{to.year})"`, `quantity=1`, `unit="x"`, `unit_price=credit.net_amount`, `expense_ids=[expense_id]` |
+| Invoice item | `type="item"`, `title="Stromproduktion {leistungszeitraum} ({from.month:02d} – {to.month:02d}/{to.year})"`, `quantity=1`, `unit="x"`, `unit_price=net_amount`, `expense_ids=[expense_id]` |
 | Invoice attachment | same source PDF |
 | `leistungszeitraum` | derived, not OCR'd: `f"{period_from.year}/Q{(period_from.month-1)//3+1}"` |
+| `net_amount` (bookable, ex-VAT) | derived, not OCR'd: `round(credit.gross_amount / (1 + credit.vat_rate), 2)` — see "Real example" for the worked value. A missing `gross_amount` or `vat_rate` is a keep-draft failure (§6), same posture as a missing `net_amount`/period under the old assumption — never divide by a guessed rate. |
 
 ### 6. Failure paths
 
 Mirrors `SmartmeEnergyExpenseService._keep_draft` exactly: project
-`no_match`/`ambiguous`/`empty`, or missing `net_amount`/period → comment on
+`no_match`/`ambiguous`/`empty`, or missing `gross_amount`/`vat_rate`/period → comment on
 the draft (`commentable_type="PurchaseDraft"`) + Telegram alert, draft
 **stays** in the inbox (not deleted), webhook ACKs `ok=true`. Expense/
 invoice/attachment `HTTPError`s are **not** internally swallowed (same
@@ -262,14 +293,33 @@ matching `Stromproduktion` project is sufficient. This is strictly more
 robust than the tag (it can only be true when there is a real project to
 route to) and doesn't require clean tag data on every supplier record.
 
-**D5 — `EnergyCreditNoteData.net_amount` is always normalized to a
+**D5 — `EnergyCreditNoteData.gross_amount` is always normalized to a
 positive magnitude.** Live-tested and found EGBB's statement format frames
 its *entire* invoice as negative (e.g. `"Elektrizität Rücklieferung
--908.25"`, net `-840.20`) because the document reads from the payer's
+-908.25"`, gross `-840.20`) because the document reads from the payer's
 perspective (`"Der Betrag wird Ihnen ... ausbezahlt"` — a payout), unlike
-CKW's plain-positive convention. `net_amount` always represents the amount
-owed TO PVcontracting, so `_to_energy_credit_note_data` applies `abs()`
-unconditionally — a hard code-level guarantee, not just prompt wording
-(the prompt is also updated to ask for a positive value, belt-and-suspenders,
-same posture as the IBAN/QR-reference normalization in `_normalize_iban`/
-`_normalize_qr_reference`).
+CKW's plain-positive convention. `gross_amount` always represents the
+amount owed TO PVcontracting, so `_to_energy_credit_note_data` applies
+`abs()` unconditionally — a hard code-level guarantee, not just prompt
+wording (the prompt is also updated to ask for a positive value,
+belt-and-suspenders, same posture as the IBAN/QR-reference normalization in
+`_normalize_iban`/`_normalize_qr_reference`). The derived `net_amount`
+inherits the positive sign automatically since it's `gross_amount / (1 +
+vat_rate)`.
+
+**D6 — bookable amount is the top-level gross total, VAT-divided down —
+not a subsection's own Nettobetrag.** Original design (see prior revision
+of "Real example" above) assumed only page 4's production-section
+Nettobetrag (CHF 3'580.58 for draft `3143995`) mattered, on the theory that
+the consumption section was a separate, irrelevant invoice. Corrected: the
+consumption invoice is not separate — it's netted against the production
+credit *by the EVU itself* into the single top-level "Ihre Gutschrift" /
+Gutschriftsbetrag figure (CHF 3'785.65, inkl. MWST), which is the actual
+amount that moves. Booking page 4 alone would overstate the credit by
+ignoring the offsetting consumption charge. The ex-VAT bookable amount is
+now `gross_amount / (1 + vat_rate)` = `3785.65 / 1.081 = 3501.99` for the
+worked example — not `3580.58`. This changes §1 (OCR schema:
+`net_amount` → `gross_amount`), §5 (field mapping: `unit_price` /
+`expense_ids` item now use the derived `net_amount`), and §6 (failure
+gate now keys on missing `gross_amount`/`vat_rate` instead of
+`net_amount`).

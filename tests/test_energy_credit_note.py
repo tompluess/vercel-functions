@@ -16,6 +16,8 @@ from api.energy_credit_note_service import (
     COMMENTABLE_TYPE_DRAFT,
     EVU_TAG,
     EnergyCreditNoteService,
+    _derive_net_amount,
+    _pick_vat_code_id,
     is_energy_credit_note,
 )
 from api.stromproduktion_project_matcher import StromproduktionProjectMatcher
@@ -52,9 +54,12 @@ PROJECTS = [
 
 
 def make_credit(**overrides) -> EnergyCreditNoteData:
+    # Mirrors real draft 3143995's top-level gross Gutschriftsbetrag (inkl.
+    # MWST) — the derived net amount is 3785.65 / 1.081 = 3501.99 (see
+    # specs/SPEC_energy_credit_note.md, decision D6).
     base = dict(
         objekt="Produktion PVA HEIV Meierhofweg 10",
-        net_amount=3580.58,
+        gross_amount=3785.65,
         vat_rate=0.081,
         period_from="2026-04-01",
         period_to="2026-06-30",
@@ -267,14 +272,15 @@ def test_happy_path_creates_expense_and_invoice():
     assert result["project_id"] == 947264448
     assert result["project_name"] == "Meierhofweg10_Emmen Contracting/Einspeisung"
     assert result["leistungszeitraum"] == "2026/Q2"
-    assert result["net_amount"] == 3580.58
+    assert result["gross_amount"] == 3785.65
+    assert result["net_amount"] == 3501.99
 
     project_id, expense_payload = moco.expenses[0]
     assert project_id == 947264448
     assert expense_payload["title"] == "Stromproduktion 2026/Q2"
     assert expense_payload["quantity"] == 1
     assert expense_payload["unit"] == "x"
-    assert expense_payload["unit_price"] == 3580.58
+    assert expense_payload["unit_price"] == 3501.99
     assert expense_payload["unit_cost"] == 0
     assert expense_payload["billable"] is True
     assert expense_payload["budget_relevant"] is False
@@ -298,7 +304,7 @@ def test_happy_path_creates_expense_and_invoice():
     assert item["title"] == "Stromproduktion 2026/Q2 (04 – 06/2026)"
     assert item["quantity"] == 1
     assert item["unit"] == "x"
-    assert item["unit_price"] == 3580.58
+    assert item["unit_price"] == 3501.99
     assert item["expense_ids"] == [5187500]
     d = date.fromisoformat(invoice_payload["date"])
     assert date.fromisoformat(invoice_payload["due_date"]) == d + timedelta(days=30)
@@ -324,6 +330,26 @@ def test_low_confidence_success_flags_review_in_telegram():
              draft_id=3143995, body=DRAFT_BODY)
     assert "⚠️" in tg.messages[0]
     assert "bitte prüfen" in tg.messages[0]
+
+
+# --- net-amount derivation -----------------------------------------------------
+
+def test_derive_net_amount_matches_worked_example():
+    """The exact draft-3143995 worked example from
+    specs/SPEC_energy_credit_note.md: 3785.65 / 1.081 = 3501.99."""
+    assert _derive_net_amount(3785.65, 0.081) == 3501.99
+
+
+def test_derive_net_amount_none_when_gross_missing():
+    assert _derive_net_amount(None, 0.081) is None
+
+
+def test_derive_net_amount_none_when_vat_rate_missing():
+    assert _derive_net_amount(3785.65, None) is None
+
+
+def test_derive_net_amount_rounds_to_two_decimals():
+    assert _derive_net_amount(100.0, 0.081) == pytest.approx(92.51)
 
 
 # --- quarter-label formatting -------------------------------------------------
@@ -396,16 +422,34 @@ def test_ambiguous_project_reports_candidate_count():
     assert "2 Projekte" in tg.messages[0]
 
 
-def test_missing_net_amount_keeps_draft():
+def test_missing_gross_amount_keeps_draft():
     moco = FakeMoco()
     tg = FakeTelegram()
-    ocr = FakeOcr(result=make_credit(net_amount=None))
+    ocr = FakeOcr(result=make_credit(gross_amount=None))
     s = build_service(moco=moco, ocr=ocr, telegram=tg)
     result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
                        company=COMPANY, draft_id=1, body=DRAFT_BODY)
-    assert result["skipped"] == "energy_credit_note_no_net_amount"
+    assert result["skipped"] == "energy_credit_note_no_gross_amount"
     assert moco.expenses == []
-    assert "Netto-Betrag" in tg.messages[0]
+    assert "Brutto-Betrag" in tg.messages[0]
+
+
+def test_missing_vat_rate_keeps_draft():
+    """A missing vat_rate blocks the net-amount derivation (gross / (1 +
+    vat_rate)) just as much as a missing gross_amount would — never divide
+    by a guessed rate (see specs/SPEC_energy_credit_note.md, D6)."""
+    moco = FakeMoco()
+    moco_invoices = FakeMocoInvoices()
+    tg = FakeTelegram()
+    ocr = FakeOcr(result=make_credit(vat_rate=None))
+    s = build_service(moco=moco, moco_invoices=moco_invoices, ocr=ocr,
+                      telegram=tg)
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+    assert result["skipped"] == "energy_credit_note_no_vat_rate"
+    assert moco.expenses == []
+    assert moco_invoices.invoices == []
+    assert "Mehrwertsteuersatz" in tg.messages[0]
 
 
 def test_missing_period_keeps_draft():
@@ -453,22 +497,21 @@ def test_vat_code_resolved_from_ocr_rate():
 
 
 def test_vat_code_falls_back_to_account_standard_when_ocr_rate_missing():
-    moco_invoices = FakeMocoInvoices()
-    ocr = FakeOcr(result=make_credit(vat_rate=None))
-    s = build_service(moco_invoices=moco_invoices, ocr=ocr)
-    s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(), company=COMPANY,
-             draft_id=1, body=DRAFT_BODY)
-    assert moco_invoices.invoices[0]["vat_code_id"] == 107816
+    """`_pick_vat_code_id`'s own ocr_rate=None fallback, tested directly:
+    through the full service this path is now unreachable, since a missing
+    `vat_rate` is caught earlier by the net-amount-derivation gate (see
+    `test_missing_vat_rate_keeps_draft`) before `_resolve_vat_code_id` is
+    ever called."""
+    vat_codes = [
+        {"id": 107816, "tax": 8.1, "active": True},
+        {"id": 107817, "tax": 2.6, "active": True},
+    ]
+    assert _pick_vat_code_id(vat_codes, None) == 107816
 
 
 def test_vat_code_falls_back_to_first_active_when_no_standard_rate_present():
-    moco_invoices = FakeMocoInvoices()
-    moco_invoices.vat_codes = [{"id": 999, "tax": 3.7, "active": True}]
-    ocr = FakeOcr(result=make_credit(vat_rate=None))
-    s = build_service(moco_invoices=moco_invoices, ocr=ocr)
-    s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(), company=COMPANY,
-             draft_id=1, body=DRAFT_BODY)
-    assert moco_invoices.invoices[0]["vat_code_id"] == 999
+    vat_codes = [{"id": 999, "tax": 3.7, "active": True}]
+    assert _pick_vat_code_id(vat_codes, None) == 999
 
 
 def test_vat_code_omitted_when_list_fetch_fails():

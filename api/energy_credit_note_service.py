@@ -13,16 +13,19 @@ lookup — there is no cheap pre-download signal here, unlike smart-me) and
 delegates here instead. This service:
 
   1. Runs a second, targeted OCR pass (`extract_energy_credit_note`) to
-     pull the Objekt / Nettobetrag / Abrechnungszeitraum of the
-     production-credit section specifically — these documents often carry
-     a *different* consumption-section total in the same PDF, which must
-     not leak into the bookable amount (see `specs/SPEC_energy_credit_note.md`).
+     pull the Objekt (production section) / top-level gross Gutschriftsbetrag
+     (inkl. MWST) / VAT rate / Abrechnungszeitraum. The bookable ex-VAT
+     amount is then DERIVED, not OCR'd: `net_amount = gross_amount /
+     (1 + vat_rate)` — the top-level gross figure already nets the
+     consumption section against the production section, so it (not either
+     subsection's own Nettobetrag) is the correct basis (see
+     `specs/SPEC_energy_credit_note.md`, decision D6).
   2. Matches the Objekt + supplier to exactly one `Stromproduktion`-tagged
      Moco project (`StromproduktionProjectMatcher`).
   3. Creates a project expense via `POST /projects/{id}/expenses` with the
      field conventions the operator uses manually: quantity 1, unit "x",
-     unit_price = Nettobetrag, unit_cost 0, billable, NOT budget_relevant,
-     service_period = Abrechnungszeitraum, PDF attached.
+     unit_price = derived net amount, unit_cost 0, billable, NOT
+     budget_relevant, service_period = Abrechnungszeitraum, PDF attached.
   4. Creates a Moco invoice via `POST /invoices` linking that expense
      through `items[].expense_ids` (Moco marks the expense billed
      automatically), attaches the same PDF, and leaves the invoice at
@@ -34,8 +37,9 @@ delegates here instead. This service:
      still needs manual review + sending.
 
 Anything that prevents a confident booking — no project match, ambiguous
-match, missing Netto-Betrag, missing/unparseable Abrechnungszeitraum —
-takes the *keep* path: Telegram alert + best-effort comment on the draft
+match, missing Brutto-Betrag or VAT rate (either one blocks the net-amount
+derivation), missing/unparseable Abrechnungszeitraum — takes the *keep*
+path: Telegram alert + best-effort comment on the draft
 itself (`commentable_type="PurchaseDraft"`), the draft stays in the inbox,
 and the webhook ACKs ok=true (a retry can't fix it). Expense/invoice/
 attachment creation errors propagate so `index.py`'s existing mapping
@@ -135,9 +139,10 @@ class EnergyCreditNoteService:
         """
         credit = self._ocr.extract_energy_credit_note(pdf_bytes)
         logger.info("energy_credit_note: extracted draft_id=%s confidence=%.2f "
-                    "objekt=%r net=%r period=%r..%r",
+                    "objekt=%r gross=%r vat_rate=%r period=%r..%r",
                     draft_id, credit.confidence, credit.objekt,
-                    credit.net_amount, credit.period_from, credit.period_to)
+                    credit.gross_amount, credit.vat_rate,
+                    credit.period_from, credit.period_to)
 
         match = self._matcher.match(supplier_name=invoice.supplier_name,
                                     objekt=credit.objekt)
@@ -151,13 +156,20 @@ class EnergyCreditNoteService:
                 reason=_unmatched_reason(match),
                 skipped=f"energy_credit_note_project_{match.status}",
                 extra={"match_status": match.status, "objekt": credit.objekt})
-        if credit.net_amount is None:
-            logger.warning("energy_credit_note: draft %s has no Netto-Betrag",
-                           draft_id)
+        net_amount = _derive_net_amount(credit.gross_amount, credit.vat_rate)
+        if net_amount is None:
+            if credit.gross_amount is None:
+                reason, skipped = ("OCR fand keinen Brutto-Betrag",
+                                   "energy_credit_note_no_gross_amount")
+            else:
+                reason, skipped = ("OCR fand keinen Mehrwertsteuersatz "
+                                   "(zur Netto-Berechnung nötig)",
+                                   "energy_credit_note_no_vat_rate")
+            logger.warning("energy_credit_note: draft %s cannot derive net "
+                           "amount (gross=%r vat_rate=%r)", draft_id,
+                           credit.gross_amount, credit.vat_rate)
             return self._keep_draft(
-                draft_id, credit=credit,
-                reason="OCR fand keinen Netto-Betrag",
-                skipped="energy_credit_note_no_net_amount",
+                draft_id, credit=credit, reason=reason, skipped=skipped,
                 extra={"objekt": credit.objekt})
         leistungszeitraum = _format_leistungszeitraum(credit.period_from)
         if not credit.period_from or not credit.period_to or leistungszeitraum is None:
@@ -173,8 +185,8 @@ class EnergyCreditNoteService:
         project_id = project.get("id")
 
         expense_payload = _build_expense_payload(
-            credit, pdf_bytes, leistungszeitraum=leistungszeitraum,
-            draft_id=draft_id)
+            credit, pdf_bytes, net_amount=net_amount,
+            leistungszeitraum=leistungszeitraum, draft_id=draft_id)
         # HTTPError propagates — index.py maps 4xx → app error (Telegram +
         # 200 ok=false) and 5xx → 502 retry. Same posture as the smart-me
         # flow: no known routine 4xx here, so no service-internal swallow.
@@ -186,7 +198,7 @@ class EnergyCreditNoteService:
 
         vat_code_id = self._resolve_vat_code_id(credit.vat_rate)
         invoice_payload = _build_invoice_payload(
-            project, credit, expense_id=expense_id,
+            project, credit, expense_id=expense_id, net_amount=net_amount,
             leistungszeitraum=leistungszeitraum, vat_code_id=vat_code_id)
         created_invoice = self._moco_invoices.create_invoice(invoice_payload)
         invoice_id = created_invoice.get("id")
@@ -209,7 +221,8 @@ class EnergyCreditNoteService:
             "invoice_id": invoice_id,
             "project_id": project_id,
             "project_name": project.get("name"),
-            "net_amount": credit.net_amount,
+            "gross_amount": credit.gross_amount,
+            "net_amount": net_amount,
             "leistungszeitraum": leistungszeitraum,
             "confidence": credit.confidence,
         }
@@ -354,14 +367,30 @@ class EnergyCreditNoteService:
 # --- pure helpers -------------------------------------------------------
 
 
+def _derive_net_amount(gross_amount: float | None,
+                       vat_rate: float | None) -> float | None:
+    """Ex-VAT bookable amount: `gross_amount / (1 + vat_rate)`, rounded to
+    2dp. `gross_amount` is the document's top-level Gutschriftsbetrag
+    (inkl. MWST) — already netting the consumption section against the
+    production section (see `specs/SPEC_energy_credit_note.md`, D6).
+
+    None when either operand is missing — callers must treat that as a
+    keep-draft failure, never divide by a guessed rate.
+    """
+    if gross_amount is None or vat_rate is None:
+        return None
+    return round(gross_amount / (1 + vat_rate), 2)
+
+
 def _build_expense_payload(credit: EnergyCreditNoteData, pdf_bytes: bytes, *,
+                           net_amount: float,
                            leistungszeitraum: str,
                            draft_id: int) -> dict[str, Any]:
     """Construct the POST /projects/{id}/expenses body.
 
     Field conventions copied from the operator's manual entries on the
-    Stromproduktion projects: one "x" unit at the net amount, zero cost
-    (the fed-back power itself has no purchase cost), billable but NOT
+    Stromproduktion projects: one "x" unit at the derived net amount, zero
+    cost (the fed-back power itself has no purchase cost), billable but NOT
     budget_relevant (matches 5 of 6 historical entries — see
     `specs/SPEC_energy_credit_note.md`), the Abrechnungszeitraum as the
     service period, and the source PDF attached.
@@ -371,7 +400,7 @@ def _build_expense_payload(credit: EnergyCreditNoteData, pdf_bytes: bytes, *,
         "title": f"Stromproduktion {leistungszeitraum}",
         "quantity": 1,
         "unit": "x",
-        "unit_price": credit.net_amount,
+        "unit_price": net_amount,
         "unit_cost": 0,
         "billable": True,
         "budget_relevant": False,
@@ -385,7 +414,8 @@ def _build_expense_payload(credit: EnergyCreditNoteData, pdf_bytes: bytes, *,
 
 
 def _build_invoice_payload(project: dict, credit: EnergyCreditNoteData, *,
-                           expense_id: int, leistungszeitraum: str,
+                           expense_id: int, net_amount: float,
+                           leistungszeitraum: str,
                            vat_code_id: int | None) -> dict[str, Any]:
     """Construct the POST /invoices body.
 
@@ -415,7 +445,7 @@ def _build_invoice_payload(project: dict, credit: EnergyCreditNoteData, *,
             "title": item_title,
             "quantity": 1,
             "unit": "x",
-            "unit_price": credit.net_amount,
+            "unit_price": net_amount,
             "expense_ids": [expense_id],
         }],
     }
@@ -505,8 +535,11 @@ def _credit_summary_lines(credit: EnergyCreditNoteData | None) -> str:
     lines: list[str] = []
     if credit.objekt:
         lines.append(f"Objekt: {credit.objekt}")
-    if credit.net_amount is not None:
-        lines.append(f"Betrag: CHF {credit.net_amount:.2f} (netto)")
+    if credit.gross_amount is not None:
+        lines.append(f"Betrag: CHF {credit.gross_amount:.2f} (brutto, inkl. MWST)")
+    net_amount = _derive_net_amount(credit.gross_amount, credit.vat_rate)
+    if net_amount is not None:
+        lines.append(f"Betrag netto (berechnet): CHF {net_amount:.2f}")
     if credit.period_from and credit.period_to:
         lines.append(f"Zeitraum: {credit.period_from} – {credit.period_to}")
     return "\n".join(lines) + "\n" if lines else ""
@@ -533,9 +566,13 @@ def _format_keep_comment(credit: EnergyCreditNoteData | None,
     fields: list[str] = []
     if credit is not None:
         fields.append(_li("Objekt", credit.objekt))
-        fields.append(_li("Netto-Betrag",
-                          f"CHF {credit.net_amount:.2f}"
-                          if credit.net_amount is not None else None))
+        fields.append(_li("Brutto-Betrag",
+                          f"CHF {credit.gross_amount:.2f}"
+                          if credit.gross_amount is not None else None))
+        net_amount = _derive_net_amount(credit.gross_amount, credit.vat_rate)
+        fields.append(_li("Netto-Betrag (berechnet)",
+                          f"CHF {net_amount:.2f}"
+                          if net_amount is not None else None))
         zeitraum = (f"{credit.period_from} – {credit.period_to}"
                     if credit.period_from and credit.period_to else None)
         fields.append(_li("Abrechnungszeitraum", zeitraum))

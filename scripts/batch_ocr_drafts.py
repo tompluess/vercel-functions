@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from api.anthropic_ocr_client import AnthropicOcrClient, AnthropicOcrError
 from api.energy_credit_note_service import (
     EnergyCreditNoteService,
+    _derive_net_amount,
     is_energy_credit_note,
 )
 from api.moco_category_resolver import CategoryDecision, MocoCategoryResolver
@@ -266,9 +267,11 @@ def _process_energy_credit_note(draft: dict, *, pdf_bytes: bytes, invoice,
     """
     draft_id = draft.get("id")
     credit = service._ocr.extract_energy_credit_note(pdf_bytes)
-    amount_cell = _format_amount("CHF", credit.net_amount)
+    net_amount = _derive_net_amount(credit.gross_amount, credit.vat_rate)
+    amount_cell = _format_amount("CHF", net_amount)
     _step(f"energy credit note: objekt={credit.objekt!r} "
-          f"net={credit.net_amount} confidence={credit.confidence:.0%}")
+          f"gross={credit.gross_amount} vat_rate={credit.vat_rate} "
+          f"net={net_amount} confidence={credit.confidence:.0%}")
 
     # Resolved here (not just inside service.process()) so the diagnostic
     # log line prints in BOTH dry-run and apply mode — pure/cheap
