@@ -2285,3 +2285,49 @@ def test_credit_note_keeps_gutschrift_tag_and_is_held():
     assert purchases.creates[0]["tags"] == ["OCR", "Review pending",
                                             "Gutschrift"]
     assert result["review_pending"] is True
+
+
+def test_registered_payment_posts_an_explanatory_comment():
+    """The purchase timeline should say why it shows no open balance."""
+    purchases = FakePurchaseClient()
+    purchases.create_gross_total = 145.0
+    ocr = FakeOcr(result=make_invoice(already_paid_by_card=True,
+                                      currency="CHF",
+                                      invoice_date="2026-06-17"))
+    s = build_service(purchases=purchases, ocr=ocr)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    payment_comments = [text for pid, text in purchases.comments
+                        if "Zahlung automatisch erfasst" in text]
+    assert len(payment_comments) == 1
+    body = payment_comments[0]
+    assert "💳" in body
+    assert "CHF 145.00" in body
+    assert "2026-06-17" in body
+
+
+def test_no_payment_comment_when_no_payment_registered():
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(already_paid_by_card=False))
+    s = build_service(purchases=purchases, ocr=ocr)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert not any("Zahlung automatisch erfasst" in text
+                   for _, text in purchases.comments)
+
+
+def test_payment_comment_failure_does_not_unset_registered_flag():
+    """The payment is the authoritative side effect — a failed comment
+    must not make the caller believe the settle didn't happen."""
+    purchases = FakePurchaseClient()
+    purchases.comment_error = urlerror.HTTPError(
+        "u", 500, "boom", {}, io.BytesIO(b"nope"))
+    ocr = FakeOcr(result=make_invoice(already_paid_by_card=True))
+    s = build_service(purchases=purchases, ocr=ocr)
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.payments != []          # payment still went through
+    assert result["payment_registered"] is True

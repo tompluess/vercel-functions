@@ -705,6 +705,18 @@ class SupplierInvoiceOcrService:
                     "date=%s total=%s",
                     payment.get("id") if isinstance(payment, dict) else None,
                     purchase_id, date, total)
+
+        # Explain the settled balance on the purchase's own timeline.
+        # Best-effort and deliberately AFTER the payment: the payment is
+        # the authoritative side effect, and a failed comment must not
+        # make the caller think the settle didn't happen.
+        try:
+            self._purchases.post_comment(
+                purchase_id,
+                _format_payment_comment(total, invoice.currency, date))
+        except Exception:
+            logger.exception("ocr: payment comment failed purchase_id=%s",
+                             purchase_id)
         return True, None
 
     # --- telegram routing ---------------------------------------------------
@@ -1367,6 +1379,30 @@ def _today() -> str:
 # thread doesn't bloat the Moco comment (no documented hard limit, but
 # multi-megabyte bodies aren't useful for a reviewer scrolling past).
 EMAIL_BODY_MAX_CHARS = 2000
+
+
+def _format_payment_comment(total: float, currency: str | None,
+                            date: str) -> str:
+    """HTML comment body for the 💳 auto-registered payment.
+
+    Posted as its own Moco comment right after the payment is created, so
+    the purchase's timeline explains why it shows no open balance — the
+    money left the account at the till, not via a transfer someone
+    forgot to record.
+
+    Same HTML constraints as the other comment formatters: Moco keeps only
+    `div, strong, em, u, pre, ul, ol, li, br` and drops plain-text
+    newlines, so structure via `<br>` / `<ul>`.
+    """
+    amount = f"{currency or 'CHF'} {total:.2f}"
+    return (
+        "<div><strong>💳 Zahlung automatisch erfasst</strong><br>"
+        f"Betrag: <strong>{escape(amount)}</strong><br>"
+        f"Zahlungsdatum: {escape(date)}<br>"
+        "<em>Der Beleg weist die Ausgabe als bereits bezahlt aus "
+        "(Karte / TWINT / POS-Terminal), daher wurde die Zahlung direkt "
+        "verbucht — diese Ausgabe ist nicht mehr offen.</em></div>"
+    )
 
 
 def _format_ocr_comment(invoice: InvoiceData) -> str:
