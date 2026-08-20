@@ -88,7 +88,7 @@ hold:
 | condition | rationale |
 |---|---|
 | `company_id` is not None | `MocoSupplierMatcher` produced a unique tiered match. Also means Bexio's own `no_company` gate can't fire downstream. |
-| `category_id` is not None | An expense account was determined. See the already-paid rule below. Also means Bexio's `no_account` gate can't fire. |
+| the category is *trusted* (see below) | An expense account was determined by a route we're willing to skip review on. Also means Bexio's `no_account` gate can't fire. |
 | `invoice.confidence >= AUTO_RELEASE_CONFIDENCE` (0.90) | **My addition — see D2.** The only signal that speaks to whether the *amount* and *IBAN* were read correctly. |
 | `not invoice.is_credit_note` | Credit notes always need a human to check the sign; today's Telegram alert says so unconditionally. |
 
@@ -149,8 +149,12 @@ class ReviewDecision:
 class PurchaseReviewGate:
     def __init__(self, *, min_confidence: float = AUTO_RELEASE_CONFIDENCE): ...
     def evaluate(self, *, invoice: InvoiceData, company_id: int | None,
-                 category: CategoryDecision) -> ReviewDecision: ...
+                 category: CategoryDecision,
+                 project_match: ProjectMatch | None) -> ReviewDecision: ...
 ```
+
+`project_match` is needed only to read `.tier` for the `source="project"`
+rule above. Both operator scripts already hold one.
 
 `reasons` is what makes a held purchase self-explanatory in the log, the
 Telegram message, and the batch script's column — the operator sees *which*
@@ -158,12 +162,33 @@ condition held it, not just that it was held. Having the gate own `tags` keeps
 the assembly in one place; `_build_create_payload` takes the finished list
 rather than re-deriving policy.
 
-**Open point for review — D1.** For an already-paid receipt the resolver
-accepts a *project* `Aufwandkonto` as well as a supplier one. Your note said
-"only set category when resolved by supplier-account". Both are explicit
-operator configuration rather than a guess, so this spec keeps both
-qualifying. Say the word and the auto-release condition tightens to
-`decision.source == "supplier"`.
+**Which categories are trusted (D1).** `category_id is not None` alone is not
+enough — the route that produced it matters:
+
+| `CategoryDecision.source` | trusted for auto-release? |
+|---|---|
+| `"supplier"` | **yes** — the supplier was matched by name off the receipt itself, and the `Aufwandkonto` is deliberate operator config. |
+| `"project"` | **only** when the project matched at the `exact` or `substring` tier. |
+| `"default"` (the 4000 fallback) | **yes** — but see the note below; this is unreachable for card receipts. |
+| `"already_paid"` | never — `category_id` is None by construction. |
+
+The project restriction exists because `MocoProjectResolver`'s loosest tier is
+`token-overlap`, where *any single shared token* counts as a match — loose
+enough that `SmartmeProjectMatcher` was written specifically to avoid it. The
+`Aufwandkonto` config is equally deliberate in both cases; it's the *match*
+selecting the project that's weaker. `ProjectMatch.tier` already reports
+which tier fired, so the gate reads it directly.
+
+An override that was **set but missed the catalog** yields `category_id is
+None` with `source="project"`/`"supplier"` — correctly held, since an explicit
+account that didn't map is exactly the case a human should see.
+
+**The gate needs no payment-method branch.** `MocoCategoryResolver` returns
+`source="already_paid"` (and `category_id=None`) for card receipts *before*
+reaching the 4000 default, so a card receipt can never present as
+`source="default"`. Card-receipt strictness falls out of the existing resolver
+chain rather than a special case in the gate — which is why the resolver needs
+no change at all.
 
 ### 3. Payment registration
 
@@ -352,11 +377,18 @@ Service-level, existing in-memory fakes in
 10. all four conditions met → `review_pending` False, `tags == ["OCR", "Auto"]`,
     `reasons` empty.
 11. each condition failing on its own → held, with that condition named in
-    `reasons` (four cases: no company, no category, low confidence, credit
-    note).
+    `reasons` (four cases: no company, untrusted category, low confidence,
+    credit note).
 12. multiple failures → all named in `reasons`.
 13. credit note with everything else resolved → held, `Gutschrift` tag still
     appended.
+14. **category source matrix (D1)** — `source="supplier"` → released;
+    `source="default"` → released; `source="project"` with
+    `tier="exact"` → released; `source="project"` with
+    `tier="substring"` → released; `source="project"` with
+    `tier="token-overlap"` → **held**; `source="already_paid"`
+    (`category_id=None`) → held.
+15. override set but unmapped (`category_id=None`, `source="supplier"`) → held.
 
 Wrapper-level (`tests/test_moco_purchase_client.py`): `create_payment` POSTs
 to `/api/v1/purchases/payments` with the three-field JSON body.
@@ -369,10 +401,16 @@ operator scripts.
 
 ## Decisions
 
-- **D1 — already-paid category via explicit override only, never the 4000
-  default.** Unchanged resolver behaviour, now load-bearing: it stops card
-  receipts from auto-releasing on a guessed booking. Open point above: this
-  spec lets a *project* override qualify alongside a supplier one.
+- **D1 — a category is trusted by *source*, not just by being set.**
+  `supplier` always; `project` only on an `exact`/`substring` project match
+  (never `token-overlap`, the loosest matcher in the pipeline); `default`
+  (4000) yes, which is unreachable for card receipts because the resolver
+  short-circuits at `already_paid` first. Consequence, accepted knowingly: for
+  a **bank-transfer** bill the 4000 fallback nearly always resolves, so the
+  category condition rarely bites there and the effective gate is company +
+  confidence. Card receipts stay strict — they auto-release only when their
+  supplier (or a strongly-matched project) carries an explicit `Aufwandkonto`.
+  The resolver itself needs no change.
 - **D2 — confidence is part of the auto-release gate.** My addition, not in
   your proposal. Company and category resolution are orthogonal to whether
   the amount was read correctly; confidence is the only signal that covers
