@@ -272,8 +272,8 @@ unchanged and still takes exactly one `objekt` string per call.
 | Invoice `customer_id` / `recipient_address` | `project.customer.id` / `project.billing_address` |
 | Invoice `project_id` | matched project id |
 | Invoice `title` | `"Stromproduktion {leistungszeitraum} – {project.name}"` |
-| Invoice `date` | today |
-| Invoice `due_date` | today + 30 days (matches precedent) |
+| Invoice `date` | `credit.invoice_date` (the source EVU document's own Rechnungsdatum, i.e. the customer's Beleg) — falls back to today only when OCR found none (decision D8) |
+| Invoice `due_date` | `date` + 30 days (matches precedent) — now relative to the Beleg date, not always "today + 30" |
 | Invoice `currency` | `"CHF"` |
 | Invoice `tags` | `["Stromproduktion"]` |
 | Invoice `vat_code_id` | OCR `vat_rate` matched against `GET /vat_code_sales`, else the entry with `tax == 8.1` (account standard, matches every precedent), else the first active entry |
@@ -398,3 +398,17 @@ Tier 0 checks across ALL Stromproduktion projects regardless of supplier,
 so pinning a generic label like `"vZEV Überschuss"` risks hijacking an
 unrelated EVU's future statement that happens to print the same generic
 wording).
+
+**D8 — Invoice `date` is the source document's own Rechnungsdatum, not
+today.** Originally `_today()` unconditionally (matching the historical
+manual precedent — the operator typically processed these same-day).
+Explicit operator ask: the generated Moco invoice should be dated to
+match the customer's (EVU's) own Beleg date, not the day the automation
+happened to run — e.g. if a draft sits in the inbox for a few days before
+processing, or the batch script is used to backfill older drafts, the
+invoice should still carry the EVU's original Rechnungsdatum. Uses
+`credit.invoice_date` (already OCR'd for the attachment filename and the
+expense's own `date` field, which already had this fallback — see
+`_build_expense_payload`), falling back to today only when OCR found no
+date at all. `due_date` (`date + 30 days`) is unchanged in *formula* but
+now naturally shifts with it, rather than always being "today + 30".

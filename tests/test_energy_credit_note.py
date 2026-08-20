@@ -339,6 +339,10 @@ def test_happy_path_creates_expense_and_invoice():
     assert item["unit"] == "x"
     assert item["unit_price"] == 3501.99
     assert item["expense_ids"] == [5187500]
+    # Rechnungsdatum = the source EVU document's own invoice date (the
+    # customer's Beleg), not today — operator explicitly wants the Moco
+    # invoice dated to match it.
+    assert invoice_payload["date"] == "2026-07-31"
     d = date.fromisoformat(invoice_payload["date"])
     assert date.fromisoformat(invoice_payload["due_date"]) == d + timedelta(days=30)
 
@@ -353,6 +357,19 @@ def test_happy_path_creates_expense_and_invoice():
     assert "verbucht" in tg.messages[0]
     assert "versendet" in tg.messages[0]
     assert moco.comments == []
+
+
+def test_invoice_date_falls_back_to_today_when_ocr_missing_invoice_date():
+    """No Rechnungsdatum on the source document — the Moco invoice date
+    falls back to today rather than being left unset (same posture as
+    the project expense's own `date` field)."""
+    ocr = FakeOcr(result=make_credit(invoice_date=None))
+    moco_invoices = FakeMocoInvoices()
+    s = build_service(moco_invoices=moco_invoices, ocr=ocr)
+    s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(), company=COMPANY,
+             draft_id=3143995, body=DRAFT_BODY)
+    invoice_payload = moco_invoices.invoices[0]
+    assert invoice_payload["date"] == date.today().isoformat()
 
 
 def test_low_confidence_success_flags_review_in_telegram():

@@ -501,7 +501,11 @@ def _build_invoice_payload(project: dict, credit: EnergyCreditNoteData, *,
     suffix = _format_period_suffix(credit.period_from, credit.period_to)
     if suffix:
         item_title = f"{item_title} {suffix}"
-    date = _today()
+    # Rechnungsdatum: the source EVU document's own invoice date, not
+    # today — the operator wants the Moco invoice dated to match the
+    # customer's original Beleg. Falls back to today only when OCR found
+    # no date (same posture as `_build_expense_payload`'s `date` field).
+    date = credit.invoice_date or _today()
     payload: dict[str, Any] = {
         "status": "created",
         "customer_id": customer.get("id"),
