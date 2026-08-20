@@ -15,6 +15,7 @@ from api.purchase_review_gate import OCR_TAG, REVIEW_PENDING_TAG
 from api.supplier_invoice_ocr_service import (
     CONFIDENCE_THRESHOLD,
     SupplierInvoiceOcrService,
+    _format_ocr_comment,
 )
 
 
@@ -776,11 +777,14 @@ def test_comment_includes_delivery_address_after_kommission():
     _, text = purchases.comments[0]
     assert "Lieferadresse" in text
     assert "Hauptstrasse 5, 8304 Wallisellen" in text
-    # Kommission appears before Lieferadresse appears before Lieferant.
+    # The three resolved-against-Moco fields lead the list with ✓/✗
+    # markers (Lieferant → Konto → Kommission); the plain OCR readings
+    # follow, Lieferadresse first.
+    pos_lieferant = text.find("Lieferant")
+    pos_konto = text.find("Konto")
     pos_kommission = text.find("Kommission")
     pos_lieferadresse = text.find("Lieferadresse")
-    pos_lieferant = text.find("Lieferant")
-    assert 0 <= pos_kommission < pos_lieferadresse < pos_lieferant
+    assert 0 <= pos_lieferant < pos_konto < pos_kommission < pos_lieferadresse
 
 
 def test_comment_omits_lieferadresse_when_not_extracted():
@@ -1234,7 +1238,7 @@ def test_comment_text_includes_displayed_fields_and_draft_backlink():
     assert "Bauvorhaben Müller" in text
     # No draft back-link — the draft is auto-deleted after successful create.
     assert "purchases/drafts/" not in text
-    assert "Bitte Felder prüfen" in text
+    assert "Bitte prüfen und freigeben" in text
 
 
 def test_comment_text_is_html_and_uses_only_moco_allowed_tags():
@@ -1254,7 +1258,7 @@ def test_comment_text_is_html_and_uses_only_moco_allowed_tags():
     assert "<li>" in text and "</li>" in text
     # Headers / important markers use <strong>.
     assert "<strong>🤖 OCR-Extraktion</strong>" in text
-    assert "<strong>⚠️ Bitte Felder prüfen und freigeben.</strong>" in text
+    assert "Bitte prüfen und freigeben</strong>" in text
     allowed = {"div", "strong", "em", "u", "pre", "ul", "ol", "li", "br"}
     used = set(re.findall(r"</?([a-z]+)", text))
     assert used <= allowed, f"used non-allowed tags: {used - allowed}"
@@ -2331,3 +2335,116 @@ def test_payment_comment_failure_does_not_unset_registered_flag():
 
     assert purchases.payments != []          # payment still went through
     assert result["payment_registered"] is True
+
+
+# --- OCR comment: verdict header + resolution checkmarks --------------------
+
+
+def _resolved_service(purchases, ocr, moco=None):
+    m = moco or FakeMoco()
+    return build_service(moco=m, purchases=purchases, ocr=ocr,
+                         category_resolver=_category_resolver())
+
+
+def test_ocr_comment_leads_with_auto_release_verdict():
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "Digitec Galaxus AG"}]
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(supplier_name="Digitec Galaxus AG",
+                                      confidence=0.94))
+    s = _resolved_service(purchases, ocr, moco)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    _, text = purchases.comments[0]
+
+    assert "Automatisch freigegeben" in text
+    # The verdict is the FIRST thing, ahead of the extraction block.
+    assert text.find("Automatisch freigegeben") < text.find("OCR-Extraktion")
+    # ...and the old trailing review banner is gone, not merely moved.
+    assert "Bitte prüfen und freigeben" not in text
+
+
+def test_ocr_comment_leads_with_hold_verdict_and_reasons():
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(confidence=0.72))
+    s = _resolved_service(purchases, ocr)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    _, text = purchases.comments[0]
+
+    assert text.find("Bitte prüfen und freigeben") < text.find("OCR-Extraktion")
+    assert "keine Firma zugeordnet" in text        # the reasons, verbatim
+    assert "Konfidenz 72%" in text
+    assert "Review pending" in text                # what to do next
+    assert "Automatisch freigegeben" not in text
+
+
+def test_ocr_comment_marks_resolved_fields_with_checkmarks():
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "Digitec Galaxus AG"}]
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(supplier_name="Digitec Galaxus AG"))
+    s = _resolved_service(purchases, ocr, moco)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    _, text = purchases.comments[0]
+
+    assert "✓ <strong>Lieferant:</strong>" in text
+    assert "✓ <strong>Konto:</strong>" in text
+    # Plain OCR readings stay unmarked — a ✓ there would imply a match
+    # that was never attempted.
+    assert "✓ <strong>Betrag:</strong>" not in text
+    assert "✗ <strong>Betrag:</strong>" not in text
+
+
+def test_ocr_comment_marks_unresolved_fields_and_says_why():
+    purchases = FakePurchaseClient()  # no suppliers → no company match
+    ocr = FakeOcr(result=make_invoice(supplier_name="Nozomi Luzern GmbH"))
+    s = _resolved_service(purchases, ocr)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    _, text = purchases.comments[0]
+
+    assert "✗ <strong>Lieferant:</strong>" in text
+    assert "keine Firma in Moco zugeordnet" in text
+
+
+def test_ocr_comment_konto_source_is_german():
+    """`CategoryDecision.source` is an internal English token; the comment
+    must not leak it to the operator."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "Digitec Galaxus AG"}]
+    moco.companies = {555: {"id": 555, "name": "Digitec Galaxus AG",
+                            "custom_properties": {"Aufwandkonto": "4500"}}}
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(supplier_name="Digitec Galaxus AG"))
+    s = _resolved_service(purchases, ocr, moco)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    _, text = purchases.comments[0]
+
+    assert "4500 (Lieferant)" in text
+    assert "(supplier)" not in text
+
+
+def test_ocr_comment_already_paid_konto_reason_is_german():
+    """The already-paid omit is the most common HOLD reason for card
+    receipts — it must read as an instruction, not a log line."""
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=make_invoice(already_paid_by_card=True))
+    s = _resolved_service(purchases, ocr)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    _, text = purchases.comments[0]
+
+    assert "kein Aufwandkonto hinterlegt — bitte manuell wählen" in text
+    assert "skipped: already paid" not in text
+
+
+def test_ocr_comment_standalone_render_keeps_legacy_banner():
+    """Without a ReviewDecision (operator scripts, ad-hoc calls) there's no
+    verdict to lead with, so the original trailing banner still applies."""
+    text = _format_ocr_comment(make_invoice())
+
+    assert "Bitte Felder prüfen und freigeben" in text
+    assert "Automatisch freigegeben" not in text

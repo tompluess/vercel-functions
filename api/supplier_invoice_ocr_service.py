@@ -326,7 +326,10 @@ class SupplierInvoiceOcrService:
         payment_warning: str | None = None
         if new_purchase_id:
             self._post_summary_comments(new_purchase_id, invoice,
-                                        draft_id, body)
+                                        draft_id, body,
+                                        review=review, company=company,
+                                        project_match=project_match,
+                                        category=category)
             assign_warnings = self._assign_resolved_project(
                 created, project_match)
             payment_registered, payment_warning = self._register_payment(
@@ -496,7 +499,12 @@ class SupplierInvoiceOcrService:
     # --- comment back to Moco -----------------------------------------------
 
     def _post_summary_comments(self, purchase_id: int, invoice: InvoiceData,
-                               draft_id: int, draft: dict) -> None:
+                               draft_id: int, draft: dict, *,
+                               review: ReviewDecision | None = None,
+                               company: dict | None = None,
+                               project_match: ProjectMatch | None = None,
+                               category: CategoryDecision | None = None
+                               ) -> None:
         """Two separate best-effort comments on the newly created purchase.
 
         Posted as two distinct Moco comments so the reviewer sees them as
@@ -521,7 +529,10 @@ class SupplierInvoiceOcrService:
                 logger.exception("ocr: email-source comment failed "
                                  "purchase_id=%s", purchase_id)
 
-        ocr_text = _format_ocr_comment(invoice)
+        ocr_text = _format_ocr_comment(invoice, review=review,
+                                       company=company,
+                                       project_match=project_match,
+                                       category=category)
         try:
             self._purchases.post_comment(purchase_id, ocr_text)
         except Exception:
@@ -1405,7 +1416,63 @@ def _format_payment_comment(total: float, currency: str | None,
     )
 
 
-def _format_ocr_comment(invoice: InvoiceData) -> str:
+# `CategoryDecision.source` is an internal token; these are the
+# operator-facing German labels for it. Kept next to the comment
+# formatter (not on the resolver) so the resolver's own `reason` /
+# `source` stay stable for logs and the batch script's compact table.
+CATEGORY_SOURCE_LABELS = {
+    "supplier": "Lieferant",
+    "project": "Projekt",
+    "default": "Standard",
+}
+
+
+def _category_comment_text(category: CategoryDecision | None) -> str:
+    """German one-liner describing how (or whether) the Konto was resolved.
+
+    Deliberately does NOT reuse `CategoryDecision.reason`: that string is
+    internal English aimed at logs ("skipped: already paid", "supplier
+    override credit_account='9999' not found in catalog — omit"). A Moco
+    comment is read by the operator during review, so it gets German and
+    an explicit next action.
+    """
+    if category is None:
+        return "nicht aufgelöst"
+    if category.category_id is not None:
+        label = CATEGORY_SOURCE_LABELS.get(category.source, category.source)
+        return f"{category.credit_account} ({label})"
+    if category.source == "already_paid":
+        return ("kein Aufwandkonto hinterlegt — bitte manuell wählen")
+    if category.credit_account:
+        label = CATEGORY_SOURCE_LABELS.get(category.source, category.source)
+        return (f"Konto {category.credit_account} ({label}) nicht im "
+                "Kontenplan gefunden — bitte manuell wählen")
+    return "nicht gesetzt — bitte manuell wählen"
+
+
+def _match_li(label: str, ok: bool, value) -> str:
+    """Render one resolution outcome as `<li>✓/✗ <strong>Label:</strong> …</li>`.
+
+    Used for the three fields the pipeline *resolves* against Moco
+    (Lieferant → company, Konto → category, Kommission → project), as
+    opposed to the fields it merely reads off the PDF. Mirrors the ✓/✗
+    markers in `batch_ocr_drafts.py`'s table so the two operator surfaces
+    read the same way.
+
+    A missing value still renders (as `—`) rather than being filtered
+    out: for a resolution outcome, "nothing matched" is exactly the thing
+    the reviewer needs to see.
+    """
+    mark = "✓" if ok else "✗"
+    shown = escape(str(value)) if value not in (None, "") else "—"
+    return f"<li>{mark} <strong>{label}:</strong> {shown}</li>"
+
+
+def _format_ocr_comment(invoice: InvoiceData, *,
+                        review: ReviewDecision | None = None,
+                        company: dict | None = None,
+                        project_match: ProjectMatch | None = None,
+                        category: CategoryDecision | None = None) -> str:
     """HTML comment body for the 🤖 OCR-extraction summary.
 
     Posted as its own Moco comment (separate from the 📧 email-source
@@ -1415,12 +1482,55 @@ def _format_ocr_comment(invoice: InvoiceData) -> str:
     is stripped). Plain-text newlines are NOT preserved, so structure
     via `<br>` and `<ul>`.
 
+    Leads with the **verdict** — auto-released or held, and why — because
+    that's the one thing a reviewer opening the purchase needs first; the
+    extracted fields are supporting detail. (It used to be the last line,
+    below a long field list.)
+
+    The three fields resolved against Moco (Lieferant / Konto /
+    Kommission) carry ✓/✗ markers via `_match_li`, matching the batch
+    script's table. Plain OCR readings below them stay unmarked — a ✓
+    there would imply a match that was never attempted.
+
+    `review` / `company` / `project_match` / `category` are optional so
+    the formatter still renders standalone (operator scripts, tests);
+    without them the verdict header is omitted and the field list falls
+    back to plain rendering.
+
     No back-link to the original draft is included — the service
     auto-deletes the draft after the create succeeds (see
     `_delete_draft_after_create`).
     """
     parts: list[str] = []
     confidence_pct = f"{invoice.confidence:.0%}"
+
+    # --- verdict, first ---------------------------------------------------
+    if review is not None:
+        if review.review_pending:
+            parts.append(
+                "<strong>⚠️ Bitte prüfen und freigeben</strong>"
+            )
+            if review.reasons:
+                parts.append(
+                    "<em>Zurückgehalten: "
+                    f"{escape(review.reason_text())}</em>"
+                )
+            parts.append(
+                "<em>Nach der Prüfung das Tag &quot;Review pending&quot; "
+                "entfernen — die Ausgabe wird dann automatisch an Bexio "
+                "übergeben.</em>"
+            )
+        else:
+            parts.append(
+                "<strong>✅ Automatisch freigegeben — keine Prüfung "
+                "nötig</strong>"
+            )
+            parts.append(
+                f"<em>Firma und Konto wurden eindeutig erkannt "
+                f"(Konfidenz {confidence_pct}). Die Ausgabe wurde ohne "
+                "manuelle Prüfung an Bexio übergeben.</em>"
+            )
+
     parts.append(
         f"<strong>🤖 OCR-Extraktion</strong> (Konfidenz: {confidence_pct})"
     )
@@ -1441,9 +1551,46 @@ def _format_ocr_comment(invoice: InvoiceData) -> str:
         betrag = None
 
     fields: list[str] = []
-    fields.append(_li("Kommission", invoice.commission))
+    # The three resolved-against-Moco outcomes lead the list with ✓/✗ —
+    # they're what decides auto-release, so they're what a reviewer checks
+    # first. Only rendered when the caller supplied the resolution
+    # results; standalone callers fall back to the plain readings below.
+    resolved_shown = review is not None
+    if resolved_shown:
+        supplier_ok = company is not None
+        supplier_text = invoice.supplier_name or "—"
+        if supplier_ok:
+            linked = (company or {}).get("name")
+            if linked and linked != invoice.supplier_name:
+                supplier_text = f"{invoice.supplier_name} → {linked}"
+        elif invoice.supplier_name:
+            supplier_text = (f"{invoice.supplier_name} "
+                             "(keine Firma in Moco zugeordnet)")
+        fields.append(_match_li("Lieferant", supplier_ok, supplier_text))
+
+        cat_ok = category is not None and category.category_id is not None
+        fields.append(_match_li("Konto", cat_ok,
+                                _category_comment_text(category)))
+
+        proj_ok = (project_match is not None
+                   and project_match.status == "matched")
+        if proj_ok:
+            proj_name = (project_match.project or {}).get("name")
+            proj_text = f"{invoice.commission} → {proj_name}"
+        elif project_match is not None and project_match.status == "ambiguous":
+            proj_text = (f"{invoice.commission} — mehrdeutig "
+                         f"({project_match.candidate_count} Projekte)")
+        elif invoice.commission:
+            proj_text = f"{invoice.commission} (kein Projekt gefunden)"
+        else:
+            proj_text = None
+        fields.append(_match_li("Kommission", proj_ok, proj_text))
+    else:
+        fields.append(_li("Kommission", invoice.commission))
+
     fields.append(_li("Lieferadresse", invoice.delivery_address))
-    fields.append(_li("Lieferant", invoice.supplier_name))
+    if not resolved_shown:
+        fields.append(_li("Lieferant", invoice.supplier_name))
     fields.append(_li("Adresse", invoice.supplier_address))
     fields.append(_li("Betrag", betrag))
     fields.append(_li("Datum", invoice.invoice_date))
@@ -1460,9 +1607,13 @@ def _format_ocr_comment(invoice: InvoiceData) -> str:
     # we know the new purchase landed, so no back-link is needed in the
     # comment. (If the delete fails, the operator gets a separate
     # Telegram alert with both URLs.)
-    parts.append(
-        "<strong>⚠️ Bitte Felder prüfen und freigeben.</strong>"
-    )
+    # The review/auto verdict is the FIRST thing in this comment now, so
+    # no trailing "bitte prüfen" banner — it would repeat the header and,
+    # on an auto-released purchase, contradict it.
+    if review is None:
+        parts.append(
+            "<strong>⚠️ Bitte Felder prüfen und freigeben.</strong>"
+        )
     return "<div>" + "<br>".join(parts) + "</div>"
 
 
