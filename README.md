@@ -112,9 +112,22 @@ Operator scripts for validating the OCR pipeline against real Moco drafts live u
 
 ## Scripts
 
-Two CLIs drive the OCR pipeline directly against the Moco account so you can validate behaviour without going through the webhook. Both default to **dry-run** (no Moco writes); pass `--apply` to actually create purchases. Both load env from `.env.local` (use `vercel env pull .env.local` first) and need `MOCO_SUBDOMAIN`, `MOCO_API_KEY`, and `ANTHROPIC_API_KEY`.
+Operator CLIs under [`scripts/`](scripts/) drive real Moco/Bexio/Telegram calls directly, so you can validate behaviour without going through a live webhook. All load env from `.env.local` (`vercel env pull .env.local` first) and follow the same dry-run-by-default / `--apply` convention where relevant.
 
-### `scripts/test_ocr_create_purchase.py` — single draft
+| Script | Purpose | Single draft? | Default mode |
+| --- | --- | --- | --- |
+| [`batch_ocr_drafts.py`](scripts/batch_ocr_drafts.py) | **The one that answers "how would the webhook handle this draft?"** — runs the `supplier-invoice-ocr` dispatch (generic purchase / Gutschrift / energy-credit-note routing; smart-me detection is *not* wired in here, see below) against one or many drafts, prints a per-draft log + summary table. | `--draft-id ID` | dry-run |
+| [`batch_smartme_drafts.py`](scripts/batch_smartme_drafts.py) | Same idea, scoped to the smart-me `Energiekostenabrechnung` branch specifically (`is_smartme_draft` → `SmartmeEnergyExpenseService`). | `--draft-id ID` | dry-run |
+| [`test_ocr_create_purchase.py`](scripts/test_ocr_create_purchase.py) | Deepest single-draft trace of the **generic** purchase pipeline — every resolution step (supplier, VAT, Kommission/project, category) printed individually. Best when iterating on the OCR prompt or debugging one weird invoice. Not branch-aware: doesn't preview/apply the smart-me or energy-credit-note paths. | positional `draft_id` (required) | dry-run |
+| [`test_ocr_real.py`](scripts/test_ocr_real.py) | OCR only, no Moco writes at all — just `AnthropicOcrClient.extract()` against one draft's PDF, pretty-printed. For eyeballing raw model output. | positional `draft_id` (required) | read-only |
+| [`send_test_telegram.py`](scripts/send_test_telegram.py) | Sends one Telegram message via `TelegramNotifier` to verify a bot token / chat id pair. | n/a | sends for real |
+| [`bexio_oauth_bootstrap.py`](scripts/bexio_oauth_bootstrap.py) | One-time (or recovery-time) local OAuth2 Authorization Code flow that seeds `bexio:oauth` in KV. Not part of the OCR pipeline. | n/a | writes to KV |
+
+For "did the webhook route draft X the way I expect" — including whether it gets detected as a Gutschrift or an EVU energy credit note — use `batch_ocr_drafts.py --draft-id ID` (dry-run by default). Use `batch_smartme_drafts.py --draft-id ID` instead for a smart-me `Energiekostenabrechnung` draft. `test_ocr_create_purchase.py` gives more granular step-by-step output but only ever exercises the plain-purchase code path.
+
+The two `batch_*` scripts need `MOCO_SUBDOMAIN`, `MOCO_API_KEY`, `ANTHROPIC_API_KEY`; `test_ocr_create_purchase.py` also needs `ANTHROPIC_API_KEY` and, with `--notify`, `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`.
+
+### `scripts/test_ocr_create_purchase.py` — single draft, generic pipeline only
 
 Runs the full pipeline against one specific draft id and prints a detailed step-by-step view: the draft fields, the OCR'd `InvoiceData`, the supplier-lookup outcome, the resolved VAT code, the Kommission → project resolution (status + tier + candidate count), the chosen category (with reasoning), the exact `POST /purchases` payload (with the PDF base64 elided) and rendered comment bodies, plus a preview of the `POST /purchases/{id}/assign_to_project` body. Useful when iterating on the prompt or chasing a single weird invoice.
 
@@ -129,21 +142,24 @@ Flags: `--apply` (POST + comments + delete draft), `--notify` (Telegram on confi
 
 Exit codes: `0` ok, `1` OCR error, `2` missing env / bad args, `3` Moco fetch error, `4` `POST /purchases` error.
 
-### `scripts/batch_ocr_drafts.py` — all drafts
+Note: this script's dry-run preview and its `--apply` path only exercise the generic OCR→purchase pipeline — it does not wire up `SmartmeEnergyExpenseService` or `EnergyCreditNoteService`, so a smart-me or energy-credit-note draft run through here will be (mis)handled as a plain purchase instead of being routed the way the real webhook routes it. Use `batch_ocr_drafts.py --draft-id ID` (or `batch_smartme_drafts.py --draft-id ID`) for a webhook-accurate single-draft run.
 
-Lists `GET /purchases/drafts` (newest first), runs the same in-process pipeline against each draft, and prints a per-draft live log followed by a summary table.
+### `scripts/batch_ocr_drafts.py` — one or many drafts, full webhook-equivalent dispatch
+
+Lists `GET /purchases/drafts` (newest first) — or fetches exactly one draft via `--draft-id` — runs the same in-process pipeline the webhook uses (including Gutschrift and energy-credit-note detection/routing), and prints a per-draft live log followed by a summary table.
 
 ```bash
-.venv/bin/python scripts/batch_ocr_drafts.py --max 5            # dry-run, 5 newest
-.venv/bin/python scripts/batch_ocr_drafts.py --max 5 --apply    # actually create
-.venv/bin/python scripts/batch_ocr_drafts.py --max 20           # larger sweep
+.venv/bin/python scripts/batch_ocr_drafts.py --max 5              # dry-run, 5 newest
+.venv/bin/python scripts/batch_ocr_drafts.py --max 5 --apply      # actually create
+.venv/bin/python scripts/batch_ocr_drafts.py --max 20             # larger sweep
+.venv/bin/python scripts/batch_ocr_drafts.py --draft-id 3143995   # one specific draft, dry-run
 ```
 
 Per-draft live log (one block per draft) shows PDF size + OCR latency, confidence + Gutschrift flag, supplier lookup outcome (id + matched/ambiguous/no-match), VAT-code resolution tier (matched OCR rate / supplier default / account default / unresolved), the Kommission → project resolution (project id + tier or `no_match` / `ambiguous`), the chosen `category_id` with reasoning, and chosen payment method + IBAN tail (with `(QR-IBAN)` marker).
 
 Summary table columns: `DRAFT ID | PURCHASE ID | LIEFERANT | BETRAG | KOMMISSION | KATEGORIE | RESULT`. The `LIEFERANT` column carries a leading `✓` when the supplier was uniquely matched in Moco's company list; the `KOMMISSION` column shows the raw OCR'd value plus a `✓` when it resolved to exactly one project (or `✗ ambiguous (N)` when it didn't); the `KATEGORIE` column shows the resolved account and its source — `✓ 4500 (project)` / `✓ 6510 (supplier)` / `✓ 4000 (default)` on a hit, `✗ 4999 (project)` when an `Aufwandkonto` override names an account missing from the catalog (field omitted), `- paid` for card receipts without an override. The footer counts `created / dry-run / skipped / failed / supplier-matched`.
 
-Flags: `--max N` (cap at N newest drafts, default 10), `--apply`, `--model`, `--env-file`.
+Flags: `--max N` (cap at N newest drafts, default 10; ignored when `--draft-id` is given), `--draft-id ID` (process exactly this draft, bypassing the listing), `--apply`, `--model`, `--env-file`.
 
 Telegram is intentionally **not** wired into the batch script (one alert per row would spam the chat); the table is the audit surface. Production webhook traffic still notifies as usual.
 

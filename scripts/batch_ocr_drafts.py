@@ -19,8 +19,9 @@ dry-run the row only reports that the draft would be deleted.
 
 Usage (from the repo root):
     vercel env pull .env.local
-    .venv/bin/python scripts/batch_ocr_drafts.py --max 5          # dry-run
-    .venv/bin/python scripts/batch_ocr_drafts.py --max 5 --apply  # real writes
+    .venv/bin/python scripts/batch_ocr_drafts.py --max 5              # dry-run
+    .venv/bin/python scripts/batch_ocr_drafts.py --max 5 --apply      # real writes
+    .venv/bin/python scripts/batch_ocr_drafts.py --draft-id 3143995   # one draft, dry-run
 
 Required env (same as test_ocr_create_purchase.py):
     MOCO_SUBDOMAIN    source subdomain (e.g. "solar")
@@ -43,11 +44,21 @@ from urllib import error as urlerror
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from api.anthropic_ocr_client import AnthropicOcrClient, AnthropicOcrError
+from api.energy_credit_note_service import (
+    EnergyCreditNoteService,
+    _derive_net_amount,
+    is_energy_credit_note,
+)
 from api.moco_category_resolver import CategoryDecision, MocoCategoryResolver
+from api.moco_invoice_client import MocoInvoiceClient
 from api.moco_project_resolver import MocoProjectResolver, ProjectMatch
 from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_client import MocoClient
 from api.moco_supplier_matcher import MocoSupplierMatcher
+from api.stromproduktion_project_matcher import (
+    StromproduktionProjectMatch,
+    StromproduktionProjectMatcher,
+)
 from api.supplier_invoice_ocr_service import (
     CONFIDENCE_THRESHOLD,
     SupplierInvoiceOcrService,
@@ -210,6 +221,106 @@ def _format_kommission_log(raw: str | None, match: ProjectMatch) -> str:
     return f"{label} → no project match"
 
 
+def _format_stromproduktion_match_log(objekt: str | None,
+                                      match: StromproduktionProjectMatch) -> str:
+    """Build the per-draft Stromproduktion project-resolution live-log line.
+
+    Mirrors `_format_kommission_log`'s style, but additionally names the
+    tied candidates on an `ambiguous` outcome (not just a count) — same
+    diagnostic depth as the supplier-lookup log's ambiguous branch, so the
+    operator can see at a glance which projects tied and why (e.g. a
+    generic short token like a bare house number colliding across two
+    unrelated projects).
+    """
+    if match.status == "empty":
+        return "Stromproduktion project: OCR returned no Objekt"
+    label = f"Stromproduktion project for Objekt {objekt!r}"
+    if match.status == "matched":
+        proj = match.project or {}
+        return (f"{label} → project '{proj.get('name')}' "
+                f"(id={proj.get('id')}, {match.tier} tier)")
+    if match.status == "ambiguous":
+        names = ", ".join(repr(p.get("name")) for p in match.candidates[:4])
+        return (f"{label} → ambiguous ({match.candidate_count} candidates "
+                f"at {match.tier} tier: {names} — leaving project empty)")
+    return (f"{label} → no match (no Stromproduktion project of this "
+            "supplier overlaps the Objekt)")
+
+
+def _process_energy_credit_note(draft: dict, *, pdf_bytes: bytes, invoice,
+                                company: dict | None,
+                                supplier_matched: bool,
+                                service: EnergyCreditNoteService,
+                                apply: bool) -> Row:
+    """Preview or apply the energy-credit-note branch for one draft.
+
+    Mirrors how the rest of this script reuses `service.process()` / its
+    internals for apply mode (see the docstring on `_process_draft`) —
+    dry-run peeks at the SAME `ocr`/`matcher` objects the production
+    webhook uses (via the service's own collaborators) without writing
+    anything to Moco; apply mode calls `service.process()` directly, the
+    exact call the webhook makes.
+
+    Reuses the `Row.purchase_id` column for the created invoice's id
+    (labeled explicitly in the `result` text) rather than adding a new
+    table column for this one row type. Likewise reuses the KOMMISSION
+    column for the credit note's OCR'd Objekt + the
+    `StromproduktionProjectMatcher` outcome — same `matched`/`ambiguous`/
+    `no_match`/`empty` vocabulary as the generic Kommission→project
+    resolver, so `_kommission_cell`'s existing rendering (✓/✗ ambiguous
+    (N)/plain) applies unchanged.
+    """
+    draft_id = draft.get("id")
+    credit = service._ocr.extract_energy_credit_note(pdf_bytes)
+    net_amount = _derive_net_amount(credit.gross_amount, credit.vat_rate)
+    amount_cell = _format_amount("CHF", net_amount)
+    _step(f"energy credit note: objekt={credit.objekt!r} "
+          f"objekt_top_level={credit.objekt_top_level!r} "
+          f"gross={credit.gross_amount} vat_rate={credit.vat_rate} "
+          f"net={net_amount} confidence={credit.confidence:.0%}")
+
+    # Resolved here (not just inside service.process()) so the diagnostic
+    # log line prints in BOTH dry-run and apply mode — pure/cheap
+    # (in-memory only), so recomputing it in apply mode alongside the
+    # service's own internal call is not wasteful. Uses the service's own
+    # `_match_project` (production-section Objekt first, top-level-summary
+    # Objekt as fallback — see `specs/SPEC_energy_credit_note.md`, D7) so
+    # the preview matches production behavior exactly.
+    match, objekt_used = service._match_project(invoice.supplier_name,
+                                                 credit, draft_id=draft_id)
+    _step(_format_stromproduktion_match_log(objekt_used, match))
+
+    if not apply:
+        if match.status == "matched":
+            result = ("Dry-run OK (energy credit note → project "
+                      f"{match.project.get('name')!r})")
+        elif match.status == "ambiguous":
+            names = ", ".join(repr(p.get("name"))
+                              for p in match.candidates[:4])
+            result = (f"Dry-run: energy credit note, ambiguous "
+                      f"({match.candidate_count}: {names})")
+        else:
+            result = f"Dry-run: energy credit note, project {match.status}"
+        return Row(draft_id, None, invoice.supplier_name, supplier_matched,
+                   amount_cell, False, objekt_used, match.status,
+                   match.candidate_count, result)
+
+    outcome = service.process(pdf_bytes=pdf_bytes, invoice=invoice,
+                              company=company, draft_id=draft_id, body=draft)
+    if outcome.get("skipped"):
+        _step(f"energy credit note kept draft: {outcome['skipped']}")
+        return Row(draft_id, None, invoice.supplier_name, supplier_matched,
+                   amount_cell, False, objekt_used, match.status,
+                   match.candidate_count, f"Skipped: {outcome['skipped']}")
+    _step(f"created invoice id={outcome.get('invoice_id')} "
+          f"expense id={outcome.get('expense_id')}")
+    return Row(draft_id, outcome.get("invoice_id"), invoice.supplier_name,
+               supplier_matched, amount_cell, False, objekt_used,
+               match.status, match.candidate_count,
+               "Created energy-credit-note invoice (status=created, "
+               f"expense={outcome.get('expense_id')})")
+
+
 def _process_draft(draft: dict, *,
                    moco: MocoClient,
                    purchases: MocoPurchaseClient,
@@ -218,6 +329,7 @@ def _process_draft(draft: dict, *,
                    resolver: MocoProjectResolver,
                    category_resolver: MocoCategoryResolver,
                    supplier_matcher: MocoSupplierMatcher,
+                   energy_credit_note_service: EnergyCreditNoteService | None,
                    apply: bool,
                    idx: int,
                    total: int) -> Row:
@@ -331,6 +443,28 @@ def _process_draft(draft: dict, *,
             full_company = moco.get_company(company_id)
         except Exception as e:
             log.warning("get_company failed id=%s: %s", company_id, e)
+
+    # --- energy credit note detection --------------------------------------
+    # EVU production credit notes (see energy_credit_note_service.py)
+    # short-circuit to their own expense+invoice flow — mirrors the
+    # production webhook's dispatch point exactly (right after the
+    # supplier company is resolved, before Kommission/VAT/category
+    # resolution for the generic purchase path). Three independent
+    # signals, any one sufficient — see the identical check in
+    # supplier_invoice_ocr_service.py.
+    is_energy_credit = energy_credit_note_service is not None and (
+        is_energy_credit_note(invoice, full_company)
+        or (invoice.is_credit_note
+            and energy_credit_note_service.is_evu_tagged_customer(
+                invoice.supplier_name))
+        or (invoice.is_credit_note
+            and energy_credit_note_service.has_matching_project(
+                invoice.supplier_name)))
+    if is_energy_credit:
+        return _process_energy_credit_note(
+            draft, pdf_bytes=pdf_bytes, invoice=invoice, company=full_company,
+            supplier_matched=matched, service=energy_credit_note_service,
+            apply=apply)
 
     # --- Kommission → Moco project ----------------------------------------
     # Resolver-only (Stage 1): we surface the would-be project but DON'T
@@ -456,7 +590,11 @@ def _print_table(rows: list[Row], *, result_width: int = 60) -> None:
     Moco's company list; Betrag gets a leading ✓ on already-paid bills;
     Kommission gets a leading ✓ when the OCR'd value resolved to exactly
     one Moco project, or a trailing `✗ ambiguous (N)` when more than one
-    matched. Kategorie carries the pre-formatted `_format_category_cell`
+    matched. For energy-credit-note rows this column is repurposed to show
+    the credit note's OCR'd Objekt + `StromproduktionProjectMatcher`
+    outcome instead (see `_process_energy_credit_note`) — same status
+    vocabulary, so the same rendering applies unchanged. Kategorie carries
+    the pre-formatted `_format_category_cell`
     outcome (✓ account (source) / ✗ unmapped account / `- paid`).
 
     Truncates Lieferant / Kommission / Result so long values don't blow
@@ -567,6 +705,12 @@ def main() -> int:
     parser.add_argument("--max", dest="max_drafts", type=int, default=10,
                         help="Maximum number of drafts to process "
                              "(newest first). Default: 10.")
+    parser.add_argument("--draft-id", type=int, default=None,
+                        help="Process exactly this draft (bypasses the "
+                             "listing) — the way to dry-run one specific "
+                             "draft through the full webhook dispatch "
+                             "(generic purchase / Gutschrift / energy "
+                             "credit note routing all included).")
     parser.add_argument("--apply", action="store_true",
                         help="Actually POST /purchases for each draft "
                              "(default: dry-run, OCR only, no Moco writes).")
@@ -595,20 +739,28 @@ def main() -> int:
     purchases = MocoPurchaseClient(subdomain=subdomain, api_key=moco_key)
     ocr = AnthropicOcrClient(api_key=anthropic_key, model=args.model)
 
-    # Always fetch the full draft pool (up to 100) so the --max N cap is
-    # applied to the freshest N AFTER newest-first sorting. Limiting the
-    # API call directly would just take whatever order Moco returns the
-    # first N in, which isn't guaranteed to be newest-first.
-    print(f"Listing drafts from "
-          f"https://{subdomain}.mocoapp.com/api/v1/purchases/drafts …")
-    try:
-        drafts = purchases.list_purchase_drafts(limit=DRAFT_FETCH_CAP)
-    except Exception as e:
-        print(f"Failed to list drafts: {e}", file=sys.stderr)
-        return 3
-    drafts = _newest_first(drafts)[:args.max_drafts]
-    print(f"Got {len(drafts)} draft(s) (newest first, capped at --max="
-          f"{args.max_drafts}). "
+    if args.draft_id is not None:
+        print(f"Fetching draft {args.draft_id} …")
+        try:
+            drafts = [purchases.get_purchase_draft(args.draft_id)]
+        except Exception as e:
+            print(f"Failed to fetch draft {args.draft_id}: {e}",
+                  file=sys.stderr)
+            return 3
+    else:
+        # Always fetch the full draft pool (up to 100) so the --max N cap
+        # is applied to the freshest N AFTER newest-first sorting. Limiting
+        # the API call directly would just take whatever order Moco
+        # returns the first N in, which isn't guaranteed to be newest-first.
+        print(f"Listing drafts from "
+              f"https://{subdomain}.mocoapp.com/api/v1/purchases/drafts …")
+        try:
+            drafts = purchases.list_purchase_drafts(limit=DRAFT_FETCH_CAP)
+        except Exception as e:
+            print(f"Failed to list drafts: {e}", file=sys.stderr)
+            return 3
+        drafts = _newest_first(drafts)[:args.max_drafts]
+    print(f"Got {len(drafts)} draft(s). "
           f"Mode: {'APPLY (real writes)' if args.apply else 'DRY-RUN'}")
 
     # Build the Kommission → Moco project resolver once per run. The
@@ -659,15 +811,37 @@ def main() -> int:
     print(f"  {len(all_suppliers)} supplier(s) returned, "
           f"{supplier_matcher.indexed_count()} matchable by name.")
 
+    # Customer-type company list feeds the third energy-credit-note
+    # detection signal (`is_evu_tagged_customer`) — some EVUs only carry
+    # the EVU tag on their type=customer record (confirmed live: CKW,
+    # BKW). Same per-run fetch + graceful-empty-on-failure pattern.
+    print("Loading Moco customers for EVU customer-tag detection …")
+    try:
+        all_customers = moco.list_customers()
+    except Exception as e:
+        print(f"  WARN: list_customers failed ({e}); EVU customer-tag "
+              "detection signal disabled.", file=sys.stderr)
+        all_customers = []
+    customer_matcher = MocoSupplierMatcher(all_customers)
+    print(f"  {len(all_customers)} customer(s) returned, "
+          f"{customer_matcher.indexed_count()} matchable by name.")
+
     # Telegram intentionally NOT wired in. Batch runs touch dozens of drafts
     # at a time and would spam the chat with one alert per row; the table is
     # the audit surface here. Production webhook traffic still notifies as
     # usual.
+    moco_invoices = MocoInvoiceClient(subdomain=subdomain, api_key=moco_key)
+    energy_credit_note_service = EnergyCreditNoteService(
+        moco=moco, moco_invoices=moco_invoices, purchase_client=purchases,
+        ocr=ocr, matcher=StromproduktionProjectMatcher(all_projects),
+        customer_matcher=customer_matcher,
+        subdomain=subdomain, telegram=None)
     service = SupplierInvoiceOcrService(
         moco=moco, purchase_client=purchases, ocr=ocr,
         subdomain=subdomain, telegram=None,
         project_resolver=resolver,
-        category_resolver=category_resolver)
+        category_resolver=category_resolver,
+        energy_credit_note=energy_credit_note_service)
 
     rows: list[Row] = []
     for i, draft in enumerate(drafts, start=1):
@@ -676,6 +850,7 @@ def main() -> int:
             service=service, resolver=resolver,
             category_resolver=category_resolver,
             supplier_matcher=supplier_matcher,
+            energy_credit_note_service=energy_credit_note_service,
             apply=args.apply, idx=i, total=len(drafts)))
 
     _print_table(rows)

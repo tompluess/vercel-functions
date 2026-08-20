@@ -587,3 +587,108 @@ def test_extract_energy_bill_tolerates_reasoning_preamble(client, calls):
     calls["next_response"] = _anthropic_response(text)
     bill = client.extract_energy_bill(PDF_BYTES)
     assert bill.net_amount == 558.09
+
+
+# --- extract_energy_credit_note ------------------------------------------------
+
+SAMPLE_CREDIT_NOTE_OCR = {
+    "objekt": "Produktion PVA HEIV Meierhofweg 10",
+    "objekt_top_level": "Eigenbedarf PVA HEIV Meierhofweg 10",
+    "gross_amount": 3785.65,
+    "vat_rate": 0.081,
+    "period_from": "2026-04-01",
+    "period_to": "2026-06-30",
+    "invoice_date": "2026-07-31",
+    "invoice_number": "600949594",
+    "confidence": 0.93,
+}
+
+
+def test_extract_energy_credit_note_sends_own_prompt(client, calls):
+    calls["next_response"] = _anthropic_response(
+        json.dumps(SAMPLE_CREDIT_NOTE_OCR))
+    client.extract_energy_credit_note(PDF_BYTES)
+    payload = calls["calls"][0]["payload"]
+    assert "production credit" in payload["system"]
+    assert "qr_reference" not in payload["system"]
+    doc_block = next(b for b in payload["messages"][0]["content"]
+                     if b["type"] == "document")
+    assert doc_block["source"]["data"] == base64.b64encode(
+        PDF_BYTES).decode("ascii")
+
+
+def test_extract_energy_credit_note_parses_all_fields(client, calls):
+    calls["next_response"] = _anthropic_response(
+        json.dumps(SAMPLE_CREDIT_NOTE_OCR))
+    credit = client.extract_energy_credit_note(PDF_BYTES)
+    assert credit.objekt == "Produktion PVA HEIV Meierhofweg 10"
+    assert credit.objekt_top_level == "Eigenbedarf PVA HEIV Meierhofweg 10"
+    assert credit.gross_amount == 3785.65
+    assert credit.vat_rate == pytest.approx(0.081)
+    assert credit.period_from == "2026-04-01"
+    assert credit.period_to == "2026-06-30"
+    assert credit.invoice_date == "2026-07-31"
+    assert credit.invoice_number == "600949594"
+    assert credit.confidence == 0.93
+
+
+def test_extract_energy_credit_note_objekt_top_level_can_differ_from_objekt(
+        client, calls):
+    """Real-world regression (draft 3143993, CKW vZEV Krugel 1 Oberkirch):
+    the production section's Objekt can be a generic label ("vZEV
+    Überschuss") while the top-level summary's Objekt carries the actual
+    site name — the two fields must be extracted independently."""
+    payload = {**SAMPLE_CREDIT_NOTE_OCR, "objekt": "vZEV Überschuss",
+               "objekt_top_level": "vZEV Krugel 1 Oberkirch"}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    credit = client.extract_energy_credit_note(PDF_BYTES)
+    assert credit.objekt == "vZEV Überschuss"
+    assert credit.objekt_top_level == "vZEV Krugel 1 Oberkirch"
+
+
+def test_extract_energy_credit_note_normalizes_negative_gross_amount():
+    """Real-world regression (draft 3143992, EGBB): some EVUs frame their
+    ENTIRE statement as a negative payout figure ("Elektrizität
+    Rücklieferung -908.25", gross -840.20) rather than CKW's plain-positive
+    convention. `gross_amount` must always come out positive — a hard
+    code-level guarantee, not just prompt wording."""
+    from api.anthropic_ocr_client import _to_energy_credit_note_data
+    credit = _to_energy_credit_note_data(
+        {**SAMPLE_CREDIT_NOTE_OCR, "gross_amount": -840.20})
+    assert credit.gross_amount == 840.20
+
+
+def test_extract_energy_credit_note_missing_gross_amount_stays_none():
+    from api.anthropic_ocr_client import _to_energy_credit_note_data
+    credit = _to_energy_credit_note_data(
+        {**SAMPLE_CREDIT_NOTE_OCR, "gross_amount": None})
+    assert credit.gross_amount is None
+
+
+def test_extract_energy_credit_note_coerces_numeric_strings(client, calls):
+    payload = {**SAMPLE_CREDIT_NOTE_OCR, "gross_amount": "-3785.65",
+               "confidence": "0.9"}
+    calls["next_response"] = _anthropic_response(json.dumps(payload))
+    credit = client.extract_energy_credit_note(PDF_BYTES)
+    assert credit.gross_amount == 3785.65
+    assert credit.confidence == 0.9
+
+
+def test_extract_energy_credit_note_missing_fields_default_safely(client, calls):
+    calls["next_response"] = _anthropic_response(json.dumps({}))
+    credit = client.extract_energy_credit_note(PDF_BYTES)
+    assert credit.objekt is None
+    assert credit.objekt_top_level is None
+    assert credit.gross_amount is None
+    assert credit.vat_rate is None
+    assert credit.period_from is None
+    assert credit.invoice_number is None
+    assert credit.confidence == 0.0
+
+
+def test_extract_energy_credit_note_tolerates_reasoning_preamble(client, calls):
+    text = ("Let me check which section is the production credit...\n\n"
+            + json.dumps(SAMPLE_CREDIT_NOTE_OCR))
+    calls["next_response"] = _anthropic_response(text)
+    credit = client.extract_energy_credit_note(PDF_BYTES)
+    assert credit.gross_amount == 3785.65

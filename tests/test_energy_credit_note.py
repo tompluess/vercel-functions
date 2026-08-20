@@ -1,0 +1,1162 @@
+"""Unit tests for EnergyCreditNoteService — detection (`is_energy_credit_note`),
+expense/invoice payload shape, quarter-label formatting, VAT-code
+resolution, keep-draft paths, draft deletion, error propagation, and the
+`SupplierInvoiceOcrService` dispatch point. In-memory fakes for all
+collaborators."""
+
+import base64
+import io
+from datetime import date, timedelta
+from urllib import error as urlerror
+
+import pytest
+
+from api.anthropic_ocr_client import EnergyCreditNoteData, InvoiceData
+from api.energy_credit_note_service import (
+    COMMENTABLE_TYPE_DRAFT,
+    EVU_TAG,
+    EnergyCreditNoteService,
+    _derive_net_amount,
+    _pick_vat_code_id,
+    is_energy_credit_note,
+)
+from api.moco_supplier_matcher import MocoSupplierMatcher
+from api.stromproduktion_project_matcher import StromproduktionProjectMatcher
+from api.supplier_invoice_ocr_service import SupplierInvoiceOcrService
+
+
+PDF_BYTES = b"%PDF-1.4 energy-credit-note-test"
+
+# Mirrors the real draft 3143995 (CKW AG statement for Meierhofweg 10) —
+# see specs/SPEC_energy_credit_note.md.
+DRAFT_BODY = {
+    "id": 3143995,
+    "title": "260731 CKW Meierhofweg10 Rechnung  600 949 594.pdf",
+    "file_url": "https://data.mocoapp.com/objects/fake.pdf?sig=abc",
+}
+
+# The matched *supplier* company record — a DIFFERENT Moco company than
+# the project's customer (see PROJECTS below), same real-world entity,
+# both tagged EVU_TAG. This is the record `MocoSupplierMatcher` links.
+COMPANY = {"id": 762378104, "name": "CKW AG (Lieferant)", "tags": [EVU_TAG]}
+
+PROJECTS = [
+    {"id": 947264448, "name": "Meierhofweg10_Emmen Contracting/Einspeisung",
+     "tags": ["Contracting", "Stromproduktion"],
+     "customer": {"id": 762378092, "name": "CKW AG"},
+     "billing_address": "CKW AG\nTäschmattstrasse 4\n6015 Luzern\nSchweiz",
+     "custom_properties": {"Kommission": None}},
+    {"id": 947264459, "name": "Lindershalde_Rengg Contracting/Einspeisung",
+     "tags": ["Contracting", "Stromproduktion"],
+     "customer": {"id": 762378092, "name": "CKW AG"},
+     "billing_address": "CKW AG\nTäschmattstrasse 4\n6015 Luzern\nSchweiz",
+     "custom_properties": {"Kommission": None}},
+]
+
+
+def make_credit(**overrides) -> EnergyCreditNoteData:
+    # Mirrors real draft 3143995's top-level gross Gutschriftsbetrag (inkl.
+    # MWST) — the derived net amount is 3785.65 / 1.081 = 3501.99 (see
+    # specs/SPEC_energy_credit_note.md, decision D6).
+    base = dict(
+        objekt="Produktion PVA HEIV Meierhofweg 10",
+        objekt_top_level="Eigenbedarf PVA HEIV Meierhofweg 10",
+        gross_amount=3785.65,
+        vat_rate=0.081,
+        period_from="2026-04-01",
+        period_to="2026-06-30",
+        invoice_date="2026-07-31",
+        invoice_number="600949594",
+        confidence=0.93,
+    )
+    base.update(overrides)
+    return EnergyCreditNoteData(**base)
+
+
+def make_invoice(**overrides) -> InvoiceData:
+    base = dict(
+        supplier_name="CKW AG (Lieferant)",
+        supplier_address=None,
+        invoice_date="2026-07-31",
+        due_date=None,
+        invoice_number="600949594",
+        total_amount=3785.65,
+        net_amount=None,
+        vat_amount=None,
+        vat_rate=None,
+        currency="CHF",
+        iban=None,
+        qr_reference=None,
+        creditor_reference=None,
+        payment_purpose=None,
+        description=None,
+        is_credit_note=True,
+        commission=None,
+        delivery_address=None,
+        already_paid_by_card=False,
+        confidence=0.9,
+    )
+    base.update(overrides)
+    return InvoiceData(**base)
+
+
+# --- fakes ------------------------------------------------------------------
+
+class FakeMoco:
+    def __init__(self):
+        self.expenses: list[tuple[int, dict]] = []
+        self.expense_error: Exception | None = None
+        self.next_expense_id = 5187500
+        self.comments: list[dict] = []
+        self.comment_error: Exception | None = None
+
+    def create_project_expense(self, project_id: int, payload: dict) -> dict:
+        if self.expense_error:
+            raise self.expense_error
+        self.expenses.append((project_id, payload))
+        return {"id": self.next_expense_id, **payload}
+
+    def post_comment(self, *, commentable_id: int, commentable_type: str,
+                     text: str) -> dict:
+        if self.comment_error:
+            raise self.comment_error
+        self.comments.append({"commentable_id": commentable_id,
+                              "commentable_type": commentable_type,
+                              "text": text})
+        return {"id": 1}
+
+
+class FakeMocoInvoices:
+    def __init__(self):
+        # Mirrors the real /vat_code_sales shape pulled live from the account.
+        self.vat_codes: list[dict] = [
+            {"id": 107816, "tax": 8.1, "active": True},
+            {"id": 107817, "tax": 2.6, "active": True},
+            {"id": 107819, "tax": 0.0, "active": True},
+        ]
+        self.vat_codes_error: Exception | None = None
+        self.invoices: list[dict] = []
+        self.next_invoice_id = 7900001
+        self.create_invoice_error: Exception | None = None
+        self.attachments: list[tuple[int, str, str]] = []
+        self.add_attachment_error: Exception | None = None
+
+    def list_vat_code_sales(self) -> list[dict]:
+        if self.vat_codes_error:
+            raise self.vat_codes_error
+        return self.vat_codes
+
+    def create_invoice(self, payload: dict) -> dict:
+        if self.create_invoice_error:
+            raise self.create_invoice_error
+        self.invoices.append(payload)
+        invoice_id = self.next_invoice_id
+        self.next_invoice_id += 1
+        return {"id": invoice_id, **payload}
+
+    def add_attachment(self, invoice_id: int, *, filename: str,
+                       base64_content: str) -> dict:
+        if self.add_attachment_error:
+            raise self.add_attachment_error
+        self.attachments.append((invoice_id, filename, base64_content))
+        return {"id": 1}
+
+
+class FakePurchaseClient:
+    def __init__(self):
+        self.deleted_drafts: list[int] = []
+        self.delete_draft_error: Exception | None = None
+
+    def delete_purchase_draft(self, draft_id: int) -> None:
+        if self.delete_draft_error:
+            raise self.delete_draft_error
+        self.deleted_drafts.append(draft_id)
+
+
+class FakeOcr:
+    def __init__(self, result: EnergyCreditNoteData | None = None,
+                 error: Exception | None = None):
+        self.result = result
+        self.error = error
+        self.calls: list[bytes] = []
+
+    def extract_energy_credit_note(self, pdf_bytes: bytes) -> EnergyCreditNoteData:
+        self.calls.append(pdf_bytes)
+        if self.error:
+            raise self.error
+        return self.result
+
+
+class FakeTelegram:
+    def __init__(self):
+        self.messages: list[str] = []
+
+    def notify(self, text: str) -> bool:
+        self.messages.append(text)
+        return True
+
+
+def build_service(*, moco=None, moco_invoices=None, purchases=None, ocr=None,
+                  telegram=None, projects=None, customers=None,
+                  subdomain="solar"):
+    return EnergyCreditNoteService(
+        moco=moco or FakeMoco(),
+        moco_invoices=moco_invoices or FakeMocoInvoices(),
+        purchase_client=purchases or FakePurchaseClient(),
+        ocr=ocr or FakeOcr(result=make_credit()),
+        matcher=StromproduktionProjectMatcher(
+            PROJECTS if projects is None else projects),
+        customer_matcher=MocoSupplierMatcher(customers or []),
+        subdomain=subdomain,
+        telegram=telegram,
+    )
+
+
+def _http_error(code: int, body: bytes = b"boom") -> urlerror.HTTPError:
+    return urlerror.HTTPError("https://x", code, "err", {}, io.BytesIO(body))
+
+
+# --- detection ---------------------------------------------------------------
+
+def test_is_energy_credit_note_true_when_credit_note_and_evu_tagged():
+    assert is_energy_credit_note(make_invoice(is_credit_note=True), COMPANY) is True
+
+
+def test_is_energy_credit_note_false_when_not_credit_note():
+    assert is_energy_credit_note(make_invoice(is_credit_note=False), COMPANY) is False
+
+
+def test_is_energy_credit_note_false_when_no_company():
+    assert is_energy_credit_note(make_invoice(is_credit_note=True), None) is False
+
+
+def test_is_energy_credit_note_false_when_company_not_evu_tagged():
+    company = {"id": 1, "name": "Irgendein Lieferant", "tags": ["Sonstiges"]}
+    assert is_energy_credit_note(make_invoice(is_credit_note=True), company) is False
+
+
+def test_is_energy_credit_note_tag_check_is_case_insensitive():
+    company = {"id": 1, "name": "X",
+               "tags": ["lokaler energieversorger (evu)"]}
+    assert is_energy_credit_note(make_invoice(is_credit_note=True), company) is True
+
+
+def test_is_energy_credit_note_true_despite_different_company_id_than_project_customer():
+    """The real CKW case: the matched *supplier* company record (id
+    762378104) differs from the project's *customer* record (id
+    762378092) — detection only cares about the supplier's own tags, not
+    the eventual project match."""
+    assert is_energy_credit_note(make_invoice(is_credit_note=True), COMPANY) is True
+
+
+def test_has_matching_project_delegates_to_matcher():
+    """The fallback detection signal — used when the supplier's own
+    company record isn't tagged EVU (real EGBB regression, see
+    stromproduktion_project_matcher's has_candidate_for_supplier)."""
+    s = build_service()
+    assert s.has_matching_project("CKW AG (Lieferant)") is True
+    assert s.has_matching_project("Irgendein Unbekannter EVU AG") is False
+
+
+def test_is_evu_tagged_customer_true_when_matched_and_tagged():
+    """Real-world regression (draft 3154913, BKW Energie AG): the EVU tag
+    can live on the type=customer company record instead of (or with no)
+    type=supplier counterpart — the relationship an energy credit note
+    represents is PVcontracting selling production back to the EVU."""
+    bkw_customer = {"id": 763576517, "name": "BKW Energie AG",
+                    "tags": [EVU_TAG]}
+    s = build_service(customers=[bkw_customer])
+    assert s.is_evu_tagged_customer("BKW Energie AG") is True
+
+
+def test_is_evu_tagged_customer_false_when_matched_but_untagged():
+    untagged_customer = {"id": 1, "name": "Irgendeine AG", "tags": []}
+    s = build_service(customers=[untagged_customer])
+    assert s.is_evu_tagged_customer("Irgendeine AG") is False
+
+
+def test_is_evu_tagged_customer_false_when_no_match():
+    s = build_service(customers=[])
+    assert s.is_evu_tagged_customer("BKW Energie AG") is False
+
+
+def test_is_evu_tagged_customer_false_when_ambiguous():
+    tied = [{"id": 1, "name": "Solar Energie AG", "tags": [EVU_TAG]},
+           {"id": 2, "name": "Solar Energie GmbH", "tags": [EVU_TAG]}]
+    s = build_service(customers=tied)
+    assert s.is_evu_tagged_customer("Solar Energie") is False
+
+
+# --- happy path ---------------------------------------------------------------
+
+def test_happy_path_creates_expense_and_invoice():
+    moco = FakeMoco()
+    moco_invoices = FakeMocoInvoices()
+    purchases = FakePurchaseClient()
+    tg = FakeTelegram()
+    s = build_service(moco=moco, moco_invoices=moco_invoices,
+                      purchases=purchases, telegram=tg)
+
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=3143995, body=DRAFT_BODY)
+
+    assert result["energy_credit_note"] is True
+    assert result["expense_id"] == 5187500
+    assert result["project_id"] == 947264448
+    assert result["project_name"] == "Meierhofweg10_Emmen Contracting/Einspeisung"
+    assert result["leistungszeitraum"] == "2026/Q2"
+    assert result["gross_amount"] == 3785.65
+    assert result["net_amount"] == 3501.99
+
+    project_id, expense_payload = moco.expenses[0]
+    assert project_id == 947264448
+    assert expense_payload["title"] == "Stromproduktion 2026/Q2"
+    assert expense_payload["quantity"] == 1
+    assert expense_payload["unit"] == "x"
+    assert expense_payload["unit_price"] == 3501.99
+    assert expense_payload["unit_cost"] == 0
+    assert expense_payload["billable"] is True
+    assert expense_payload["budget_relevant"] is False
+    assert expense_payload["service_period_from"] == "2026-04-01"
+    assert expense_payload["service_period_to"] == "2026-06-30"
+    assert base64.b64decode(expense_payload["file"]["base64"]) == PDF_BYTES
+
+    invoice_payload = moco_invoices.invoices[0]
+    assert invoice_payload["status"] == "created"
+    assert invoice_payload["customer_id"] == 762378092
+    assert invoice_payload["project_id"] == 947264448
+    assert invoice_payload["recipient_address"] == (
+        "CKW AG\nTäschmattstrasse 4\n6015 Luzern\nSchweiz")
+    assert invoice_payload["title"] == (
+        "Stromproduktion 2026/Q2 – Meierhofweg10_Emmen Contracting/Einspeisung")
+    assert invoice_payload["currency"] == "CHF"
+    assert invoice_payload["tags"] == ["Stromproduktion"]
+    assert invoice_payload["vat_code_id"] == 107816
+    item = invoice_payload["items"][0]
+    assert item["type"] == "item"
+    assert item["title"] == "Stromproduktion 2026/Q2 (04 – 06/2026)"
+    assert item["quantity"] == 1
+    assert item["unit"] == "x"
+    assert item["unit_price"] == 3501.99
+    assert item["expense_ids"] == [5187500]
+    # Rechnungsdatum = the source EVU document's own invoice date (the
+    # customer's Beleg), not today — operator explicitly wants the Moco
+    # invoice dated to match it.
+    assert invoice_payload["date"] == "2026-07-31"
+    d = date.fromisoformat(invoice_payload["date"])
+    assert date.fromisoformat(invoice_payload["due_date"]) == d + timedelta(days=30)
+
+    assert moco_invoices.attachments[0][0] == result["invoice_id"]
+    assert base64.b64decode(moco_invoices.attachments[0][2]) == PDF_BYTES
+
+    # Invoice stays at "created" — never transitioned to "sent" (decision D2).
+    assert "sent" not in {invoice_payload.get("status")}
+
+    assert purchases.deleted_drafts == [3143995]
+    assert len(tg.messages) == 1
+    assert "verbucht" in tg.messages[0]
+    assert "versendet" in tg.messages[0]
+    assert moco.comments == []
+
+
+def test_invoice_date_falls_back_to_today_when_ocr_missing_invoice_date():
+    """No Rechnungsdatum on the source document — the Moco invoice date
+    falls back to today rather than being left unset (same posture as
+    the project expense's own `date` field)."""
+    ocr = FakeOcr(result=make_credit(invoice_date=None))
+    moco_invoices = FakeMocoInvoices()
+    s = build_service(moco_invoices=moco_invoices, ocr=ocr)
+    s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(), company=COMPANY,
+             draft_id=3143995, body=DRAFT_BODY)
+    invoice_payload = moco_invoices.invoices[0]
+    assert invoice_payload["date"] == date.today().isoformat()
+
+
+def test_low_confidence_success_flags_review_in_telegram():
+    tg = FakeTelegram()
+    ocr = FakeOcr(result=make_credit(confidence=0.4))
+    s = build_service(ocr=ocr, telegram=tg)
+    s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(), company=COMPANY,
+             draft_id=3143995, body=DRAFT_BODY)
+    assert "⚠️" in tg.messages[0]
+    assert "bitte prüfen" in tg.messages[0]
+
+
+# --- objekt fallback (top-level summary) ----------------------------------
+
+def test_objekt_fallback_matches_when_primary_objekt_is_generic():
+    """Real-world regression (draft 3143993, CKW vZEV Krugel 1 Oberkirch):
+    the production-section Objekt can be a generic label with no site
+    identifier ("vZEV Überschuss") — when that misses (`no_match`), the
+    top-level summary Objekt is tried as a fallback and used if it hits."""
+    tg = FakeTelegram()
+    ocr = FakeOcr(result=make_credit(
+        objekt="vZEV Überschuss",
+        objekt_top_level="Eigenbedarf PVA HEIV Meierhofweg 10"))
+    s = build_service(ocr=ocr, telegram=tg)
+
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=3143993, body=DRAFT_BODY)
+
+    assert result["project_id"] == 947264448
+    assert result["objekt_matched"] == "Eigenbedarf PVA HEIV Meierhofweg 10"
+    assert "Top-Level-Fallback" in tg.messages[0]
+    assert "Eigenbedarf PVA HEIV Meierhofweg 10" in tg.messages[0]
+
+
+def test_objekt_fallback_not_used_when_primary_matches():
+    """The primary (production-section) Objekt wins when it already
+    matches — the fallback is never consulted, let alone allowed to
+    override a successful primary match."""
+    tg = FakeTelegram()
+    ocr = FakeOcr(result=make_credit())  # default: primary objekt matches
+    s = build_service(ocr=ocr, telegram=tg)
+
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=3143995, body=DRAFT_BODY)
+
+    assert result["objekt_matched"] == "Produktion PVA HEIV Meierhofweg 10"
+    assert "Top-Level-Fallback" not in tg.messages[0]
+
+
+def test_objekt_fallback_not_retried_when_primary_ambiguous():
+    """An ambiguous primary result is not retried with the fallback
+    Objekt — even when the fallback Objekt would have resolved uniquely,
+    proving the retry genuinely doesn't happen (not just that this
+    particular fallback also fails)."""
+    projects = [
+        {"id": 1, "name": "Blumenrain 1 Contracting/Einspeisung",
+         "tags": ["Stromproduktion"], "customer": {"id": 1, "name": "CKW AG"}},
+        {"id": 2, "name": "Blumenrain 3 Contracting/Einspeisung",
+         "tags": ["Stromproduktion"], "customer": {"id": 1, "name": "CKW AG"}},
+    ]
+    ocr = FakeOcr(result=make_credit(
+        objekt="Produktion Blumenrain",
+        # Would uniquely match project id=1 (2 shared tokens vs project
+        # id=2's 1) if it were ever tried — it must not be.
+        objekt_top_level="Produktion Blumenrain 1"))
+    s = build_service(ocr=ocr, projects=projects)
+
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+
+    assert result["skipped"] == "energy_credit_note_project_ambiguous"
+
+
+def test_objekt_fallback_skipped_when_top_level_objekt_missing():
+    """No `objekt_top_level` to fall back to — stays `no_match`, doesn't
+    raise."""
+    ocr = FakeOcr(result=make_credit(objekt="Solarpark Zermatt",
+                                     objekt_top_level=None))
+    s = build_service(ocr=ocr)
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+    assert result["skipped"] == "energy_credit_note_project_no_match"
+
+
+# --- net-amount derivation -----------------------------------------------------
+
+def test_derive_net_amount_matches_worked_example():
+    """The exact draft-3143995 worked example from
+    specs/SPEC_energy_credit_note.md: 3785.65 / 1.081 = 3501.99."""
+    assert _derive_net_amount(3785.65, 0.081) == 3501.99
+
+
+def test_derive_net_amount_none_when_gross_missing():
+    assert _derive_net_amount(None, 0.081) is None
+
+
+def test_derive_net_amount_none_when_vat_rate_missing():
+    assert _derive_net_amount(3785.65, None) is None
+
+
+def test_derive_net_amount_rounds_to_two_decimals():
+    assert _derive_net_amount(100.0, 0.081) == pytest.approx(92.51)
+
+
+# --- quarter-label formatting -------------------------------------------------
+
+@pytest.mark.parametrize("period_from,period_to,expected", [
+    ("2026-01-15", "2026-03-31", "2026/Q1"),
+    ("2026-04-01", "2026-06-30", "2026/Q2"),
+    ("2026-07-01", "2026-09-30", "2026/Q3"),
+    ("2026-10-01", "2026-12-31", "2026/Q4"),
+])
+def test_leistungszeitraum_quarter_boundaries(period_from, period_to, expected):
+    ocr = FakeOcr(result=make_credit(period_from=period_from,
+                                     period_to=period_to))
+    s = build_service(ocr=ocr)
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+    assert result["leistungszeitraum"] == expected
+
+
+# --- keep-draft paths ---------------------------------------------------------
+
+def test_no_matching_project_keeps_draft():
+    """Both the primary AND the top-level-fallback Objekt miss — a real
+    no-match, not just a primary-source miss (see
+    test_objekt_fallback_matches_when_primary_objekt_is_generic for the
+    fallback-succeeds case)."""
+    moco = FakeMoco()
+    moco_invoices = FakeMocoInvoices()
+    purchases = FakePurchaseClient()
+    tg = FakeTelegram()
+    ocr = FakeOcr(result=make_credit(objekt="Solarpark Zermatt",
+                                     objekt_top_level="Solarpark Zermatt"))
+    s = build_service(moco=moco, moco_invoices=moco_invoices,
+                      purchases=purchases, ocr=ocr, telegram=tg)
+
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=3143995, body=DRAFT_BODY)
+
+    assert result["skipped"] == "energy_credit_note_project_no_match"
+    assert moco.expenses == []
+    assert moco_invoices.invoices == []
+    assert purchases.deleted_drafts == []
+    assert len(tg.messages) == 1
+    assert "nicht verbucht" in tg.messages[0]
+    comment = moco.comments[0]
+    assert comment["commentable_id"] == 3143995
+    assert comment["commentable_type"] == COMMENTABLE_TYPE_DRAFT
+
+
+def test_unrelated_supplier_never_falls_back_to_other_evus_project():
+    """A supplier with no Stromproduktion project of its own must never
+    be routed onto an unrelated EVU's project."""
+    ocr = FakeOcr(result=make_credit())
+    invoice = make_invoice(supplier_name="Irgendein Anderer EVU AG")
+    s = build_service(ocr=ocr)
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=invoice, company=COMPANY,
+                       draft_id=1, body=DRAFT_BODY)
+    assert result["skipped"] == "energy_credit_note_project_no_match"
+
+
+def test_ambiguous_project_reports_candidate_count():
+    projects = [
+        {"id": 1, "name": "Blumenrain 1 Contracting/Einspeisung",
+         "tags": ["Stromproduktion"], "customer": {"id": 1, "name": "CKW AG"}},
+        {"id": 2, "name": "Blumenrain 3 Contracting/Einspeisung",
+         "tags": ["Stromproduktion"], "customer": {"id": 1, "name": "CKW AG"}},
+    ]
+    tg = FakeTelegram()
+    ocr = FakeOcr(result=make_credit(objekt="Produktion Blumenrain"))
+    s = build_service(ocr=ocr, projects=projects, telegram=tg)
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+    assert result["skipped"] == "energy_credit_note_project_ambiguous"
+    assert result["match_status"] == "ambiguous"
+    assert "2 Projekte" in tg.messages[0]
+
+
+def test_missing_gross_amount_keeps_draft():
+    moco = FakeMoco()
+    tg = FakeTelegram()
+    ocr = FakeOcr(result=make_credit(gross_amount=None))
+    s = build_service(moco=moco, ocr=ocr, telegram=tg)
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+    assert result["skipped"] == "energy_credit_note_no_gross_amount"
+    assert moco.expenses == []
+    assert "Brutto-Betrag" in tg.messages[0]
+
+
+def test_missing_vat_rate_keeps_draft():
+    """A missing vat_rate blocks the net-amount derivation (gross / (1 +
+    vat_rate)) just as much as a missing gross_amount would — never divide
+    by a guessed rate (see specs/SPEC_energy_credit_note.md, D6)."""
+    moco = FakeMoco()
+    moco_invoices = FakeMocoInvoices()
+    tg = FakeTelegram()
+    ocr = FakeOcr(result=make_credit(vat_rate=None))
+    s = build_service(moco=moco, moco_invoices=moco_invoices, ocr=ocr,
+                      telegram=tg)
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+    assert result["skipped"] == "energy_credit_note_no_vat_rate"
+    assert moco.expenses == []
+    assert moco_invoices.invoices == []
+    assert "Mehrwertsteuersatz" in tg.messages[0]
+
+
+def test_missing_period_keeps_draft():
+    moco = FakeMoco()
+    tg = FakeTelegram()
+    ocr = FakeOcr(result=make_credit(period_to=None))
+    s = build_service(moco=moco, ocr=ocr, telegram=tg)
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+    assert result["skipped"] == "energy_credit_note_no_period"
+    assert moco.expenses == []
+
+
+def test_unparseable_period_from_keeps_draft():
+    moco = FakeMoco()
+    ocr = FakeOcr(result=make_credit(period_from="not-a-date"))
+    s = build_service(moco=moco, ocr=ocr)
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+    assert result["skipped"] == "energy_credit_note_no_period"
+    assert moco.expenses == []
+
+
+def test_failed_draft_comment_is_swallowed():
+    moco = FakeMoco()
+    moco.comment_error = _http_error(422)
+    tg = FakeTelegram()
+    ocr = FakeOcr(result=make_credit(objekt="Solarpark Zermatt",
+                                     objekt_top_level="Solarpark Zermatt"))
+    s = build_service(moco=moco, ocr=ocr, telegram=tg)
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+    assert result["skipped"] == "energy_credit_note_project_no_match"
+    assert len(tg.messages) == 1
+
+
+# --- VAT-code resolution -------------------------------------------------------
+
+def test_vat_code_resolved_from_ocr_rate():
+    moco_invoices = FakeMocoInvoices()
+    ocr = FakeOcr(result=make_credit(vat_rate=0.026))
+    s = build_service(moco_invoices=moco_invoices, ocr=ocr)
+    s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(), company=COMPANY,
+             draft_id=1, body=DRAFT_BODY)
+    assert moco_invoices.invoices[0]["vat_code_id"] == 107817
+
+
+def test_vat_code_falls_back_to_account_standard_when_ocr_rate_missing():
+    """`_pick_vat_code_id`'s own ocr_rate=None fallback, tested directly:
+    through the full service this path is now unreachable, since a missing
+    `vat_rate` is caught earlier by the net-amount-derivation gate (see
+    `test_missing_vat_rate_keeps_draft`) before `_resolve_vat_code_id` is
+    ever called."""
+    vat_codes = [
+        {"id": 107816, "tax": 8.1, "active": True},
+        {"id": 107817, "tax": 2.6, "active": True},
+    ]
+    assert _pick_vat_code_id(vat_codes, None) == 107816
+
+
+def test_vat_code_falls_back_to_first_active_when_no_standard_rate_present():
+    vat_codes = [{"id": 999, "tax": 3.7, "active": True}]
+    assert _pick_vat_code_id(vat_codes, None) == 999
+
+
+def test_vat_code_omitted_when_list_fetch_fails():
+    moco_invoices = FakeMocoInvoices()
+    moco_invoices.vat_codes_error = _http_error(500)
+    ocr = FakeOcr(result=make_credit())
+    s = build_service(moco_invoices=moco_invoices, ocr=ocr)
+    s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(), company=COMPANY,
+             draft_id=1, body=DRAFT_BODY)
+    assert "vat_code_id" not in moco_invoices.invoices[0]
+
+
+# --- error propagation ---------------------------------------------------------
+
+def test_expense_create_http_error_propagates():
+    moco = FakeMoco()
+    moco.expense_error = _http_error(422, b'{"base":["error"]}')
+    purchases = FakePurchaseClient()
+    s = build_service(moco=moco, purchases=purchases)
+    with pytest.raises(urlerror.HTTPError):
+        s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(), company=COMPANY,
+                 draft_id=1, body=DRAFT_BODY)
+    assert purchases.deleted_drafts == []
+
+
+def test_invoice_create_http_error_propagates():
+    moco_invoices = FakeMocoInvoices()
+    moco_invoices.create_invoice_error = _http_error(422)
+    purchases = FakePurchaseClient()
+    s = build_service(moco_invoices=moco_invoices, purchases=purchases)
+    with pytest.raises(urlerror.HTTPError):
+        s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(), company=COMPANY,
+                 draft_id=1, body=DRAFT_BODY)
+    assert purchases.deleted_drafts == []
+
+
+def test_attachment_http_error_propagates():
+    moco_invoices = FakeMocoInvoices()
+    moco_invoices.add_attachment_error = _http_error(422)
+    purchases = FakePurchaseClient()
+    s = build_service(moco_invoices=moco_invoices, purchases=purchases)
+    with pytest.raises(urlerror.HTTPError):
+        s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(), company=COMPANY,
+                 draft_id=1, body=DRAFT_BODY)
+    assert purchases.deleted_drafts == []
+
+
+# --- draft deletion edge cases --------------------------------------------------
+
+def test_draft_delete_404_is_silent():
+    purchases = FakePurchaseClient()
+    purchases.delete_draft_error = _http_error(404)
+    tg = FakeTelegram()
+    s = build_service(purchases=purchases, telegram=tg)
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+    assert result["invoice_id"] is not None
+    assert len(tg.messages) == 1
+    assert "verbucht" in tg.messages[0]
+
+
+def test_draft_delete_failure_alerts_but_result_stays_ok():
+    purchases = FakePurchaseClient()
+    purchases.delete_draft_error = _http_error(500, b"oops")
+    tg = FakeTelegram()
+    s = build_service(purchases=purchases, telegram=tg)
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+    assert result["invoice_id"] is not None
+    delete_alerts = [m for m in tg.messages if "nicht gelöscht" in m]
+    assert len(delete_alerts) == 1
+    assert "invoices/" in delete_alerts[0]
+
+
+def test_works_without_telegram():
+    """telegram=None (unit-test convenience + defensive prod default)."""
+    s = build_service(telegram=None)
+    result = s.process(pdf_bytes=PDF_BYTES, invoice=make_invoice(),
+                       company=COMPANY, draft_id=1, body=DRAFT_BODY)
+    assert result["invoice_id"] is not None
+
+
+# --- SupplierInvoiceOcrService dispatch ---------------------------------------
+
+class DispatchFakeMoco:
+    def __init__(self, pdf_bytes: bytes = PDF_BYTES):
+        self.pdf_bytes = pdf_bytes
+        self.suppliers: list[dict] = []
+        self.companies: dict[int, dict] = {}
+
+    def download_file(self, signed_url: str) -> bytes:
+        return self.pdf_bytes
+
+    def list_suppliers(self, *, limit: int = 1000) -> list[dict]:
+        return self.suppliers
+
+    def get_company(self, company_id: int) -> dict:
+        return self.companies.get(company_id, {"id": company_id})
+
+
+class DispatchFakePurchaseClient:
+    def __init__(self):
+        self.creates: list[dict] = []
+        self.deleted_drafts: list[int] = []
+
+    def list_vat_codes(self) -> list[dict]:
+        return []
+
+    def create_purchase(self, payload: dict) -> dict:
+        self.creates.append(payload)
+        return {"id": 4001234, "items": []}
+
+    def delete_purchase_draft(self, draft_id: int) -> None:
+        self.deleted_drafts.append(draft_id)
+
+    def post_comment(self, purchase_id: int, text: str) -> dict:
+        return {"id": 1}
+
+    def assign_item_to_project(self, *args, **kwargs) -> dict:
+        return {"id": 1}
+
+
+class DispatchFakeOcr:
+    def __init__(self, result: InvoiceData):
+        self.result = result
+        self.calls: list[bytes] = []
+
+    def extract(self, pdf_bytes: bytes) -> InvoiceData:
+        self.calls.append(pdf_bytes)
+        return self.result
+
+
+class FakeEnergyCreditNoteService:
+    def __init__(self, *, http_error: Exception | None = None,
+                 has_matching_project_result: bool = False,
+                 is_evu_tagged_customer_result: bool = False):
+        self.calls: list[dict] = []
+        self.http_error = http_error
+        self.has_matching_project_result = has_matching_project_result
+        self.has_matching_project_calls: list[str | None] = []
+        self.is_evu_tagged_customer_result = is_evu_tagged_customer_result
+        self.is_evu_tagged_customer_calls: list[str | None] = []
+
+    def has_matching_project(self, supplier_name: str | None) -> bool:
+        self.has_matching_project_calls.append(supplier_name)
+        return self.has_matching_project_result
+
+    def is_evu_tagged_customer(self, supplier_name: str | None) -> bool:
+        self.is_evu_tagged_customer_calls.append(supplier_name)
+        return self.is_evu_tagged_customer_result
+
+    def process(self, *, pdf_bytes, invoice, company, draft_id, body) -> dict:
+        self.calls.append({"pdf_bytes": pdf_bytes, "invoice": invoice,
+                           "company": company, "draft_id": draft_id,
+                           "body": body})
+        if self.http_error:
+            raise self.http_error
+        return {"energy_credit_note": True, "draft_id": draft_id,
+                "invoice_id": 7900001}
+
+
+def test_energy_credit_note_draft_is_delegated_not_purchased():
+    moco = DispatchFakeMoco()
+    moco.suppliers = [COMPANY]
+    moco.companies = {COMPANY["id"]: COMPANY}
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(supplier_name="CKW AG (Lieferant)",
+                                       is_credit_note=True))
+    ecn = FakeEnergyCreditNoteService()
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn)
+
+    result = s.process("create", DRAFT_BODY)
+
+    assert result == {"energy_credit_note": True, "draft_id": 3143995,
+                      "invoice_id": 7900001}
+    assert len(ecn.calls) == 1
+    assert ecn.calls[0]["draft_id"] == 3143995
+    assert ecn.calls[0]["company"]["id"] == COMPANY["id"]
+    # The generic OCR→purchase path never ran.
+    assert purchases.creates == []
+
+
+def test_untagged_supplier_still_delegated_via_project_match_fallback():
+    """Real-world regression (draft 3143992, EGBB): the matched *supplier*
+    company record can have `tags: []` (only the *customer* record is
+    tagged EVU). Detection must still succeed via the second signal —
+    an actual Stromproduktion project existing for this supplier."""
+    untagged_company = {"id": 762340520,
+                        "name": "EGBB Elektrizitäts Genossenschaft Boswil "
+                                "Bünzen (Lieferant)", "tags": []}
+    moco = DispatchFakeMoco()
+    moco.suppliers = [untagged_company]
+    moco.companies = {untagged_company["id"]: untagged_company}
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(
+        supplier_name="EGBB Elektrizitäts Genossenschaft Boswil Bünzen "
+                      "(Lieferant)",
+        is_credit_note=True))
+    ecn = FakeEnergyCreditNoteService(has_matching_project_result=True)
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn)
+
+    result = s.process("create", DRAFT_BODY)
+
+    assert result == {"energy_credit_note": True, "draft_id": 3143995,
+                      "invoice_id": 7900001}
+    assert len(ecn.calls) == 1
+    assert purchases.creates == []
+    assert ecn.has_matching_project_calls == [
+        "EGBB Elektrizitäts Genossenschaft Boswil Bünzen (Lieferant)"]
+
+
+def test_no_supplier_company_at_all_still_delegated_via_project_match_fallback():
+    """Real-world regression (draft 3154913, BKW Energie AG, Häbern 118):
+    unlike CKW/EGBB, BKW has only ONE Moco company record at all, and it's
+    `type: "customer"` (correctly EVU-tagged) — there is no `type:
+    "supplier"` "(Lieferant)" counterpart. `MocoSupplierMatcher`/
+    `list_suppliers()` (type=supplier only, by design — see
+    `moco_client.py`) therefore finds NOTHING and `company` stays None,
+    a step further than the EGBB case above (which at least had an
+    untagged supplier-type record). Detection must still succeed via the
+    D4 fallback signal ALONE — a THIRD independent real-world EVU
+    confirming the fallback generalizes regardless of whether any
+    supplier-type company record exists.
+
+    NOTE: as of this writing no Stromproduktion-tagged project with
+    customer.name="BKW Energie AG" exists in the live Moco account for
+    this site — draft 3154913 currently falls through to the generic
+    Gutschrift-purchase path for that reason. That is an operator-side
+    Moco data gap (create/tag the right project), not a code gap; see
+    `specs/SPEC_energy_credit_note.md`. This test proves the code is
+    already ready for it — `test_bkw_credit_note_processed_correctly_once_project_exists`
+    below proves the full expense+invoice flow using this draft's real
+    extracted field values."""
+    moco = DispatchFakeMoco()
+    moco.suppliers = []  # BKW has no type=supplier company record at all
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(
+        supplier_name="BKW Energie AG",
+        is_credit_note=True,
+        total_amount=-304.3,
+        commission="Nr. 684868, Häbern 118, 3538 Röthenbach im Emmental"))
+    ecn = FakeEnergyCreditNoteService(has_matching_project_result=True)
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn)
+
+    result = s.process("create", DRAFT_BODY)
+
+    assert result == {"energy_credit_note": True, "draft_id": 3143995,
+                      "invoice_id": 7900001}
+    assert len(ecn.calls) == 1
+    assert ecn.calls[0]["company"] is None
+    assert ecn.has_matching_project_calls == ["BKW Energie AG"]
+    assert purchases.creates == []
+
+
+def test_evu_tagged_customer_alone_delegates_without_needing_project_or_supplier():
+    """Real-world regression (draft 3154913, BKW Energie AG): the third
+    detection signal — a CUSTOMER-type company match carrying the EVU tag
+    — is sufficient entirely on its own, independent of both the
+    supplier-type lookup (`company=None` here, matching live reality
+    before this signal existed) and the project-fallback signal. Also
+    proves the OR-chain short-circuits: `has_matching_project` is never
+    even consulted once `is_evu_tagged_customer` already said yes."""
+    moco = DispatchFakeMoco()
+    moco.suppliers = []
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(
+        supplier_name="BKW Energie AG",
+        is_credit_note=True,
+        total_amount=-304.3,
+        commission="Nr. 684868, Häbern 118, 3538 Röthenbach im Emmental"))
+    ecn = FakeEnergyCreditNoteService(is_evu_tagged_customer_result=True)
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn)
+
+    result = s.process("create", DRAFT_BODY)
+
+    assert result == {"energy_credit_note": True, "draft_id": 3143995,
+                      "invoice_id": 7900001}
+    assert len(ecn.calls) == 1
+    assert ecn.calls[0]["company"] is None
+    assert ecn.is_evu_tagged_customer_calls == ["BKW Energie AG"]
+    assert ecn.has_matching_project_calls == []
+    assert purchases.creates == []
+
+
+def test_bkw_credit_note_processed_correctly_once_project_exists():
+    """Companion to the dispatch test above — proves the full expense +
+    invoice pipeline correctly handles a real BKW document once a
+    Stromproduktion project exists for it (the operator-side gap noted
+    above), using LIVE-EXTRACTED field values from draft 3154913 rather
+    than synthetic ones. This is a different EVU document format than
+    every other real example this feature has been tested against: BKW
+    has no "Objekt:" label at all (site identifier is a "Bezugsstelle:"
+    field instead) and frames every line item as negative with a separate
+    positive "Zu Ihren Gunsten" payout total (same EGBB-style negative
+    convention as D5, confirmed live to generalize to a third EVU).
+    `AnthropicOcrClient.extract_energy_credit_note` was confirmed live to
+    correctly parse this format without any prompt changes:
+    gross_amount=304.30, vat_rate=0.081, objekt=objekt_top_level=
+    'Nr. 684868, Häbern 118, 3538 Röthenbach im Emmental,
+    Photovoltaikanlage' (BKW's Bezugsstelle, recognized as the site
+    identifier), period 2026-05-07..2026-06-30."""
+    bkw_project = {
+        "id": 900000001,
+        "name": "Häbern 118, Röthenbach - BKW Einspeisung",
+        "tags": ["Contracting", "Stromproduktion"],
+        "customer": {"id": 763576517, "name": "BKW Energie AG"},
+        "billing_address": "BKW Energie AG\nViktoriaplatz 2\n3013 Bern\nSchweiz",
+        "custom_properties": {"Kommission": None},
+    }
+    credit = EnergyCreditNoteData(
+        objekt="Nr. 684868, Häbern 118, 3538 Röthenbach im Emmental, "
+              "Photovoltaikanlage",
+        objekt_top_level="Nr. 684868, Häbern 118, 3538 Röthenbach im "
+                         "Emmental, Photovoltaikanlage",
+        gross_amount=304.30,
+        vat_rate=0.081,
+        period_from="2026-05-07",
+        period_to="2026-06-30",
+        invoice_date="2026-07-28",
+        invoice_number="751 600 263 080",
+        confidence=0.82,
+    )
+    moco = FakeMoco()
+    moco_invoices = FakeMocoInvoices()
+    purchases = FakePurchaseClient()
+    ocr = FakeOcr(result=credit)
+    s = build_service(moco=moco, moco_invoices=moco_invoices,
+                      purchases=purchases, ocr=ocr, projects=[bkw_project])
+
+    result = s.process(
+        pdf_bytes=PDF_BYTES,
+        invoice=make_invoice(supplier_name="BKW Energie AG"),
+        company=None,  # no supplier-type company record exists — see above
+        draft_id=3154913, body=DRAFT_BODY)
+
+    assert result["project_id"] == 900000001
+    assert result["net_amount"] == 281.5  # 304.30 / 1.081, rounded to 2dp
+    assert result["leistungszeitraum"] == "2026/Q2"
+
+    project_id, expense_payload = moco.expenses[0]
+    assert project_id == 900000001
+    assert expense_payload["unit_price"] == 281.5
+    assert expense_payload["service_period_from"] == "2026-05-07"
+
+    invoice_payload = moco_invoices.invoices[0]
+    assert invoice_payload["customer_id"] == 763576517
+    assert invoice_payload["items"][0]["unit_price"] == 281.5
+
+
+def test_untagged_supplier_without_project_match_falls_through_to_purchase():
+    """The fallback signal only fires when a project actually exists —
+    an untagged, unrelated credit-note sender must still fall through to
+    the generic purchase path, not get swept into the energy branch."""
+    untagged_company = {"id": 1, "name": "Irgendein Anderer AG", "tags": []}
+    moco = DispatchFakeMoco()
+    moco.suppliers = [untagged_company]
+    moco.companies = {untagged_company["id"]: untagged_company}
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(supplier_name="Irgendein Anderer AG",
+                                       is_credit_note=True))
+    ecn = FakeEnergyCreditNoteService(has_matching_project_result=False)
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn)
+
+    s.process("create", DRAFT_BODY)
+
+    assert ecn.calls == []
+    assert len(purchases.creates) == 1
+
+
+def test_credit_note_telegram_includes_evu_hint_when_all_signals_declined():
+    """When the energy-credit-note branch was actually checked (service
+    configured) and all three detection signals declined a genuine
+    credit note, the generic "Gutschrift erkannt" alert gets a soft,
+    conditional hint pointing at what might be missing on the Moco side
+    (EVU tag on either company-type record, or a Stromproduktion
+    project) — exactly the situation draft 3154913 was in before the
+    BKW project/tag existed."""
+    untagged_company = {"id": 1, "name": "Irgendein Anderer AG", "tags": []}
+    moco = DispatchFakeMoco()
+    moco.suppliers = [untagged_company]
+    moco.companies = {untagged_company["id"]: untagged_company}
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(supplier_name="Irgendein Anderer AG",
+                                       is_credit_note=True))
+    ecn = FakeEnergyCreditNoteService(has_matching_project_result=False,
+                                      is_evu_tagged_customer_result=False)
+    tg = FakeTelegram()
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn, telegram=tg)
+
+    s.process("create", DRAFT_BODY)
+
+    assert "Gutschrift erkannt" in tg.messages[0]
+    assert "Falls dies eine EVU-Produktions-Gutschrift ist" in tg.messages[0]
+    assert EVU_TAG in tg.messages[0]
+    assert "Irgendein Anderer AG" in tg.messages[0]
+
+
+def test_credit_note_telegram_omits_evu_hint_when_service_not_configured():
+    """`energy_credit_note=None` — detection was never even attempted, so
+    the hint would be misleading (we don't actually know it declined
+    anything) and must not appear."""
+    moco = DispatchFakeMoco()
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(supplier_name="Irgendein Anderer AG",
+                                       is_credit_note=True))
+    tg = FakeTelegram()
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        telegram=tg)
+
+    s.process("create", DRAFT_BODY)
+
+    assert "Gutschrift erkannt" in tg.messages[0]
+    assert "EVU-Produktions-Gutschrift" not in tg.messages[0]
+
+
+def test_non_energy_credit_note_falls_through_to_generic_purchase_path():
+    moco = DispatchFakeMoco()
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(supplier_name="FLYERALARM",
+                                       is_credit_note=False))
+    ecn = FakeEnergyCreditNoteService()
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn)
+
+    s.process("create", DRAFT_BODY)
+
+    assert ecn.calls == []
+    assert len(purchases.creates) == 1
+
+
+def test_flipped_consumption_dominant_invoice_falls_through_to_purchase():
+    """Real-world regression (purchase 3734115, CKW vZEV Krugel 1
+    Oberkirch, period 2025/11-12): when the consumption/Rechnungsbetrag
+    (net CHF 1'696.74) exceeds the production Gutschrift (net CHF 39.17),
+    CKW's own document flips from "Ihre Gutschrift" to "Ihre
+    Stromrechnung" — a genuine payable, not PVcontracting's own outgoing
+    revenue. Live-tested `AnthropicOcrClient.extract` against the real PDF
+    and confirmed it correctly returns `is_credit_note=False` (not fooled
+    by the word "Gutschrift" appearing in the invoice's own netting
+    breakdown) with `total_amount=1791.85`, `commission='vZEV Krugel 1
+    Oberkirch'` — the exact field values reproduced here.
+
+    Both `is_energy_credit_note()` and its EVU-tag/project-match OR
+    fallback hard-require `invoice.is_credit_note == True` with no rescue
+    path — so this must fall straight through to the generic
+    OCR->Purchase pipeline, exactly like the real purchase was booked
+    historically (as a plain Purchase, not via this feature), EVEN
+    THOUGH the supplier is EVU-tagged and a matching Stromproduktion
+    project exists (`has_matching_project_result=True` proves the
+    fallback is never even consulted)."""
+    moco = DispatchFakeMoco()
+    moco.suppliers = [COMPANY]
+    moco.companies = {COMPANY["id"]: COMPANY}
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(
+        supplier_name="CKW AG (Lieferant)",
+        is_credit_note=False,
+        total_amount=1791.85,
+        commission="vZEV Krugel 1 Oberkirch"))
+    ecn = FakeEnergyCreditNoteService(has_matching_project_result=True)
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn)
+
+    s.process("create", DRAFT_BODY)
+
+    assert ecn.calls == []
+    assert ecn.has_matching_project_calls == []
+    assert len(purchases.creates) == 1
+
+
+def test_energy_credit_note_without_service_falls_through():
+    """energy_credit_note=None (default) — legacy behavior on the same body."""
+    moco = DispatchFakeMoco()
+    moco.suppliers = [COMPANY]
+    moco.companies = {COMPANY["id"]: COMPANY}
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(supplier_name="CKW AG (Lieferant)",
+                                       is_credit_note=True))
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar")
+
+    result = s.process("create", DRAFT_BODY)
+
+    assert "energy_credit_note" not in result
+    assert len(purchases.creates) == 1
+
+
+def test_energy_credit_note_4xx_propagates_not_swallowed_as_moco_rejected():
+    """The energy-credit-note branch's own HTTPErrors must reach
+    index.py's standard 4xx/5xx mapping, not this function's
+    purchase-specific duplicate-receipt swallow (see the
+    `in_energy_credit_note_branch` flag in supplier_invoice_ocr_service.py)."""
+    moco = DispatchFakeMoco()
+    moco.suppliers = [COMPANY]
+    moco.companies = {COMPANY["id"]: COMPANY}
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(supplier_name="CKW AG (Lieferant)",
+                                       is_credit_note=True))
+    ecn = FakeEnergyCreditNoteService(http_error=_http_error(422))
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn)
+
+    with pytest.raises(urlerror.HTTPError):
+        s.process("create", DRAFT_BODY)
