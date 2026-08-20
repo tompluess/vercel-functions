@@ -217,12 +217,20 @@ class SupplierInvoiceOcrService:
             # delegate before any purchase-payload work. Detection needs
             # the OCR result + matched supplier company, so it can only
             # run here (unlike the smart-me check, which runs before the
-            # PDF is even downloaded). Two independent signals, either
-            # sufficient: the supplier's own EVU tag, or (fallback, for
-            # when that tag is missing/incomplete — confirmed live) a
-            # Stromproduktion project actually existing for this supplier.
+            # PDF is even downloaded). THREE independent signals, any one
+            # sufficient: the supplier-type company's own EVU tag; a
+            # CUSTOMER-type company matching the supplier name carrying
+            # the EVU tag instead (confirmed live for CKW and BKW — the
+            # relationship a credit note represents is PVcontracting
+            # selling production back to the EVU, i.e. the EVU as a
+            # customer); or (fallback, for when neither company record is
+            # tagged — confirmed live) a Stromproduktion project actually
+            # existing for this supplier.
             if self._energy_credit_note is not None and (
                     is_energy_credit_note(invoice, company)
+                    or (invoice.is_credit_note
+                        and self._energy_credit_note.is_evu_tagged_customer(
+                            invoice.supplier_name))
                     or (invoice.is_credit_note
                         and self._energy_credit_note.has_matching_project(
                             invoice.supplier_name))):

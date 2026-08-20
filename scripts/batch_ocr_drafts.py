@@ -449,11 +449,14 @@ def _process_draft(draft: dict, *,
     # short-circuit to their own expense+invoice flow — mirrors the
     # production webhook's dispatch point exactly (right after the
     # supplier company is resolved, before Kommission/VAT/category
-    # resolution for the generic purchase path). Two independent signals,
-    # either sufficient — see the identical check in
+    # resolution for the generic purchase path). Three independent
+    # signals, any one sufficient — see the identical check in
     # supplier_invoice_ocr_service.py.
     is_energy_credit = energy_credit_note_service is not None and (
         is_energy_credit_note(invoice, full_company)
+        or (invoice.is_credit_note
+            and energy_credit_note_service.is_evu_tagged_customer(
+                invoice.supplier_name))
         or (invoice.is_credit_note
             and energy_credit_note_service.has_matching_project(
                 invoice.supplier_name)))
@@ -808,6 +811,21 @@ def main() -> int:
     print(f"  {len(all_suppliers)} supplier(s) returned, "
           f"{supplier_matcher.indexed_count()} matchable by name.")
 
+    # Customer-type company list feeds the third energy-credit-note
+    # detection signal (`is_evu_tagged_customer`) — some EVUs only carry
+    # the EVU tag on their type=customer record (confirmed live: CKW,
+    # BKW). Same per-run fetch + graceful-empty-on-failure pattern.
+    print("Loading Moco customers for EVU customer-tag detection …")
+    try:
+        all_customers = moco.list_customers()
+    except Exception as e:
+        print(f"  WARN: list_customers failed ({e}); EVU customer-tag "
+              "detection signal disabled.", file=sys.stderr)
+        all_customers = []
+    customer_matcher = MocoSupplierMatcher(all_customers)
+    print(f"  {len(all_customers)} customer(s) returned, "
+          f"{customer_matcher.indexed_count()} matchable by name.")
+
     # Telegram intentionally NOT wired in. Batch runs touch dozens of drafts
     # at a time and would spam the chat with one alert per row; the table is
     # the audit surface here. Production webhook traffic still notifies as
@@ -816,6 +834,7 @@ def main() -> int:
     energy_credit_note_service = EnergyCreditNoteService(
         moco=moco, moco_invoices=moco_invoices, purchase_client=purchases,
         ocr=ocr, matcher=StromproduktionProjectMatcher(all_projects),
+        customer_matcher=customer_matcher,
         subdomain=subdomain, telegram=None)
     service = SupplierInvoiceOcrService(
         moco=moco, purchase_client=purchases, ocr=ocr,

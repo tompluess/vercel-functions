@@ -1,11 +1,12 @@
-"""Unit tests for MocoClient.list_suppliers.
+"""Unit tests for MocoClient.list_suppliers / list_customers.
 
 The rest of MocoClient (get_company / get_project / post_comment /
 download_file) is exercised end-to-end via the Bexio and OCR endpoint tests
 — they stub urlopen so the wrappers are trivially covered by call-site
-assertions. The supplier listing has non-trivial client-side logic
-(pagination, defensive shape handling) that deserves focused unit tests.
-The name matching itself lives in MocoSupplierMatcher (own test module).
+assertions. The supplier/customer listing has non-trivial client-side logic
+(pagination, defensive shape handling, shared via `_list_companies`) that
+deserves focused unit tests. The name matching itself lives in
+MocoSupplierMatcher (own test module).
 """
 
 import json
@@ -109,3 +110,25 @@ def test_list_suppliers_handles_unexpected_response_shape(client, calls):
     back to "no company linked" rather than 500-ing on a schema drift."""
     calls["responses"] = [json.dumps({"data": []}).encode()]
     assert client.list_suppliers() == []
+
+
+def test_list_customers_uses_type_customer(client, calls):
+    """`list_customers` shares `list_suppliers`' pagination/limit/error
+    handling (both go through `_list_companies`, covered above) — this
+    only needs to confirm the type filter differs. Feeds
+    `EnergyCreditNoteService.is_evu_tagged_customer`: some EVUs (CKW, BKW,
+    confirmed live) carry the `Lokaler Energieversorger (EVU)` tag on
+    their `type: "customer"` record rather than any `type: "supplier"`
+    one — the relationship an energy credit note represents is
+    PVcontracting selling production back to the EVU."""
+    calls["responses"] = [json.dumps([
+        {"id": 763576517, "name": "BKW Energie AG",
+         "tags": ["Lokaler Energieversorger (EVU)"]},
+    ]).encode()]
+    result = client.list_customers()
+    assert [c["id"] for c in result] == [763576517]
+    call = calls["calls"][0]
+    assert call["url"] == (
+        "https://solar.mocoapp.com/api/v1/companies"
+        "?type=customer&per_page=100&page=1"
+    )

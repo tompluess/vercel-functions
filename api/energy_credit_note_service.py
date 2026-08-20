@@ -67,6 +67,7 @@ from api.anthropic_ocr_client import (
 from api.moco_client import MocoClient
 from api.moco_invoice_client import MocoInvoiceClient
 from api.moco_purchase_client import MocoPurchaseClient
+from api.moco_supplier_matcher import MocoSupplierMatcher
 from api.stromproduktion_project_matcher import (
     StromproduktionProjectMatch,
     StromproduktionProjectMatcher,
@@ -96,13 +97,17 @@ def is_energy_credit_note(invoice: InvoiceData, company: dict | None) -> bool:
     lookup `SupplierInvoiceOcrService.process` already runs for every
     draft.
 
-    This is one of TWO independent detection signals — callers should
-    also check `EnergyCreditNoteService.has_matching_project` and treat
-    either as sufficient. The EVU tag alone is not reliable: confirmed
-    live that Moco can hold the tag on one of an entity's two company
-    records but not the other (see `has_candidate_for_supplier`'s
-    docstring in `stromproduktion_project_matcher.py`), so a real EVU
-    credit note can arrive with `company.tags == []`.
+    This is `company` — the SUPPLIER-type company match — one of THREE
+    independent detection signals; callers should also check
+    `EnergyCreditNoteService.has_matching_project` and
+    `EnergyCreditNoteService.is_evu_tagged_customer`, treating any one as
+    sufficient. The EVU tag on the supplier-type record alone is not
+    reliable: confirmed live that Moco can hold the tag on one of an
+    entity's two company records but not the other (see
+    `has_candidate_for_supplier`'s docstring in
+    `stromproduktion_project_matcher.py`), so a real EVU credit note can
+    arrive with `company.tags == []` — or with no supplier-type company
+    record at all (confirmed live for BKW, see `is_evu_tagged_customer`).
     """
     if not invoice.is_credit_note or company is None:
         return False
@@ -115,6 +120,7 @@ class EnergyCreditNoteService:
                  purchase_client: MocoPurchaseClient,
                  ocr: AnthropicOcrClient,
                  matcher: StromproduktionProjectMatcher,
+                 customer_matcher: MocoSupplierMatcher,
                  subdomain: str,
                  telegram: TelegramNotifier | None = None):
         self._moco = moco
@@ -122,6 +128,7 @@ class EnergyCreditNoteService:
         self._purchases = purchase_client
         self._ocr = ocr
         self._matcher = matcher
+        self._customer_matcher = customer_matcher
         self._subdomain = subdomain
         self._telegram = telegram
 
@@ -131,6 +138,24 @@ class EnergyCreditNoteService:
         plausibly matches `supplier_name`, regardless of whether the
         supplier's own Moco company record carries the EVU tag."""
         return self._matcher.has_candidate_for_supplier(supplier_name)
+
+    def is_evu_tagged_customer(self, supplier_name: str | None) -> bool:
+        """Third detection signal — see `is_energy_credit_note`'s
+        docstring. True when a CUSTOMER-type company matching
+        `supplier_name` carries the EVU tag, independent of whatever the
+        SUPPLIER-type lookup (`is_energy_credit_note`'s `company` param)
+        found — the two are different Moco company records for the same
+        real-world entity (confirmed live: CKW and BKW both tag their
+        `type: "customer"` record, since that's the relationship an
+        energy-credit-note represents — PVcontracting selling production
+        back to the EVU). Reuses `MocoSupplierMatcher`'s own name-matching
+        tiers against the customer-type company list — same conservative
+        "unique hit only" semantics as the supplier-type lookup."""
+        match = self._customer_matcher.match(supplier_name)
+        if match.status != "matched":
+            return False
+        tags = {str(t).casefold() for t in (match.company.get("tags") or [])}
+        return EVU_TAG.casefold() in tags
 
     def process(self, *, pdf_bytes: bytes, invoice: InvoiceData,
                 company: dict, draft_id: int, body: dict) -> dict[str, Any]:

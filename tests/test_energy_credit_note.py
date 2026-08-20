@@ -20,6 +20,7 @@ from api.energy_credit_note_service import (
     _pick_vat_code_id,
     is_energy_credit_note,
 )
+from api.moco_supplier_matcher import MocoSupplierMatcher
 from api.stromproduktion_project_matcher import StromproduktionProjectMatcher
 from api.supplier_invoice_ocr_service import SupplierInvoiceOcrService
 
@@ -196,7 +197,8 @@ class FakeTelegram:
 
 
 def build_service(*, moco=None, moco_invoices=None, purchases=None, ocr=None,
-                  telegram=None, projects=None, subdomain="solar"):
+                  telegram=None, projects=None, customers=None,
+                  subdomain="solar"):
     return EnergyCreditNoteService(
         moco=moco or FakeMoco(),
         moco_invoices=moco_invoices or FakeMocoInvoices(),
@@ -204,6 +206,7 @@ def build_service(*, moco=None, moco_invoices=None, purchases=None, ocr=None,
         ocr=ocr or FakeOcr(result=make_credit()),
         matcher=StromproduktionProjectMatcher(
             PROJECTS if projects is None else projects),
+        customer_matcher=MocoSupplierMatcher(customers or []),
         subdomain=subdomain,
         telegram=telegram,
     )
@@ -253,6 +256,35 @@ def test_has_matching_project_delegates_to_matcher():
     s = build_service()
     assert s.has_matching_project("CKW AG (Lieferant)") is True
     assert s.has_matching_project("Irgendein Unbekannter EVU AG") is False
+
+
+def test_is_evu_tagged_customer_true_when_matched_and_tagged():
+    """Real-world regression (draft 3154913, BKW Energie AG): the EVU tag
+    can live on the type=customer company record instead of (or with no)
+    type=supplier counterpart — the relationship an energy credit note
+    represents is PVcontracting selling production back to the EVU."""
+    bkw_customer = {"id": 763576517, "name": "BKW Energie AG",
+                    "tags": [EVU_TAG]}
+    s = build_service(customers=[bkw_customer])
+    assert s.is_evu_tagged_customer("BKW Energie AG") is True
+
+
+def test_is_evu_tagged_customer_false_when_matched_but_untagged():
+    untagged_customer = {"id": 1, "name": "Irgendeine AG", "tags": []}
+    s = build_service(customers=[untagged_customer])
+    assert s.is_evu_tagged_customer("Irgendeine AG") is False
+
+
+def test_is_evu_tagged_customer_false_when_no_match():
+    s = build_service(customers=[])
+    assert s.is_evu_tagged_customer("BKW Energie AG") is False
+
+
+def test_is_evu_tagged_customer_false_when_ambiguous():
+    tied = [{"id": 1, "name": "Solar Energie AG", "tags": [EVU_TAG]},
+           {"id": 2, "name": "Solar Energie GmbH", "tags": [EVU_TAG]}]
+    s = build_service(customers=tied)
+    assert s.is_evu_tagged_customer("Solar Energie") is False
 
 
 # --- happy path ---------------------------------------------------------------
@@ -725,15 +757,22 @@ class DispatchFakeOcr:
 
 class FakeEnergyCreditNoteService:
     def __init__(self, *, http_error: Exception | None = None,
-                 has_matching_project_result: bool = False):
+                 has_matching_project_result: bool = False,
+                 is_evu_tagged_customer_result: bool = False):
         self.calls: list[dict] = []
         self.http_error = http_error
         self.has_matching_project_result = has_matching_project_result
         self.has_matching_project_calls: list[str | None] = []
+        self.is_evu_tagged_customer_result = is_evu_tagged_customer_result
+        self.is_evu_tagged_customer_calls: list[str | None] = []
 
     def has_matching_project(self, supplier_name: str | None) -> bool:
         self.has_matching_project_calls.append(supplier_name)
         return self.has_matching_project_result
+
+    def is_evu_tagged_customer(self, supplier_name: str | None) -> bool:
+        self.is_evu_tagged_customer_calls.append(supplier_name)
+        return self.is_evu_tagged_customer_result
 
     def process(self, *, pdf_bytes, invoice, company, draft_id, body) -> dict:
         self.calls.append({"pdf_bytes": pdf_bytes, "invoice": invoice,
@@ -841,6 +880,38 @@ def test_no_supplier_company_at_all_still_delegated_via_project_match_fallback()
     assert len(ecn.calls) == 1
     assert ecn.calls[0]["company"] is None
     assert ecn.has_matching_project_calls == ["BKW Energie AG"]
+    assert purchases.creates == []
+
+
+def test_evu_tagged_customer_alone_delegates_without_needing_project_or_supplier():
+    """Real-world regression (draft 3154913, BKW Energie AG): the third
+    detection signal — a CUSTOMER-type company match carrying the EVU tag
+    — is sufficient entirely on its own, independent of both the
+    supplier-type lookup (`company=None` here, matching live reality
+    before this signal existed) and the project-fallback signal. Also
+    proves the OR-chain short-circuits: `has_matching_project` is never
+    even consulted once `is_evu_tagged_customer` already said yes."""
+    moco = DispatchFakeMoco()
+    moco.suppliers = []
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(
+        supplier_name="BKW Energie AG",
+        is_credit_note=True,
+        total_amount=-304.3,
+        commission="Nr. 684868, Häbern 118, 3538 Röthenbach im Emmental"))
+    ecn = FakeEnergyCreditNoteService(is_evu_tagged_customer_result=True)
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn)
+
+    result = s.process("create", DRAFT_BODY)
+
+    assert result == {"energy_credit_note": True, "draft_id": 3143995,
+                      "invoice_id": 7900001}
+    assert len(ecn.calls) == 1
+    assert ecn.calls[0]["company"] is None
+    assert ecn.is_evu_tagged_customer_calls == ["BKW Energie AG"]
+    assert ecn.has_matching_project_calls == []
     assert purchases.creates == []
 
 

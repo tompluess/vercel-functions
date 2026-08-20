@@ -42,15 +42,37 @@ class MocoClient:
         `type=suppliers` silently returns the full list (no filter
         applied), `type=supplier` is what actually narrows it — and it
         also keeps customers from accidentally being linked as suppliers.
-        Paginates with `per_page=100` until the last page or `limit`.
         4xx/5xx propagate as HTTPError so the caller can map them to the
         right retry semantics.
         """
-        suppliers: list[dict] = []
+        return self._list_companies(company_type="supplier", limit=limit)
+
+    def list_customers(self, *, limit: int = 1000) -> list[dict]:
+        """GET /companies?type=customer — full customer list, paginated.
+
+        Feeds `EnergyCreditNoteService.is_evu_tagged_customer`: an EVU's
+        `Lokaler Energieversorger (EVU)` tag can live on its `type:
+        "customer"` company record rather than (or in addition to) any
+        `type: "supplier"` record — confirmed live for both CKW and BKW,
+        since the relationship an energy-credit-note represents is
+        PVcontracting selling production back to the EVU, i.e. the EVU
+        acting as a customer, even though the document itself arrives in
+        the Purchase::Draft inbox. Not used for the general purchase
+        pipeline's own company-linking (that stays supplier-only by
+        design — see `list_suppliers`).
+        """
+        return self._list_companies(company_type="customer", limit=limit)
+
+    def _list_companies(self, *, company_type: str, limit: int) -> list[dict]:
+        """Shared pagination loop for `list_suppliers`/`list_customers`.
+
+        Paginates with `per_page=100` until the last page or `limit`.
+        """
+        companies: list[dict] = []
         page = 1
         per_page = 100
-        while len(suppliers) < limit:
-            params = urlparse.urlencode({"type": "supplier",
+        while len(companies) < limit:
+            params = urlparse.urlencode({"type": company_type,
                                          "per_page": per_page,
                                          "page": page})
             url = f"{self._base_url}/companies?{params}"
@@ -60,11 +82,11 @@ class MocoClient:
                 batch = json.loads(resp.read())
             if not isinstance(batch, list) or not batch:
                 break
-            suppliers.extend(batch)
+            companies.extend(batch)
             if len(batch) < per_page:
                 break
             page += 1
-        return suppliers[:limit]
+        return companies[:limit]
 
     def get_project(self, project_id: int) -> dict:
         req = urlrequest.Request(f"{self._base_url}/projects/{project_id}",

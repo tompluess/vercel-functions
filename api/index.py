@@ -34,6 +34,7 @@ from api.moco_category_resolver import MocoCategoryResolver
 from api.moco_invoice_client import MocoInvoiceClient
 from api.moco_project_resolver import MocoProjectResolver
 from api.moco_purchase_client import MocoPurchaseClient
+from api.moco_supplier_matcher import MocoSupplierMatcher
 from api.moco_sync_service import MocoSyncService, TargetNotFoundError
 from api.moco_webhook_validator import MocoWebhookValidator
 from api.moco_client import MocoClient
@@ -321,12 +322,24 @@ async def supplier_invoice_ocr_webhook(request: Request) -> dict[str, Any]:
         subdomain=cfg["MOCO_SUBDOMAIN"],
         api_key=cfg["MOCO_API_KEY"],
     )
+    # Third detection signal (`is_evu_tagged_customer`): some EVUs only
+    # carry the EVU tag on their type=customer company record (confirmed
+    # live: CKW, BKW) — same graceful-degrade-on-failure posture as
+    # projects/categories above; an empty list just means this signal
+    # never fires, the other two still can.
+    try:
+        customers = moco.list_customers()
+    except Exception:
+        logger.exception("ocr: list_customers failed; EVU customer-tag "
+                         "detection signal disabled for this webhook")
+        customers = []
     energy_credit_note_service = EnergyCreditNoteService(
         moco=moco,
         moco_invoices=moco_invoices,
         purchase_client=purchase_client,
         ocr=ocr,
         matcher=StromproduktionProjectMatcher(projects),
+        customer_matcher=MocoSupplierMatcher(customers),
         subdomain=cfg["MOCO_SUBDOMAIN"],
         telegram=notifier,
     )
