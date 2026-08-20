@@ -62,6 +62,7 @@ from api.anthropic_ocr_client import (
     _normalize_qr_reference,
 )
 from api.energy_credit_note_service import (
+    EVU_TAG,
     EnergyCreditNoteService,
     is_energy_credit_note,
 )
@@ -305,8 +306,16 @@ class SupplierInvoiceOcrService:
                 created, project_match)
             self._delete_draft_after_create(draft_id, new_purchase_id)
 
+        # If we got this far without returning from the energy-credit-note
+        # `if` above, all three of its detection signals came back False
+        # for this draft — meaningful only when it's actually a credit
+        # note and the service was configured to check at all (tests that
+        # pass `energy_credit_note=None` intentionally skip detection
+        # entirely, so no hint applies there).
+        checked_energy_credit_note = self._energy_credit_note is not None
         self._notify_outcome(new_purchase_id, draft_id, invoice,
-                             assign_warnings)
+                             assign_warnings,
+                             checked_energy_credit_note=checked_energy_credit_note)
 
         assigned_project = (project_match.project
                             if project_match and project_match.status == "matched"
@@ -592,7 +601,8 @@ class SupplierInvoiceOcrService:
 
     def _notify_outcome(self, purchase_id: int | None, draft_id: int,
                         invoice: InvoiceData,
-                        assign_warnings: list[str] | None = None) -> None:
+                        assign_warnings: list[str] | None = None,
+                        checked_energy_credit_note: bool = False) -> None:
         if not self._telegram:
             return
         link = (self._purchase_url(purchase_id) if purchase_id
@@ -612,11 +622,29 @@ class SupplierInvoiceOcrService:
         if invoice.is_credit_note:
             # Gutschrift always triggers the alert regardless of confidence:
             # the reviewer must flip the sign on the total before approving.
+            # When the energy-credit-note branch was actually checked and
+            # declined this draft (all three detection signals came back
+            # False — see the call site), add a soft, conditional hint: it
+            # MIGHT be an EVU production credit that's missing its Moco
+            # setup (an EVU tag on either company-type record, or a
+            # matching Stromproduktion project), rather than a genuinely
+            # unrelated credit note (e.g. a hardware return) that happens
+            # to also be a Gutschrift. Phrased as "falls" (if) precisely
+            # because we can't tell the difference — see
+            # specs/SPEC_energy_credit_note.md.
+            hint = ""
+            if checked_energy_credit_note:
+                hint = (
+                    "\nℹ️ Falls dies eine EVU-Produktions-Gutschrift ist: "
+                    f"EVU-Tag (\"{EVU_TAG}\") auf der Kunde- oder "
+                    f"Lieferant-Firma \"{supplier}\" prüfen, oder ein "
+                    "Stromproduktion-Projekt dafür anlegen."
+                )
             self._telegram.notify(
                 f"⚠️ Gutschrift erkannt ({invoice.confidence:.0%}) — "
                 f"{supplier} {amount}\n"
                 f"Moco-Purchase erstellt, Vorzeichen prüfen: {link}"
-                f"{suffix}"
+                f"{suffix}{hint}"
             )
             return
         if invoice.confidence >= CONFIDENCE_THRESHOLD:

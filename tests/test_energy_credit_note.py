@@ -1002,6 +1002,55 @@ def test_untagged_supplier_without_project_match_falls_through_to_purchase():
     assert len(purchases.creates) == 1
 
 
+def test_credit_note_telegram_includes_evu_hint_when_all_signals_declined():
+    """When the energy-credit-note branch was actually checked (service
+    configured) and all three detection signals declined a genuine
+    credit note, the generic "Gutschrift erkannt" alert gets a soft,
+    conditional hint pointing at what might be missing on the Moco side
+    (EVU tag on either company-type record, or a Stromproduktion
+    project) — exactly the situation draft 3154913 was in before the
+    BKW project/tag existed."""
+    untagged_company = {"id": 1, "name": "Irgendein Anderer AG", "tags": []}
+    moco = DispatchFakeMoco()
+    moco.suppliers = [untagged_company]
+    moco.companies = {untagged_company["id"]: untagged_company}
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(supplier_name="Irgendein Anderer AG",
+                                       is_credit_note=True))
+    ecn = FakeEnergyCreditNoteService(has_matching_project_result=False,
+                                      is_evu_tagged_customer_result=False)
+    tg = FakeTelegram()
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        energy_credit_note=ecn, telegram=tg)
+
+    s.process("create", DRAFT_BODY)
+
+    assert "Gutschrift erkannt" in tg.messages[0]
+    assert "Falls dies eine EVU-Produktions-Gutschrift ist" in tg.messages[0]
+    assert EVU_TAG in tg.messages[0]
+    assert "Irgendein Anderer AG" in tg.messages[0]
+
+
+def test_credit_note_telegram_omits_evu_hint_when_service_not_configured():
+    """`energy_credit_note=None` — detection was never even attempted, so
+    the hint would be misleading (we don't actually know it declined
+    anything) and must not appear."""
+    moco = DispatchFakeMoco()
+    purchases = DispatchFakePurchaseClient()
+    ocr = DispatchFakeOcr(make_invoice(supplier_name="Irgendein Anderer AG",
+                                       is_credit_note=True))
+    tg = FakeTelegram()
+    s = SupplierInvoiceOcrService(
+        moco=moco, purchase_client=purchases, ocr=ocr, subdomain="solar",
+        telegram=tg)
+
+    s.process("create", DRAFT_BODY)
+
+    assert "Gutschrift erkannt" in tg.messages[0]
+    assert "EVU-Produktions-Gutschrift" not in tg.messages[0]
+
+
 def test_non_energy_credit_note_falls_through_to_generic_purchase_path():
     moco = DispatchFakeMoco()
     purchases = DispatchFakePurchaseClient()
