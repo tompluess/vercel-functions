@@ -150,6 +150,7 @@ def test_no_customer_skip_notifies_telegram(service_tg, source, telegram):
     assert result == {"skipped": "no_customer"}
     assert len(telegram.messages) == 1
     msg = telegram.messages[0]
+    assert msg.startswith("⚠️ ")
     assert "Reason: No customer given" in msg
     assert f"solar.mocoapp.com/invoices/{body['id']}" in msg
 

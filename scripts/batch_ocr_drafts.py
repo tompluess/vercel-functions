@@ -66,6 +66,7 @@ from api.supplier_invoice_ocr_service import (
     _build_create_payload,
     _is_notification_subject,
     _is_qr_iban,
+    _manual_upload_subject,
     _payment_method_for,
     _prefer_draft_payment_fields,
     _user_id_from_draft,
@@ -409,8 +410,11 @@ def _process_draft(draft: dict, *,
                    kommission_candidate_count, f"PDF download failed: {e}")
 
     t0 = time.monotonic()
+    subject = _manual_upload_subject(draft)
+    if subject:
+        _step(f"Betreff (manueller Upload): {subject!r}")
     try:
-        invoice = ocr.extract(pdf_bytes)
+        invoice = ocr.extract(pdf_bytes, subject=subject)
     except AnthropicOcrError as e:
         ocr_secs = time.monotonic() - t0
         _step(f"PDF {len(pdf_bytes) / 1024:.0f} KB, OCR failed after "

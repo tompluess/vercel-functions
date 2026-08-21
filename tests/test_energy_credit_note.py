@@ -90,6 +90,7 @@ def make_invoice(**overrides) -> InvoiceData:
         creditor_reference=None,
         payment_purpose=None,
         description=None,
+        position_title=None,
         is_credit_note=True,
         commission=None,
         delivery_address=None,
@@ -767,7 +768,8 @@ class DispatchFakeOcr:
         self.result = result
         self.calls: list[bytes] = []
 
-    def extract(self, pdf_bytes: bytes) -> InvoiceData:
+    def extract(self, pdf_bytes: bytes, *,
+                subject: str | None = None) -> InvoiceData:
         self.calls.append(pdf_bytes)
         return self.result
 

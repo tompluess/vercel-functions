@@ -473,6 +473,9 @@ def test_notifies_telegram_on_no_company_skip(service_tg, telegram):
     service_tg.sync(load_fixture("purchase_no_company.json"))
     assert len(telegram.messages) == 1
     msg = telegram.messages[0]
+    # Every Telegram message in this codebase leads with a status icon;
+    # these n8n-ported ones were the last four without.
+    assert msg.startswith("⚠️ ")
     assert "not synced to Bexio" in msg
     assert "Reason: No company given" in msg
     # Entity context carries the Moco purchase deep-link on the source account.
@@ -483,6 +486,7 @@ def test_notifies_telegram_on_no_account_skip(service_tg, bexio, telegram):
     bexio.contacts_by_name["Misc Vendor"] = [{"id": 5050}]
     service_tg.sync(load_fixture("purchase_no_account.json"))
     assert len(telegram.messages) == 1
+    assert telegram.messages[0].startswith("⚠️ ")
     assert "Reason: No account given" in telegram.messages[0]
 
 
@@ -497,6 +501,7 @@ def test_notifies_telegram_on_bill_closed_skip(service_tg, bexio, telegram):
 
     assert len(telegram.messages) == 1
     msg = telegram.messages[0]
+    assert msg.startswith("⚠️ ")
     assert "Reason: Bill is closed." in msg
     assert "Bill-Id might not be unique" in msg
 
@@ -656,6 +661,7 @@ def test_book_failure_notifies_telegram_and_keeps_sync_ok(
     assert not any(c[0] == "create_outgoing_payment" for c in bexio.calls)
     assert len(telegram.messages) == 1
     msg = telegram.messages[0]
+    assert msg.startswith("⚠️ ")
     assert "booking/payment failed" in msg
     assert "Cannot book non-draft bill" in msg
     assert "https://office.bexio.com/index.php/kb_bill/list#/show/9001" in msg
@@ -705,3 +711,225 @@ def test_missing_sender_env_notifies_and_skips_book_pay(
 def _io_bytes(data: bytes):
     import io
     return io.BytesIO(data)
+
+
+# --- payment remark (payment.note) ------------------------------------------
+#
+# Nothing asserted `note` before, and both branches produced text nobody
+# would want to read: the IBAN/QR one emitted a bare "-" whenever Moco's
+# `info` was empty (which is most invoices), and the MANUAL one left
+# dangling separators around empty parts. See
+# `specs/SPEC_manual_upload_subject.md` D6.
+
+def test_qr_payment_remark_is_the_purchase_title(service, bexio):
+    """Regression: this used to be `info or "-"`, and `info` (the QR-bill
+    Zahlungszweck) is empty on both live IBAN fixtures — so every QR
+    payment reached Bexio carrying a bare dash."""
+    bexio.contacts_by_name["FLYERALARM - RatePAY GmbH"] = [{"id": 5001}]
+    bexio.accounts_by_no["6600"] = [{"id": 7700, "tax_id": 42}]
+
+    service.sync(load_fixture("purchase_with_iban.json"))
+
+    payload = next(c[1] for c in bexio.calls if c[0] == "create_bill")
+    assert payload["payment"]["type"] == "QR"
+    assert payload["payment"]["note"] == "Visitenkarten und Flyer CH240067780"
+
+
+def test_manual_payment_remark_is_the_purchase_title(service, bexio):
+    """Same rule for both payment types — one remark, one code path."""
+    bexio.contacts_by_name["Restaurant Beispiel"] = [{"id": 5002}]
+    bexio.accounts_by_no["6640"] = [{"id": 7701, "tax_id": 42}]
+
+    service.sync(load_fixture("purchase_no_iban.json"))
+
+    payload = next(c[1] for c in bexio.calls if c[0] == "create_bill")
+    assert payload["payment"]["type"] == "MANUAL"
+    assert payload["payment"]["note"] == "Lunch meeting"
+
+
+def test_remark_falls_back_to_supplier_receipt_and_purpose():
+    from api.bexio_expense_sync_service import _payment_note
+    assert _payment_note({
+        "company": {"name": "Restaurant Beispiel"},
+        "receipt_identifier": "R-99999",
+        "info": "Geschäftsessen mit Kunde",
+    }) == "Restaurant Beispiel - R-99999 - Geschäftsessen mit Kunde"
+
+
+def test_remark_fallback_drops_empty_parts():
+    """Regression on `' - 000047 - '`: the old join filtered on
+    `is not None`, but its parts were `x or ""` and so never None. This is
+    the exact shape an OCR'd card receipt produces — no matched supplier,
+    no Zahlungszweck."""
+    from api.bexio_expense_sync_service import _payment_note
+    note = _payment_note({"receipt_identifier": "000047"})
+    assert note == "000047"
+    assert not note.startswith(" - ")
+    assert not note.endswith(" - ")
+
+
+def test_remark_fallback_drops_whitespace_only_parts():
+    from api.bexio_expense_sync_service import _payment_note
+    assert _payment_note({"company": {"name": "Ligu Lehm"},
+                          "receipt_identifier": "  ",
+                          "info": ""}) == "Ligu Lehm"
+
+
+def test_remark_is_truncated_to_the_bexio_budget():
+    from api.bexio_expense_sync_service import (
+        PAYMENT_NOTE_MAX_CHARS, _payment_note,
+    )
+    note = _payment_note({"title": "M" * 200})
+    assert len(note) == PAYMENT_NOTE_MAX_CHARS
+
+
+def test_remark_falls_back_to_a_dash_when_there_is_nothing_to_say():
+    """Kept from the n8n original — a non-empty note may be required by
+    Bexio, and this isn't the change to find that out on."""
+    from api.bexio_expense_sync_service import _payment_note
+    assert _payment_note({}) == "-"
+
+
+# --- receipt-reference length cap -------------------------------------------
+#
+# Live 400 from POST /4.0/purchase/bills on Moco purchase 4642736:
+#   payment.booking_text size must be between 1 and 35
+# The OCR flow read a Hornbach Kassenbon's till-slip transaction line as
+# the invoice number, giving a 40-char `receipt_identifier`.
+
+LONG_RECEIPT_ID = "0750 19.08.2026 16:07 0011 000171 004642"  # 40 chars
+
+
+def _hornbach_body(**overrides) -> dict:
+    body = {
+        "date": "2026-08-19",
+        "gross_total": 57.8,
+        "title": "Hornbach Kassenbon: Sopec Markierungssp (Baumarkt)",
+        "receipt_identifier": LONG_RECEIPT_ID,
+        "company": {"name": "HORNBACH Baumarkt (Schweiz) AG"},
+        "user": {"firstname": "Romain"},
+    }
+    body.update(overrides)
+    return body
+
+
+def test_bill_payment_caps_booking_text_at_35():
+    from api.bexio_expense_sync_service import _build_payment
+    payment = _build_payment(_hornbach_body(), {}, iban="")
+    assert len(payment["booking_text"]) == 35
+
+
+def test_bill_payment_caps_message_at_35():
+    """Same receipt reference, so it gets the same cap — `message` may well
+    tolerate more, but nothing we put in it is longer than a receipt id."""
+    from api.bexio_expense_sync_service import _build_payment
+    payment = _build_payment(_hornbach_body(), {}, iban="")
+    assert len(payment["message"]) == 35
+
+
+def test_outgoing_payment_caps_booking_text_at_35():
+    from api.bexio_expense_sync_service import _build_outgoing_payment_payload
+    payload = _build_outgoing_payment_payload(
+        _hornbach_body(iban="CH7708836121049112006"), {}, {}, 9001)
+    assert len(payload["booking_text"]) == 35
+
+
+def test_short_receipt_identifiers_are_left_alone():
+    from api.bexio_expense_sync_service import _build_payment
+    payment = _build_payment(_hornbach_body(receipt_identifier="R-99999"),
+                             {}, iban="")
+    assert payment["booking_text"] == "R-99999"
+    assert payment["message"] == "R-99999"
+
+
+def test_vendor_ref_keeps_the_full_receipt_identifier(service, bexio):
+    """The cap must NOT reach `vendor_ref`: it's the idempotency key
+    `_find_existing_bill` searches on, Bexio accepted the full 40 chars in
+    the very request that rejected `booking_text`, and truncating it would
+    make a replay miss the bill it should update."""
+    bexio.contacts_by_name["HORNBACH Baumarkt (Schweiz) AG"] = [{"id": 5003}]
+    bexio.accounts_by_no["4000"] = [{"id": 7702, "tax_id": 42}]
+    body = load_fixture("purchase_no_iban.json")
+    inner = body.get("body", body)
+    inner["receipt_identifier"] = LONG_RECEIPT_ID
+    inner["company"] = {"name": "HORNBACH Baumarkt (Schweiz) AG"}
+    inner["items"][0]["category"] = {"credit_account": "4000"}
+
+    service.sync(body)
+
+    payload = next(c[1] for c in bexio.calls if c[0] == "create_bill")
+    assert payload["vendor_ref"] == LONG_RECEIPT_ID
+    assert len(payload["payment"]["booking_text"]) == 35
+
+
+def test_qr_reference_is_never_truncated():
+    """A 27-digit QR reference fits under the cap, and a truncated payment
+    reference is a wrong payment — `reference_no` must stay untouched."""
+    from api.bexio_expense_sync_service import _build_outgoing_payment_payload
+    qr_ref = "940000201026332300805729978"
+    payload = _build_outgoing_payment_payload(
+        _hornbach_body(iban="CH7030000001857721765", reference=qr_ref),
+        {}, {}, 9001)
+    assert payload["reference_no"] == qr_ref
+
+
+# --- dash normalisation on the Bexio boundary -------------------------------
+#
+# Bexio rejects an em dash on its text fields. The OCR model writes German
+# prose and reaches for one freely — the separator it puts between an
+# operator subject and the document description is the commonest source
+# but not the only one — so every free-text field we send is normalised
+# here rather than relying on the prompt alone.
+
+EM_DASH_TITLE = "Mittagessen 20.8. — Ligu Lehm, Bern"
+
+
+def test_payment_note_normalises_the_em_dash():
+    from api.bexio_expense_sync_service import _build_payment
+    note = _build_payment({"title": EM_DASH_TITLE}, {}, iban="")["note"]
+    assert note == "Mittagessen 20.8. - Ligu Lehm, Bern"
+    assert "—" not in note
+
+
+def test_bill_and_line_titles_normalise_the_em_dash(service, bexio):
+    bexio.contacts_by_name["Restaurant Beispiel"] = [{"id": 5002}]
+    bexio.accounts_by_no["6640"] = [{"id": 7701, "tax_id": 42}]
+    body = load_fixture("purchase_no_iban.json")
+    inner = body.get("body", body)
+    inner["title"] = EM_DASH_TITLE
+    inner["items"][0]["title"] = EM_DASH_TITLE
+
+    service.sync(body)
+
+    payload = next(c[1] for c in bexio.calls if c[0] == "create_bill")
+    assert payload["title"] == "Mittagessen 20.8. - Ligu Lehm, Bern"
+    assert payload["line_items"][0]["title"] == \
+        "Mittagessen 20.8. - Ligu Lehm, Bern"
+
+
+@pytest.mark.parametrize("dash", ["—", "–", "‒",
+                                  "―", "−"])
+def test_every_unicode_dash_becomes_a_hyphen(dash):
+    """En dash, figure dash, horizontal bar and the minus sign are all
+    plausible model output, not just the em dash."""
+    from api.bexio_expense_sync_service import _bexio_text
+    assert _bexio_text(f"A {dash} B", 80) == "A - B"
+
+
+def test_plain_hyphens_are_left_alone():
+    from api.bexio_expense_sync_service import _bexio_text
+    assert _bexio_text("Aircondition - Rechnung 80572997", 80) == \
+        "Aircondition - Rechnung 80572997"
+
+
+def test_normalisation_collapses_leftover_whitespace():
+    from api.bexio_expense_sync_service import _bexio_text
+    assert _bexio_text("Lunch   meeting\n with  Kunde", 80) == \
+        "Lunch meeting with Kunde"
+
+
+def test_truncation_counts_what_bexio_actually_receives():
+    """Normalise first, truncate last — otherwise the cap counts
+    characters that get rewritten afterwards."""
+    from api.bexio_expense_sync_service import _bexio_text
+    assert len(_bexio_text("M — " * 40, 35)) == 35

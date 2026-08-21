@@ -213,7 +213,12 @@ class SupplierInvoiceOcrService:
             logger.info("ocr: downloaded PDF draft_id=%s bytes=%d",
                         draft_id, len(pdf_bytes))
 
-            invoice = self._ocr.extract(pdf_bytes)
+            # Hand-uploaded drafts carry an operator-typed subject that
+            # states the expense's business purpose ("Mittagessen 20.8.")
+            # — context OCR cannot recover from the document. Feeds
+            # `position_title` only; None for email-imported drafts.
+            subject = _manual_upload_subject(body)
+            invoice = self._ocr.extract(pdf_bytes, subject=subject)
             logger.info("ocr: extracted draft_id=%s confidence=%.2f "
                         "supplier=%r number=%r",
                         draft_id, invoice.confidence,
@@ -464,24 +469,32 @@ class SupplierInvoiceOcrService:
 
         Posted as two distinct Moco comments so the reviewer sees them as
         independent timeline entries:
-          1. 📧 Email-Quelle (sender + body) — only when Moco's email-
-             import populated `email_from` / `email_body` on the draft.
-          2. 🤖 OCR-Extraktion (fields, draft back-link, please-review).
+          1. Provenance — 📧 Email-Quelle (subject + sender + body) when
+             Moco's email-import populated `email_from`, otherwise
+             📎 Manueller Upload (subject + uploader). Mutually
+             exclusive, and the draft itself is deleted after the
+             create, so this comment is the only surviving record of
+             where the purchase came from.
+          2. 🤖 OCR-Extraktion (fields, verdict, please-review).
 
-        Each comment is independent: if the email-source post fails, the
+        Each comment is independent: if the provenance post fails, the
         OCR-summary post still runs (and vice versa). The created
         purchase is the authoritative side effect — neither failure
         rolls it back.
         """
-        email_text = _format_email_source_comment(
+        source_text = _format_email_source_comment(
+            subject=draft.get("title"),
             email_from=draft.get("email_from"),
             email_body=draft.get("email_body"),
+        ) or _format_manual_upload_comment(
+            subject=_manual_upload_subject(draft),
+            uploader=_draft_uploader_name(draft),
         )
-        if email_text:
+        if source_text:
             try:
-                self._purchases.post_comment(purchase_id, email_text)
+                self._purchases.post_comment(purchase_id, source_text)
             except Exception:
-                logger.exception("ocr: email-source comment failed "
+                logger.exception("ocr: provenance comment failed "
                                  "purchase_id=%s", purchase_id)
 
         ocr_text = _format_ocr_comment(invoice, review=review,
@@ -925,6 +938,43 @@ def _clean_context_field(value: object) -> str | None:
     return cleaned
 
 
+def _manual_upload_subject(body: dict) -> str | None:
+    """The operator-typed subject of a hand-uploaded draft, else None.
+
+    The discriminator is `email_from`, NOT the presence of a `user`:
+    confirmed live (solar draft 3213194) that a *forwarded* email carries
+    both an `email_from` and the forwarding staff member as `user`, so
+    keying on `user` would misread email subjects as operator input.
+
+    A manual draft's `title` is whatever the uploader typed into Moco's
+    upload dialog. That is often the business purpose ("Mittagessen
+    20.8.") but just as often the browser-supplied file name
+    ("trennscheibenblätter.pdf") — roughly half of the live manual
+    drafts in each account. Both are returned verbatim; sorting them out
+    is the model's job (see the `position_title` rules in
+    `anthropic_ocr_client.SYSTEM_PROMPT`), because the useful-vs-noise
+    call needs the document in hand.
+    """
+    if body.get("email_from"):
+        return None
+    title = body.get("title")
+    if not isinstance(title, str):
+        return None
+    title = title.strip()
+    return title or None
+
+
+def _draft_uploader_name(body: dict) -> str | None:
+    """"Firstname Lastname" of the draft's Moco user, else None."""
+    user = body.get("user")
+    if not isinstance(user, dict):
+        return None
+    name = " ".join(part for part in (user.get("firstname"),
+                                      user.get("lastname"))
+                    if isinstance(part, str) and part.strip()).strip()
+    return name or None
+
+
 def _user_id_from_draft(body: dict) -> int | None:
     """Extract the Moco user id from a draft purchase body.
 
@@ -967,7 +1017,13 @@ def _build_create_payload(invoice: InvoiceData, pdf_bytes: bytes, *,
     The PDF is JSON-embedded as base64. Tags are the OCR markers so a
     reviewer can filter in Moco's UI.
     """
-    title = (invoice.description
+    # `position_title` is the model's merge of the operator's subject with
+    # the document's own description (see `AnthropicOcrClient.extract`);
+    # it equals `description` when no subject was supplied. Falling back
+    # through `description` keeps every caller that predates the field —
+    # and any run where the model omitted it — on the old behaviour.
+    title = (invoice.position_title
+             or invoice.description
              or invoice.supplier_name
              or "OCR-importierte Rechnung")
     total = invoice.total_amount if invoice.total_amount is not None else 0.0
@@ -1515,14 +1571,43 @@ def _format_ocr_comment(invoice: InvoiceData, *,
     return "<div>" + "<br>".join(parts) + "</div>"
 
 
+def _format_manual_upload_comment(subject: str | None,
+                                  uploader: str | None) -> str:
+    """HTML comment body for the 📎 manual-upload block, or empty string.
+
+    The counterpart to `_format_email_source_comment`, and mutually
+    exclusive with it: a draft either arrived by email (sender + body) or
+    was uploaded by hand (subject + uploader). Posting the provenance
+    either way means the reviewer never has to open the — by then
+    deleted — draft to find out where a purchase came from.
+
+    Returns "" when there is nothing to say, so the caller skips the post.
+    """
+    if not subject and not uploader:
+        return ""
+    parts: list[str] = ["<strong>📎 Manueller Upload</strong>"]
+    if subject:
+        parts.append(f"<strong>Betreff:</strong> {escape(subject)}")
+    if uploader:
+        parts.append(f"<strong>Hochgeladen von:</strong> {escape(uploader)}")
+    return "<div>" + "<br>".join(parts) + "</div>"
+
+
 def _format_email_source_comment(email_from: str | None,
-                                 email_body: str | None) -> str:
+                                 email_body: str | None,
+                                 subject: str | None = None) -> str:
     """HTML comment body for the 📧 source-email block, or empty string.
 
     Posted as its own Moco comment (separate from the 🤖 OCR comment)
     when Moco's email-import populated `email_from` / `email_body` on
     the webhook body. Manually-uploaded drafts have neither — in that
-    case this returns "" and the caller skips posting.
+    case this returns "" and the caller falls back to
+    `_format_manual_upload_comment`.
+
+    `subject` is the draft `title`, which for an email-imported draft is
+    the mail's Subject header. Rendered only alongside an `email_from`:
+    on its own a title proves nothing about the source, and treating it
+    as one would make this function claim manual uploads as emails.
 
     Body rendering branches on shape:
       - HTML body (forwarded email from a webmail client, contains
@@ -1535,6 +1620,8 @@ def _format_email_source_comment(email_from: str | None,
     if not email_from and not email_body:
         return ""
     parts: list[str] = ["<strong>📧 Email-Quelle</strong>"]
+    if subject:
+        parts.append(f"<strong>Betreff:</strong> {escape(subject)}")
     if email_from:
         parts.append(f"<strong>Von:</strong> {escape(email_from)}")
     if email_body:

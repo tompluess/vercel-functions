@@ -40,6 +40,7 @@ def make_invoice(**overrides) -> InvoiceData:
         creditor_reference=None,
         payment_purpose=None,
         description="Werkzeug",
+        position_title=None,
         is_credit_note=False,
         commission=None,
         delivery_address=None,

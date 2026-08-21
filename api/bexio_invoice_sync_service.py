@@ -182,7 +182,7 @@ class BexioInvoiceSyncService:
         if not self._telegram:
             return
         self._telegram.notify(
-            "Invoice in Moco not synced to Bexio.\n"
+            "⚠️ Invoice in Moco not synced to Bexio.\n"
             "Reason: No customer given\n"
             f"- Invoice ID: {body.get('identifier') or ''}\n"
             f"- Date: {body.get('date') or ''}\n"
