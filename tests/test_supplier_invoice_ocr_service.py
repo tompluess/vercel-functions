@@ -1085,16 +1085,68 @@ def test_vat_code_account_default_recognized_via_is_default_field():
     assert purchases.creates[0]["items"][0]["vat_code_id"] == 12
 
 
-def test_vat_code_id_omitted_when_no_branch_resolves():
-    """If all three branches fail (no rate, no supplier default, no
-    account default in the vat-code list), the item carries no
-    `vat_code_id`. Moco will 422 → the dispatcher fires Telegram + ACKs
-    ok=false. The omission keeps the payload valid JSON."""
+def test_bank_transfer_falls_back_to_standard_rate():
+    """No OCR rate, no supplier default, no account-default flag (the
+    state BOTH live Moco accounts are in) → the 8.1% standard-rate floor
+    fires instead of omitting the field and eating a 422."""
     invoice = make_invoice(vat_rate=None)
     purchases = FakePurchaseClient()
     purchases.vat_codes = [{"id": 11, "tax": 8.1, "active": True}]  # nothing flagged default
     source = FakeMoco()
     source.suppliers = []  # no supplier match either
+    s = build_service(moco=source, purchases=purchases,
+                      ocr=FakeOcr(result=invoice))
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["items"][0]["vat_code_id"] == 11
+    # A guessed rate must never auto-release to Bexio.
+    assert "Review pending" in purchases.creates[0]["tags"]
+
+
+def test_already_paid_card_falls_back_to_zero_rate():
+    """The skyr draft-3216692 case: a card/POS slip printing no VAT line.
+    0% is the conservative booking — it claims no input tax."""
+    invoice = make_invoice(vat_rate=None, already_paid_by_card=True)
+    purchases = FakePurchaseClient()
+    purchases.vat_codes = [
+        {"id": 11, "tax": 8.1, "active": True},
+        {"id": 12, "tax": 0.0, "active": True},
+    ]
+    source = FakeMoco()
+    source.suppliers = []
+    s = build_service(moco=source, purchases=purchases,
+                      ocr=FakeOcr(result=invoice))
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["items"][0]["vat_code_id"] == 12
+    assert "Review pending" in purchases.creates[0]["tags"]
+
+
+def test_zero_rate_fallback_skips_the_reverse_charge_code():
+    """Both live accounts list the reverse-charge "(Ausland)" 0.0 code
+    BEFORE the plain 0.0 one, so a first-match-by-rate would book a
+    domestic lunch receipt to reverse charge."""
+    invoice = make_invoice(vat_rate=None, already_paid_by_card=True)
+    purchases = FakePurchaseClient()
+    purchases.vat_codes = [
+        {"id": 33681, "tax": 0.0, "active": True, "reverse_charge": True},
+        {"id": 33679, "tax": 0.0, "active": True, "reverse_charge": False},
+    ]
+    source = FakeMoco()
+    source.suppliers = []
+    s = build_service(moco=source, purchases=purchases,
+                      ocr=FakeOcr(result=invoice))
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["items"][0]["vat_code_id"] == 33679
+
+
+def test_vat_code_id_omitted_when_even_the_fallback_finds_no_code():
+    """Only when the account has no active code at the wanted rate at all
+    does the field come off. Moco 422s → Telegram alert + 200 ACK; the
+    omission keeps the payload valid JSON."""
+    invoice = make_invoice(vat_rate=None)
+    purchases = FakePurchaseClient()
+    purchases.vat_codes = [{"id": 11, "tax": 2.6, "active": True}]
+    source = FakeMoco()
+    source.suppliers = []
     s = build_service(moco=source, purchases=purchases,
                       ocr=FakeOcr(result=invoice))
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})

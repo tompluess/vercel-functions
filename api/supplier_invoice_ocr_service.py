@@ -31,17 +31,13 @@ itself is the draft; we only use its `id`, `title` (notification-email
 detection on the no-attachment path) and its `file_url`.
 
 VAT-code resolution: Moco's POST /purchases requires `vat_code_id` on
-every item. The service resolves it dynamically — `GET /vat_code_purchases`
-to list the available codes, then:
-  1. If OCR extracted a `vat_rate`, find the code whose `value` matches
-     (tolerant of percent-vs-decimal formats and tiny rounding).
-  2. Else if the supplier was matched in Moco's company list, use that
-     company's `default_vat_code_purchase_id` (fetched via get_company).
-  3. Else: use the code marked `default: true` in `/vat_code_purchases`
-     (Moco accounts typically have one designated default for purchases).
-  4. Only if all three fail (no vat-code list reachable AND no default
-     flagged): omit the field — Moco 422s, the dispatcher fires a
-     Telegram alert + ACKs 200 ok=false. Rare in practice.
+every item. The service fetches `GET /vat_code_purchases` and hands the
+list to `VatCodeResolver` (OCR'd rate → supplier default → account
+default → a payment-method floor of 0% for already-paid card slips /
+8.1% for everything else). A guessed rate holds the purchase for review;
+only an account with no usable code at all leaves the field off, which
+Moco 422s into the silent-skip + Telegram path below. See
+`api/vat_code_resolver.py` and `specs/SPEC_vat_code_fallback.md`.
 """
 
 import base64
@@ -83,6 +79,7 @@ from api.smartme_energy_expense_service import (
     is_smartme_draft,
 )
 from api.telegram_notifier import TelegramNotifier
+from api.vat_code_resolver import VatCodeResolver, VatDecision
 
 logger = logging.getLogger("supplier_invoice_ocr_service")
 
@@ -260,7 +257,7 @@ class SupplierInvoiceOcrService:
                     pdf_bytes=pdf_bytes, invoice=invoice, company=company,
                     draft_id=draft_id, body=body)
 
-            vat_code_id = self._resolve_vat_code_id(invoice, company)
+            vat = self._resolve_vat_code(invoice, company)
             # Resolve the project first so the category lookup can use it
             # (project's / supplier's Aufwandkonto custom-property
             # overrides the 4000 default). The same match feeds the
@@ -273,11 +270,12 @@ class SupplierInvoiceOcrService:
                 company_id=company_id,
                 category=category,
                 project_match=project_match,
+                vat=vat,
             )
 
             payload = _build_create_payload(
                 invoice, pdf_bytes,
-                vat_code_id=vat_code_id,
+                vat_code_id=vat.vat_code_id,
                 company_id=company_id,
                 draft_id=draft_id,
                 user_id=_user_id_from_draft(body),
@@ -329,7 +327,7 @@ class SupplierInvoiceOcrService:
                                         draft_id, body,
                                         review=review, company=company,
                                         project_match=project_match,
-                                        category=category)
+                                        category=category, vat=vat)
             assign_warnings = self._assign_resolved_project(
                 created, project_match)
             payment_registered, payment_warning = self._register_payment(
@@ -374,28 +372,19 @@ class SupplierInvoiceOcrService:
 
     # --- vat code resolution ------------------------------------------------
 
-    def _resolve_vat_code_id(self, invoice: InvoiceData,
-                             supplier_company: dict | None) -> int | None:
-        """Decide which Moco vat_code_id to put on the new purchase's item.
+    def _resolve_vat_code(self, invoice: InvoiceData,
+                          supplier_company: dict | None) -> VatDecision:
+        """Fetch `/vat_code_purchases` and run `VatCodeResolver` over it.
 
-        Priority order (per the product spec):
-          1. The OCR'd `vat_rate`, matched against the values in
-             `GET /vat_code_purchases`.
-          2. The matched supplier's default vat code (`supplier_company`
-             is the full record from `get_company` — the company-list
-             shape from `list_suppliers` doesn't carry the default).
-          3. The vat_code from `GET /vat_code_purchases` marked as
-             `default: true` (most Moco accounts have one designated
-             default for purchases).
-          4. Give up — return None. `POST /purchases` will 422 and the
-             dispatcher fires a Telegram alert + ACKs 200 ok=false. Rare
-             in practice, but better than guessing.
+        The tier logic itself lives in `api/vat_code_resolver.py` so the
+        review gate can branch on which tier fired and the operator
+        scripts can preview the real rule (see
+        `specs/SPEC_vat_code_fallback.md` D4).
 
-        A failure in any *individual* lookup (vat-codes list,
-        `_fetch_company`) is logged and treated as "no match in this
-        branch" — we don't want a flapping /vat_code_purchases to nuke an
-        otherwise-good run when the supplier could still supply a
-        fallback.
+        A failed listing is logged and degrades to an empty catalog: every
+        tier misses, `vat_code_id` is omitted, and the Moco 422 lands on
+        the silent-skip + Telegram path. We don't want a flapping
+        `/vat_code_purchases` to raise out of an otherwise-good run.
         """
         try:
             vat_codes = self._purchases.list_vat_codes()
@@ -403,42 +392,7 @@ class SupplierInvoiceOcrService:
             logger.exception("ocr: list_vat_codes failed, "
                              "vat_code_id resolution degraded")
             vat_codes = []
-
-        if invoice.vat_rate is not None:
-            match = _find_vat_code_by_rate(vat_codes, invoice.vat_rate)
-            if match is not None:
-                logger.info("ocr: matched vat_rate=%s to vat_code_id=%s",
-                            invoice.vat_rate, match.get("id"))
-                return match.get("id")
-            logger.warning("ocr: vat_rate=%s did not match any active Moco "
-                           "vat_code (tax values=%s); falling back to "
-                           "supplier default", invoice.vat_rate,
-                           [c.get("tax") for c in vat_codes
-                            if c.get("active") is not False])
-
-        if supplier_company:
-            supplier_default = _supplier_default_vat_code_id(
-                supplier_company, vat_codes,
-            )
-            if supplier_default is not None:
-                logger.info("ocr: using supplier default vat_code_id=%s "
-                            "(company_id=%s)",
-                            supplier_default, supplier_company.get("id"))
-                return supplier_default
-            logger.info("ocr: supplier id=%s has no default vat_code, "
-                        "falling back to account default",
-                        supplier_company.get("id"))
-
-        account_default = _account_default_vat_code(vat_codes)
-        if account_default is not None:
-            logger.info("ocr: using account-default vat_code_id=%s",
-                        account_default.get("id"))
-            return account_default.get("id")
-
-        logger.warning("ocr: could not resolve vat_code_id from OCR, "
-                       "supplier default, or account default — POST /purchases "
-                       "will likely 422")
-        return None
+        return VatCodeResolver(vat_codes).resolve(invoice, supplier_company)
 
     # --- supplier lookup ----------------------------------------------------
 
@@ -503,7 +457,8 @@ class SupplierInvoiceOcrService:
                                review: ReviewDecision | None = None,
                                company: dict | None = None,
                                project_match: ProjectMatch | None = None,
-                               category: CategoryDecision | None = None
+                               category: CategoryDecision | None = None,
+                               vat: VatDecision | None = None
                                ) -> None:
         """Two separate best-effort comments on the newly created purchase.
 
@@ -532,7 +487,7 @@ class SupplierInvoiceOcrService:
         ocr_text = _format_ocr_comment(invoice, review=review,
                                        company=company,
                                        project_match=project_match,
-                                       category=category)
+                                       category=category, vat=vat)
         try:
             self._purchases.post_comment(purchase_id, ocr_text)
         except Exception:
@@ -1139,98 +1094,6 @@ def _resolve_reference_and_info(invoice: InvoiceData,
     return None, info
 
 
-def _find_vat_code_by_rate(vat_codes: list[dict], rate: float) -> dict | None:
-    """Find the active vat_code whose `tax` matches the OCR'd rate.
-
-    Moco's `/vat_code_purchases` objects look like::
-        {"id": 186, "tax": 7.7, "code": "9", "active": true, ...}
-
-    `tax` is a percentage (8.1, 7.7, 2.6). OCR returns the rate as a
-    decimal (0.081 for 8.1% — per the system prompt). We multiply the OCR
-    rate by 100 for comparison, but also try the raw value to be tolerant
-    of a prompt-drift run that accidentally returned the percentage
-    directly. Epsilon of 0.05 absorbs OCR float-rounding (Sonnet sometimes
-    returns 0.077 for the legal 7.7%, or rounds slightly).
-
-    Inactive vat codes are filtered out — Moco keeps historical codes
-    (old VAT rates from before the 2024 increase, special-purpose) around
-    with `active: false`, and posting one would either 422 or book to a
-    deprecated rate.
-    """
-    if rate is None:
-        return None
-    # OCR rate in decimal (0.081). Compare against Moco's `tax` percentage
-    # (8.1). Cross-format candidate covers the rare case where OCR sent the
-    # percentage directly.
-    candidates = [rate * 100, rate]
-
-    for code in vat_codes:
-        if code.get("active") is False:
-            continue
-        raw = code.get("tax")
-        if raw is None:
-            continue
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            continue
-        for target in candidates:
-            if abs(value - target) < 0.05:
-                return code
-    return None
-
-
-def _account_default_vat_code(vat_codes: list[dict]) -> dict | None:
-    """Return the active vat_code marked as the account-wide default.
-
-    Moco's `/vat_code_purchases` response may carry a flag indicating
-    which code is the configured default; the field name isn't fully
-    documented in the example shape we have, so we try `default`,
-    `is_default`, and the legacy `default_for_purchase` to be robust.
-    Falls back to None if no code is flagged — tier 4 (omit field, Moco
-    422 → Telegram alert) handles that case.
-    """
-    for code in vat_codes:
-        if code.get("active") is False:
-            continue
-        if (code.get("default") is True
-                or code.get("is_default") is True
-                or code.get("default_for_purchase") is True):
-            return code
-    return None
-
-
-def _supplier_default_vat_code_id(company: dict,
-                                  vat_codes: list[dict]) -> int | None:
-    """Resolve the supplier's default vat_code_id.
-
-    Per Moco's company docs the relevant field is `supplier_vat`, a nested
-    object with a `tax` percentage (e.g. `{"supplier_vat": {"tax": 8.1}}`).
-    There's no direct `vat_code_id` on the company — we have to translate
-    the rate by looking it up in the same `/vat_code_purchases` list used
-    for OCR's `vat_rate` match.
-
-    Defensive fallback: a couple of older / alternate field names
-    (`default_vat_code_purchase_id`, `vat_code_purchase_id`) are also
-    tried in case some accounts return a direct id. The first hit wins.
-    """
-    supplier_vat = company.get("supplier_vat")
-    if isinstance(supplier_vat, dict) and supplier_vat.get("tax") is not None:
-        try:
-            rate = float(supplier_vat["tax"])
-        except (TypeError, ValueError):
-            rate = None
-        if rate is not None:
-            match = _find_vat_code_by_rate(vat_codes, rate)
-            if match is not None:
-                return match.get("id")
-    for key in ("default_vat_code_purchase_id", "vat_code_purchase_id"):
-        value = company.get(key)
-        if isinstance(value, int):
-            return value
-    return None
-
-
 def _prefer_draft_payment_fields(invoice: InvoiceData, draft: dict) -> InvoiceData:
     """Override OCR's iban / qr_reference with the draft's values when present.
 
@@ -1450,11 +1313,37 @@ def _category_comment_text(category: CategoryDecision | None) -> str:
     return "nicht gesetzt — bitte manuell wählen"
 
 
+VAT_SOURCE_LABELS = {
+    "ocr": "vom Beleg",
+    "supplier": "Lieferanten-Standard",
+    "account_default": "Konto-Standard",
+}
+
+
+def _vat_comment_text(vat: VatDecision) -> str:
+    """German MWST cell for the OCR comment.
+
+    Same split as `_category_comment_text`: `VatDecision.source` is an
+    internal English tier name aimed at logs, so it never reaches the
+    operator verbatim. A guessed rate says so and names its next action —
+    that line is the whole point of showing MWST in the comment at all.
+    """
+    rate = f"{vat.rate:g}%" if vat.rate is not None else "unbekannt"
+    if vat.vat_code_id is None:
+        return "nicht aufgelöst"
+    if vat.guessed:
+        return (f"{rate} angenommen — nicht auf dem Beleg erkannt, "
+                "bitte prüfen")
+    label = VAT_SOURCE_LABELS.get(vat.source, vat.source)
+    return f"{rate} ({label})"
+
+
 def _match_li(label: str, ok: bool, value) -> str:
     """Render one resolution outcome as `<li>✓/✗ <strong>Label:</strong> …</li>`.
 
-    Used for the three fields the pipeline *resolves* against Moco
-    (Lieferant → company, Konto → category, Kommission → project), as
+    Used for the four fields the pipeline *resolves* against Moco
+    (Lieferant → company, Konto → category, MWST → vat code,
+    Kommission → project), as
     opposed to the fields it merely reads off the PDF. Mirrors the ✓/✗
     markers in `batch_ocr_drafts.py`'s table so the two operator surfaces
     read the same way.
@@ -1472,7 +1361,8 @@ def _format_ocr_comment(invoice: InvoiceData, *,
                         review: ReviewDecision | None = None,
                         company: dict | None = None,
                         project_match: ProjectMatch | None = None,
-                        category: CategoryDecision | None = None) -> str:
+                        category: CategoryDecision | None = None,
+                        vat: VatDecision | None = None) -> str:
     """HTML comment body for the 🤖 OCR-extraction summary.
 
     Posted as its own Moco comment (separate from the 📧 email-source
@@ -1487,12 +1377,16 @@ def _format_ocr_comment(invoice: InvoiceData, *,
     extracted fields are supporting detail. (It used to be the last line,
     below a long field list.)
 
-    The three fields resolved against Moco (Lieferant / Konto /
+    The four fields resolved against Moco (Lieferant / Konto / MWST /
     Kommission) carry ✓/✗ markers via `_match_li`, matching the batch
     script's table. Plain OCR readings below them stay unmarked — a ✓
-    there would imply a match that was never attempted.
+    there would imply a match that was never attempted. MWST is ✗ exactly
+    when `VatCodeResolver` fell through to its payment-method floor, i.e.
+    when the rate on the line item is an assumption rather than a reading
+    — that's the number the reviewer has to confirm.
 
-    `review` / `company` / `project_match` / `category` are optional so
+    `review` / `company` / `project_match` / `category` / `vat` are
+    optional so
     the formatter still renders standalone (operator scripts, tests);
     without them the verdict header is omitted and the field list falls
     back to plain rendering.
@@ -1571,6 +1465,10 @@ def _format_ocr_comment(invoice: InvoiceData, *,
         cat_ok = category is not None and category.category_id is not None
         fields.append(_match_li("Konto", cat_ok,
                                 _category_comment_text(category)))
+
+        if vat is not None:
+            fields.append(_match_li("MWST", not vat.guessed,
+                                    _vat_comment_text(vat)))
 
         proj_ok = (project_match is not None
                    and project_match.status == "matched")

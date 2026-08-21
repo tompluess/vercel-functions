@@ -7,7 +7,8 @@ resulting ReviewDecision.
 See `specs/SPEC_purchase_payment_already_paid.md` for the rules being
 enforced here, in particular D1 (a category is trusted by its *source*, not
 merely by being set) and D2 (confidence applies uniformly, with no
-payment-method carve-out).
+payment-method carve-out), plus `specs/SPEC_vat_code_fallback.md` D3 (a
+VAT rate the resolver guessed holds the purchase).
 """
 
 import pytest
@@ -19,6 +20,7 @@ from api.purchase_review_gate import (
     AUTO_RELEASE_CONFIDENCE,
     PurchaseReviewGate,
 )
+from api.vat_code_resolver import VatDecision
 
 
 def make_invoice(**overrides) -> InvoiceData:
@@ -216,6 +218,64 @@ def test_boundary_confidence_is_inclusive():
 def test_min_confidence_is_injectable():
     decision = PurchaseReviewGate(min_confidence=0.5).evaluate(
         invoice=make_invoice(confidence=0.6), company_id=555,
+        category=supplier_category(), project_match=None)
+
+    assert decision.review_pending is False
+
+
+# --- guessed VAT rate (SPEC_vat_code_fallback.md D3) ------------------------
+
+def test_guessed_vat_rate_holds_the_purchase():
+    """A rate `VatCodeResolver` assumed from the payment method must not
+    reach Bexio unreviewed — everything else here is auto-release clean."""
+    decision = PurchaseReviewGate().evaluate(
+        invoice=make_invoice(), company_id=555,
+        category=supplier_category(), project_match=None,
+        vat=VatDecision(vat_code_id=86400, source="fallback_standard",
+                        rate=8.1))
+
+    assert decision.review_pending is True
+    assert decision.reasons == [
+        "MWST-Satz nicht auf dem Beleg erkannt (Annahme 8.1%)"]
+    assert "Review pending" in decision.tags
+
+
+def test_vat_read_off_the_document_does_not_hold():
+    decision = PurchaseReviewGate().evaluate(
+        invoice=make_invoice(), company_id=555,
+        category=supplier_category(), project_match=None,
+        vat=VatDecision(vat_code_id=86400, source="ocr", rate=8.1))
+
+    assert decision.review_pending is False
+
+
+@pytest.mark.parametrize("source", ["supplier", "account_default"])
+def test_configured_defaults_are_not_guesses(source):
+    """Tiers 2 and 3 are operator configuration, not an assumption."""
+    decision = PurchaseReviewGate().evaluate(
+        invoice=make_invoice(), company_id=555,
+        category=supplier_category(), project_match=None,
+        vat=VatDecision(vat_code_id=86400, source=source, rate=8.1))
+
+    assert decision.review_pending is False
+
+
+def test_unresolved_vat_alone_does_not_hold():
+    """`vat_code_id=None` never reaches the gate in a way that matters —
+    Moco 422s the create, so there's no purchase to tag. Asserting it
+    doesn't add a bogus reason keeps the message honest."""
+    decision = PurchaseReviewGate().evaluate(
+        invoice=make_invoice(), company_id=555,
+        category=supplier_category(), project_match=None,
+        vat=VatDecision(vat_code_id=None))
+
+    assert decision.review_pending is False
+
+
+def test_omitted_vat_argument_keeps_the_old_behaviour():
+    """Operator scripts and older call sites pass no `vat` at all."""
+    decision = PurchaseReviewGate().evaluate(
+        invoice=make_invoice(), company_id=555,
         category=supplier_category(), project_match=None)
 
     assert decision.review_pending is False

@@ -58,6 +58,7 @@ from api.moco_project_resolver import MocoProjectResolver
 from api.moco_purchase_client import MocoPurchaseClient
 from api.moco_client import MocoClient
 from api.moco_supplier_matcher import MocoSupplierMatcher
+from api.vat_code_resolver import VatCodeResolver
 from api.supplier_invoice_ocr_service import (
     SupplierInvoiceOcrService,
     _build_create_payload,
@@ -292,12 +293,6 @@ def main() -> int:
     ]
     # print(f"\nAvailable vat_code_purchases: {vat_summary}")
 
-    # Same resolution chain the service uses, exposed via the import.
-    from api.supplier_invoice_ocr_service import (
-        _account_default_vat_code,
-        _find_vat_code_by_rate,
-        _supplier_default_vat_code_id,
-    )
     # Full company record, fetched once — feeds the vat chain (supplier
     # default vat code) and the category chain (supplier Aufwandkonto).
     full_company = None
@@ -306,24 +301,18 @@ def main() -> int:
             full_company = moco.get_company(company_id)
         except Exception as e:
             log.warning("get_company failed: %s", e)
-    vat_code_id = None
-    if invoice.vat_rate is not None:
-        match = _find_vat_code_by_rate(vat_codes, invoice.vat_rate)
-        if match:
-            vat_code_id = match.get("id")
-            print(f"  → matched OCR vat_rate={invoice.vat_rate} to "
-                  f"vat_code_id={vat_code_id}")
-    if vat_code_id is None and full_company:
-        vat_code_id = _supplier_default_vat_code_id(full_company, vat_codes)
-        if vat_code_id is not None:
-            print(f"  → using supplier-default vat_code_id={vat_code_id}")
-    if vat_code_id is None:
-        account_default = _account_default_vat_code(vat_codes)
-        if account_default is not None:
-            vat_code_id = account_default.get("id")
-            print(f"  → using account-default vat_code_id={vat_code_id}")
-    if vat_code_id is None:
+    # The real chain, not a re-implementation of it: `VatCodeResolver` is
+    # the same collaborator the webhook service runs.
+    vat = VatCodeResolver(vat_codes).resolve(invoice, full_company)
+    if vat.vat_code_id is None:
         print("  → no vat_code_id resolved (Moco will reject the POST)")
+    else:
+        rate = f"{vat.rate:g}%" if vat.rate is not None else "?"
+        print(f"  → vat_code_id={vat.vat_code_id} ({rate}, "
+              f"source={vat.source})")
+        if vat.guessed:
+            print("    ⚠️  rate assumed from the payment method — the "
+                  "purchase will be held for review")
 
     # 5. resolve Moco project from the OCR'd Kommission
     _print_section("Project (Kommission) resolution")
@@ -376,7 +365,8 @@ def main() -> int:
     # tags printed below are the ones a real run would actually POST.
     review_decision = PurchaseReviewGate().evaluate(
         invoice=invoice, company_id=company_id,
-        category=category_decision, project_match=kommission_match)
+        category=category_decision, project_match=kommission_match,
+        vat=vat)
     if review_decision.review_pending:
         print(f"  review: HOLD — {review_decision.reason_text()}")
     else:
@@ -385,7 +375,7 @@ def main() -> int:
     # 7. show what would be POSTed
     payload = _build_create_payload(
         invoice, pdf_bytes,
-        vat_code_id=vat_code_id,
+        vat_code_id=vat.vat_code_id,
         company_id=company_id,
         draft_id=args.draft_id,
         user_id=_user_id_from_draft(draft),
@@ -396,7 +386,9 @@ def main() -> int:
         email_from=draft.get("email_from"),
         email_body=draft.get("email_body"),
     )
-    ocr_comment = _format_ocr_comment(invoice)
+    ocr_comment = _format_ocr_comment(
+        invoice, review=review_decision, company=full_company,
+        project_match=kommission_match, category=category_decision, vat=vat)
     _print_section("POST /purchases payload (base64 blob elided)")
     _print_payload_summary(payload)
     # The service posts these as two separate Moco comments. Render each
