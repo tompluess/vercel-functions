@@ -231,6 +231,12 @@ class SupplierInvoiceOcrService:
             # code nor custom_properties, and both the vat chain and the
             # category chain (supplier Aufwandkonto) need them.
             company = self._fetch_company(company_id)
+            # Recover an IBAN the model couldn't read off the Zahlteil
+            # from the supplier's Moco record. Must run before the payload
+            # is built: `_payment_method_for` and
+            # `_resolve_reference_and_info` both branch on `invoice.iban`.
+            invoice, iban_from_supplier = _apply_supplier_iban_fallback(
+                invoice, company)
 
             # EVU production credit notes (see `is_energy_credit_note`)
             # become a project expense + Moco invoice, never a purchase —
@@ -332,7 +338,8 @@ class SupplierInvoiceOcrService:
                                         draft_id, body,
                                         review=review, company=company,
                                         project_match=project_match,
-                                        category=category, vat=vat)
+                                        category=category, vat=vat,
+                                        iban_from_supplier=iban_from_supplier)
             assign_warnings = self._assign_resolved_project(
                 created, project_match)
             payment_registered, payment_warning = self._register_payment(
@@ -463,7 +470,8 @@ class SupplierInvoiceOcrService:
                                company: dict | None = None,
                                project_match: ProjectMatch | None = None,
                                category: CategoryDecision | None = None,
-                               vat: VatDecision | None = None
+                               vat: VatDecision | None = None,
+                               iban_from_supplier: bool = False
                                ) -> None:
         """Two separate best-effort comments on the newly created purchase.
 
@@ -500,7 +508,8 @@ class SupplierInvoiceOcrService:
         ocr_text = _format_ocr_comment(invoice, review=review,
                                        company=company,
                                        project_match=project_match,
-                                       category=category, vat=vat)
+                                       category=category, vat=vat,
+                                       iban_from_supplier=iban_from_supplier)
         try:
             self._purchases.post_comment(purchase_id, ocr_text)
         except Exception:
@@ -1150,6 +1159,44 @@ def _resolve_reference_and_info(invoice: InvoiceData,
     return None, info
 
 
+def _apply_supplier_iban_fallback(invoice: InvoiceData,
+                                  company: dict | None
+                                  ) -> tuple[InvoiceData, bool]:
+    """Fill a missing `iban` from the matched supplier's Moco record.
+
+    Returns the (possibly updated) invoice and whether the fallback fired.
+
+    `_normalize_iban` nulls an IBAN whose mod-97 checksum fails, which it
+    should — a wrong IBAN would silently send a QR-bill payment to the
+    wrong account. But the consequence is invisible downstream: an
+    IBAN-less Moco purchase makes `BexioExpenseSyncService` take its
+    MANUAL branch, which by design skips booking + the outgoing payment
+    *silently*. Confirmed live on solar purchase 4645420 — the model
+    mangled a Zahlteil IBAN ending in a letter ("...7001T", exactly the
+    alphanumeric-account case `_normalize_iban` documents), so a real
+    QR-bill landed in Bexio as a manual payment with no Zahlungsausgang
+    and no alert.
+
+    Moco already held the correct IBAN on the supplier company. That
+    record is operator-maintained rather than model-derived, so it is the
+    better source when the document read fails — but it is still
+    re-validated here, since nothing guarantees a hand-entered IBAN is
+    well-formed.
+
+    Deliberately only fills a GAP: an IBAN the model did read is never
+    overridden. The document is authoritative when it is legible — a
+    supplier can invoice from an account other than the one on file.
+    """
+    if invoice.iban or not company:
+        return invoice, False
+    candidate = _normalize_iban(company.get("iban"))
+    if not candidate:
+        return invoice, False
+    logger.info("ocr: no IBAN from OCR — using supplier company id=%s IBAN "
+                "from Moco", company.get("id"))
+    return replace(invoice, iban=candidate), True
+
+
 def _prefer_draft_payment_fields(invoice: InvoiceData, draft: dict) -> InvoiceData:
     """Override OCR's iban / qr_reference with the draft's values when present.
 
@@ -1418,7 +1465,8 @@ def _format_ocr_comment(invoice: InvoiceData, *,
                         company: dict | None = None,
                         project_match: ProjectMatch | None = None,
                         category: CategoryDecision | None = None,
-                        vat: VatDecision | None = None) -> str:
+                        vat: VatDecision | None = None,
+                        iban_from_supplier: bool = False) -> str:
     """HTML comment body for the 🤖 OCR-extraction summary.
 
     Posted as its own Moco comment (separate from the 📧 email-source
@@ -1550,7 +1598,13 @@ def _format_ocr_comment(invoice: InvoiceData, *,
     fields.append(_li("Datum", invoice.invoice_date))
     fields.append(_li("Fällig", invoice.due_date))
     fields.append(_li("Rechnungs-Nr", invoice.invoice_number))
-    fields.append(_li("IBAN", invoice.iban))
+    # Say so when the IBAN came from the supplier's Moco record rather
+    # than off the document — the reviewer is confirming a different
+    # claim in that case.
+    iban_text = invoice.iban
+    if iban_text and iban_from_supplier:
+        iban_text = f"{iban_text} (aus Lieferant-Stammdaten, nicht vom Beleg)"
+    fields.append(_li("IBAN", iban_text))
     fields.append(_li("QR-Ref", invoice.qr_reference))
     fields.append(_li("Referenz", invoice.creditor_reference))
     fields = [li for li in fields if li]
