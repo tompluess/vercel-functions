@@ -4,6 +4,7 @@ alerts. In-memory fakes for all collaborators."""
 
 import base64
 import io
+import pathlib
 from urllib import error as urlerror
 
 import pytest
@@ -2982,3 +2983,122 @@ def test_no_collaborator_keeps_the_old_behaviour():
 
     assert result["review_pending"] is False
     assert result["bexio_bill_id"] is None
+
+
+# --- regression: solar purchase 4646039 -------------------------------------
+#
+# A Solarmarkt QR-bill. OCR read the 27-digit QR-reference but not the
+# IBAN beside it (the IBAN ends in a letter — "CH59 3000 5231 1801 9101 U"
+# — the alphanumeric-account case `_normalize_iban` documents Sonnet
+# mangling). The purchase was booked as a plain `bank_transfer` with the
+# QR-reference DROPPED and no IBAN at all, then auto-released to Bexio in
+# that state.
+#
+# One missing IBAN causes all three symptoms, because
+# `_payment_method_for` and `_resolve_reference_and_info` both branch on
+# it. This pins the whole payload, not just the IBAN.
+
+SOLARMARKT_IBAN = "CH593000523118019101U"          # real, QR-IBAN (IID 30005)
+SOLARMARKT_QR_REF = "123456000000033908054024177"  # real, 27 digits
+
+
+def _solarmarkt_service(purchases, **kwargs):
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 762656480, "name": "Solarmarkt GmbH"}]
+    moco.companies[762656480] = {"id": 762656480, "name": "Solarmarkt GmbH",
+                                 "iban": SOLARMARKT_IBAN}
+    return build_service(
+        moco=moco, purchases=purchases,
+        category_resolver=_category_resolver(),
+        ocr=FakeOcr(result=make_invoice(
+            supplier_name="Solarmarkt GmbH",
+            iban=None,                       # the model missed it
+            qr_reference=SOLARMARKT_QR_REF,  # but got the reference
+            payment_purpose="Rechnung 5402417",
+            confidence=0.93)),
+        **kwargs)
+
+
+def test_regression_4646039_qr_bill_books_with_recovered_iban():
+    """All four fields the live purchase got wrong, in one assertion
+    block: IBAN recovered, QR-ESR payment method, QR-reference kept, and
+    auto-released while carrying those correct values."""
+    purchases = FakePurchaseClient()
+    s = _solarmarkt_service(purchases)
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    created = purchases.creates[0]
+    assert created["iban"] == SOLARMARKT_IBAN
+    assert created["payment_method"] == "bank_transfer_swiss_qr_esr"
+    assert created["reference"] == SOLARMARKT_QR_REF
+    # Auto-release must carry the corrected values, not merely happen.
+    assert created["tags"] == ["OCR", "Auto"]
+    assert result["review_pending"] is False
+
+
+def test_regression_4646039_hands_the_corrected_purchase_to_bexio():
+    """The bug shipped a wrong purchase straight to Bexio unreviewed, so
+    the hand-off has to be part of the regression, not a separate concern."""
+    purchases = FakePurchaseClient()
+    bexio = FakeBexioExpense()
+    purchases.purchases_by_id[4001234] = {
+        "id": 4001234, "tags": ["OCR", "Auto"], "iban": SOLARMARKT_IBAN,
+        "reference": SOLARMARKT_QR_REF,
+    }
+    s = _solarmarkt_service(purchases, bexio_expense=bexio)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert len(bexio.synced) == 1
+    assert bexio.synced[0]["iban"] == SOLARMARKT_IBAN
+
+
+def test_regression_4646039_without_recovery_the_qr_reference_is_lost():
+    """Pins WHY this mattered: with no IBAN, `_payment_method_for` falls to
+    a plain transfer and `_resolve_reference_and_info` drops the
+    QR-reference outright — Moco 422s the QR-ESR path on a non-QR-IBAN.
+    That is the exact shape the live purchase had."""
+    purchases = FakePurchaseClient()
+    moco = FakeMoco()
+    moco.suppliers = []          # no supplier match → nothing to recover from
+    s = build_service(moco=moco, purchases=purchases,
+                      category_resolver=_category_resolver(),
+                      ocr=FakeOcr(result=make_invoice(
+                          supplier_name="Solarmarkt GmbH", iban=None,
+                          qr_reference=SOLARMARKT_QR_REF,
+                          payment_purpose="Rechnung 5402417")))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    created = purchases.creates[0]
+    assert "iban" not in created
+    assert created["payment_method"] == "bank_transfer"
+    assert "reference" not in created
+    assert created["info"] == "Rechnung 5402417"
+
+
+@pytest.mark.parametrize("script", ["scripts/batch_ocr_drafts.py",
+                                    "scripts/test_ocr_create_purchase.py"])
+def test_operator_scripts_run_the_iban_fallback(script):
+    """Anti-drift guard, deliberately a source check.
+
+    The operator scripts don't call `SupplierInvoiceOcrService.process` —
+    they re-walk the pipeline step by step so each resolution can be
+    printed — and then hand the result to the same
+    `_build_create_payload`. That makes them silently skippable: when
+    `_apply_supplier_iban_fallback` was added to the service it was NOT
+    added here, so `--apply` created purchases with no IBAN, a plain
+    `bank_transfer` and the QR-reference dropped, while the webhook path
+    got it right.
+
+    A behavioural test would need the scripts' whole argparse/Moco
+    plumbing stubbed; asserting the call exists is cheap and catches the
+    exact failure that happened. Same reasoning that removed the
+    hand-written `VatCodeResolver` mirror from `batch_ocr_drafts.py`.
+    """
+    source = pathlib.Path(script).read_text()
+    assert "_apply_supplier_iban_fallback(" in source, (
+        f"{script} does not apply the supplier-IBAN fallback — an "
+        "--apply run there will book QR-bills as plain transfers"
+    )

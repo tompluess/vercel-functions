@@ -63,6 +63,7 @@ from api.stromproduktion_project_matcher import (
 from api.supplier_invoice_ocr_service import (
     CONFIDENCE_THRESHOLD,
     SupplierInvoiceOcrService,
+    _apply_supplier_iban_fallback,
     _build_create_payload,
     _is_notification_subject,
     _is_qr_iban,
@@ -472,6 +473,16 @@ def _process_draft(draft: dict, *,
         except Exception as e:
             log.warning("get_company failed id=%s: %s", company_id, e)
 
+    # Same recovery the webhook service runs — a missing IBAN filled from
+    # the supplier's Moco record. Must happen here, before the payload is
+    # built, because `_payment_method_for` / `_resolve_reference_and_info`
+    # branch on `invoice.iban`: without it an apply-run books a QR-bill as
+    # a plain transfer with the QR-reference dropped.
+    invoice, iban_from_supplier = _apply_supplier_iban_fallback(
+        invoice, full_company)
+    if iban_from_supplier:
+        _step(f"iban {invoice.iban} (aus Lieferant-Stammdaten, nicht vom Beleg)")
+
     # --- energy credit note detection --------------------------------------
     # EVU production credit notes (see energy_credit_note_service.py)
     # short-circuit to their own expense+invoice flow — mirrors the
@@ -603,7 +614,8 @@ def _process_draft(draft: dict, *,
                                         company=full_company,
                                         project_match=kommission_match,
                                         category=category_decision,
-                                        vat=vat)
+                                        vat=vat,
+                                        iban_from_supplier=iban_from_supplier)
         assign_warnings = service._assign_resolved_project(
             created, kommission_match)
         if assign_warnings:
