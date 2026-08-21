@@ -60,6 +60,8 @@ Collaborators (one class per file):
 
 **Telegram notifications + the 2xx/5xx contract**: ports the n8n `Error Trigger → Send Error to Telegram` handler, but with a deliberate HTTP-status split (`index.py`'s `_app_error`). The dividing line is *can a webhook retry fix this?*
 
+Every outbound Telegram message **leads with a status icon** so the chat is scannable: ❌ nothing was created (hard failure), ⚠️ needs a human (skip, soft-failed side step, low-confidence result), ✅ done cleanly. The four n8n-ported Bexio messages (`_notify_skip_with_entity`, `_notify_bill_closed`, `_notify_book_pay_failure`, `_notify_no_customer`) predated the convention and were brought in line; the existing skip tests assert the prefix so it can't regress.
+
 - **Application errors** — failures a retry can't fix: an upstream `HTTPError` with a **4xx** status (the external system rejected our request), an unexpected internal `Exception`, and the moco-sync delete `TargetNotFoundError`. These fire a Telegram alert (endpoint path, event, source id, error detail) and **ACK with HTTP 200 `{"ok": false, "event", "error"}`** so Moco stops retrying. Telegram now carries the visibility the old non-2xx + delivery-log used to.
 - **Infrastructure failures** — transient, retry-worthy: `URLError` (upstream unreachable) and an upstream `HTTPError` with a **5xx** status. These surface as **HTTP 502** so Moco retries, and are **NOT** notified — a flapping upstream would otherwise spam the chat once per retry.
 - **4xx auth/validation rejections** (bad signature, stale timestamp, wrong target) are unchanged: rejected pre-work with their own 401/422, never notified.

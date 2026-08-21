@@ -473,6 +473,9 @@ def test_notifies_telegram_on_no_company_skip(service_tg, telegram):
     service_tg.sync(load_fixture("purchase_no_company.json"))
     assert len(telegram.messages) == 1
     msg = telegram.messages[0]
+    # Every Telegram message in this codebase leads with a status icon;
+    # these n8n-ported ones were the last four without.
+    assert msg.startswith("⚠️ ")
     assert "not synced to Bexio" in msg
     assert "Reason: No company given" in msg
     # Entity context carries the Moco purchase deep-link on the source account.
@@ -483,6 +486,7 @@ def test_notifies_telegram_on_no_account_skip(service_tg, bexio, telegram):
     bexio.contacts_by_name["Misc Vendor"] = [{"id": 5050}]
     service_tg.sync(load_fixture("purchase_no_account.json"))
     assert len(telegram.messages) == 1
+    assert telegram.messages[0].startswith("⚠️ ")
     assert "Reason: No account given" in telegram.messages[0]
 
 
@@ -497,6 +501,7 @@ def test_notifies_telegram_on_bill_closed_skip(service_tg, bexio, telegram):
 
     assert len(telegram.messages) == 1
     msg = telegram.messages[0]
+    assert msg.startswith("⚠️ ")
     assert "Reason: Bill is closed." in msg
     assert "Bill-Id might not be unique" in msg
 
@@ -656,6 +661,7 @@ def test_book_failure_notifies_telegram_and_keeps_sync_ok(
     assert not any(c[0] == "create_outgoing_payment" for c in bexio.calls)
     assert len(telegram.messages) == 1
     msg = telegram.messages[0]
+    assert msg.startswith("⚠️ ")
     assert "booking/payment failed" in msg
     assert "Cannot book non-draft bill" in msg
     assert "https://office.bexio.com/index.php/kb_bill/list#/show/9001" in msg

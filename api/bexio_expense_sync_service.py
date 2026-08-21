@@ -341,7 +341,7 @@ class BexioExpenseSyncService:
             return
         company = (body.get("company") or {}).get("name") or ""
         self._telegram.notify(
-            "Expense in Moco synced to Bexio but booking/payment failed:\n"
+            "⚠️ Expense in Moco synced to Bexio but booking/payment failed:\n"
             f"- Company: {company}\n"
             f"- Bill ID: {body.get('receipt_identifier') or ''}\n"
             f"- Date: {body.get('date') or ''}\n"
@@ -380,7 +380,7 @@ class BexioExpenseSyncService:
             return
         company = (body.get("company") or {}).get("name") or ""
         self._telegram.notify(
-            "Expense in Moco not synced to Bexio:\n"
+            "⚠️ Expense in Moco not synced to Bexio:\n"
             f"Reason: {reason}\n"
             "Expense:\n"
             f"- Company: {company}\n"
@@ -394,7 +394,7 @@ class BexioExpenseSyncService:
         if not self._telegram:
             return
         self._telegram.notify(
-            f"Expense in Moco not synced to Bexio: {self._purchase_url(body.get('id'))}\n"
+            f"⚠️ Expense in Moco not synced to Bexio: {self._purchase_url(body.get('id'))}\n"
             "Reason: Bill is closed.\n"
             "Hint: Bill-Id might not be unique (Rechnungsnummer)"
         )
