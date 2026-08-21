@@ -66,12 +66,12 @@ from api.supplier_invoice_ocr_service import (
     _apply_supplier_iban_fallback,
     _build_create_payload,
     _is_notification_subject,
-    _is_qr_iban,
     _manual_upload_subject,
     _payment_method_for,
     _prefer_draft_payment_fields,
     _user_id_from_draft,
 )
+from api.anthropic_ocr_client import is_qr_iban
 from api.vat_code_resolver import VatCodeResolver, VatDecision
 
 logging.basicConfig(level=logging.WARNING,
@@ -536,7 +536,7 @@ def _process_draft(draft: dict, *,
               "(Karte / Terminal — IBAN & due_date suppressed)")
     else:
         iban_tail = invoice.iban[-4:] if invoice.iban else "----"
-        qr_note = "  (QR-IBAN)" if _is_qr_iban(invoice.iban) else ""
+        qr_note = "  (QR-IBAN)" if is_qr_iban(invoice.iban) else ""
         _step(f"payment: {method}  IBAN …{iban_tail}{qr_note}")
 
     # --- category resolution ----------------------------------------------

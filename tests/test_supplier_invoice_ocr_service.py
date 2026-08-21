@@ -681,7 +681,9 @@ def test_invalid_draft_iban_does_not_override_ocr():
 def test_draft_reference_overrides_ocr_qr_reference():
     """Same precedence rule for QR-reference — Moco's parser is the
     source of truth when present."""
-    invoice = make_invoice(qr_reference="999999999999999999999999999")  # OCR-wrong but valid 27d
+    # Built as InvoiceData directly, so `_normalize_qr_reference` never
+    # sees it — it only stands in for "whatever OCR produced" here.
+    invoice = make_invoice(qr_reference="999999999999999999999999999")
     purchases = FakePurchaseClient()
     s = build_service(ocr=FakeOcr(result=invoice), purchases=purchases)
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf",
@@ -3102,3 +3104,111 @@ def test_operator_scripts_run_the_iban_fallback(script):
         f"{script} does not apply the supplier-IBAN fallback — an "
         "--apply run there will book QR-bills as plain transfers"
     )
+
+
+# --- QR-IBAN without a QR-reference -----------------------------------------
+#
+# The mirror of the QR-reference-without-IBAN case above, and the more
+# dangerous one: a QR-IBAN is only payable WITH a QR-reference, so this
+# combination is a bill no bank will accept. Live on solar purchase
+# 4646154 — the supplier fallback supplied the QR-IBAN, but the model
+# dropped a zero from the reference's long zero-run and
+# `_normalize_qr_reference` nulled it. Nothing can recover it: the
+# reference is per-invoice and exists only on the document.
+
+QR_IBAN = "CH593000523118019101U"        # Solarmarkt, IID 30005
+PLAIN_IBAN = "CH7708836121049112006"     # not in the QR-IBAN range
+
+
+def test_qr_iban_without_reference_warns_on_telegram():
+    tg = FakeTelegram()
+    s = build_service(telegram=tg, ocr=FakeOcr(result=make_invoice(
+        iban=QR_IBAN, qr_reference=None)))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert any("QR-IBAN erkannt, aber keine gültige QR-Referenz" in m
+               for m in tg.messages)
+
+
+def test_qr_iban_with_reference_does_not_warn():
+    tg = FakeTelegram()
+    s = build_service(telegram=tg, ocr=FakeOcr(result=make_invoice(
+        iban=QR_IBAN, qr_reference="123456000000033908054024177")))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert not any("QR-IBAN erkannt" in m for m in tg.messages)
+
+
+def test_plain_iban_without_reference_does_not_warn():
+    """An ordinary IBAN bill needs no reference — warning on those would be
+    noise. It is the QR-IBAN that makes the gap fatal."""
+    tg = FakeTelegram()
+    s = build_service(telegram=tg, ocr=FakeOcr(result=make_invoice(
+        iban=PLAIN_IBAN, qr_reference=None)))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert not any("QR-IBAN erkannt" in m for m in tg.messages)
+
+
+def test_the_two_qr_warnings_are_mutually_exclusive():
+    """Reference-without-IBAN keeps its own message; the branches must not
+    both fire, and one Telegram per draft stays the rule."""
+    tg = FakeTelegram()
+    s = build_service(telegram=tg, ocr=FakeOcr(result=make_invoice(
+        iban=None, qr_reference="123456000000033908054024177")))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert len(tg.messages) == 1
+    assert "keine IBAN gelesen" in tg.messages[0]
+    assert "QR-IBAN erkannt" not in tg.messages[0]
+
+
+def test_recovered_qr_iban_without_reference_still_warns():
+    """The exact 4646154 shape: the supplier fallback supplies the QR-IBAN,
+    so the bill LOOKS more complete than it is — the warning is the only
+    signal that it cannot actually be paid."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 762656480, "name": "Solarmarkt GmbH"}]
+    moco.companies[762656480] = {"id": 762656480, "iban": QR_IBAN}
+    purchases = FakePurchaseClient()
+    tg = FakeTelegram()
+    s = build_service(moco=moco, purchases=purchases, telegram=tg,
+                      ocr=FakeOcr(result=make_invoice(
+                          supplier_name="Solarmarkt GmbH",
+                          iban=None, qr_reference=None)))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.creates[0]["iban"] == QR_IBAN
+    assert purchases.creates[0]["payment_method"] == "bank_transfer"
+    assert any("QR-IBAN erkannt, aber keine gültige QR-Referenz" in m
+               for m in tg.messages)
+
+
+def test_recovered_qr_iban_without_reference_is_held_not_released():
+    """The 4646154 shape end to end: the supplier fallback fills the IBAN,
+    which makes the purchase LOOK complete, but with no QR-reference it
+    cannot be paid. It must not reach Bexio on its own — a warning alone
+    would leave an unexecutable Zahlungsausgang sitting there."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 762656480, "name": "Solarmarkt GmbH"}]
+    moco.companies[762656480] = {"id": 762656480, "iban": QR_IBAN}
+    purchases = FakePurchaseClient()
+    bexio = FakeBexioExpense()
+    s = build_service(moco=moco, purchases=purchases, bexio_expense=bexio,
+                      category_resolver=_category_resolver(),
+                      ocr=FakeOcr(result=make_invoice(
+                          supplier_name="Solarmarkt GmbH", iban=None,
+                          qr_reference=None, confidence=0.95)))
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.creates[0]["iban"] == QR_IBAN
+    assert result["review_pending"] is True
+    assert "QR-IBAN ohne QR-Referenz (nicht zahlbar)" in result["review_reasons"]
+    assert purchases.creates[0]["tags"] == ["OCR", "Review pending"]
+    assert bexio.synced == []      # never auto-released

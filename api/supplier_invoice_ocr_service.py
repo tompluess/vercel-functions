@@ -54,6 +54,7 @@ from api.anthropic_ocr_client import (
     InvoiceData,
     _lift_creditor_reference_from_purpose,
     _normalize_creditor_reference,
+    is_qr_iban,
     _normalize_iban,
     _normalize_qr_reference,
 )
@@ -834,6 +835,18 @@ class SupplierInvoiceOcrService:
             suffix += ("\n⚠️ QR-Referenz erkannt, aber keine IBAN gelesen — "
                        "Bexio bucht als MANUAL ohne Zahlungsausgang. "
                        "IBAN beim Lieferanten in Moco hinterlegen.")
+        # The mirror image, and the more dangerous one: a QR-IBAN is only
+        # payable WITH a QR-reference, so this combination is a bill no
+        # bank will accept. It arises when the model reads the IBAN (or
+        # the supplier fallback supplies it) but drops the reference —
+        # e.g. by losing a digit from a long zero-run, which
+        # `_normalize_qr_reference` then nulls on length or check digit.
+        # Unlike a missing IBAN there is nothing to recover from: the
+        # reference is per-invoice and exists only on the document.
+        elif is_qr_iban(invoice.iban) and not invoice.qr_reference:
+            suffix += ("\n⚠️ QR-IBAN erkannt, aber keine gültige QR-Referenz "
+                       "gelesen — so ist die Rechnung nicht zahlbar. "
+                       "QR-Referenz vom Beleg nachtragen.")
         if invoice.is_credit_note:
             # Gutschrift always triggers the alert regardless of confidence:
             # the reviewer must flip the sign on the total before approving.
@@ -1238,7 +1251,7 @@ def _resolve_reference_and_info(invoice: InvoiceData,
         return None, info
     if invoice.qr_reference and payment_method == "bank_transfer_swiss_qr_esr":
         return invoice.qr_reference, info
-    if invoice.qr_reference and not _is_qr_iban(invoice.iban):
+    if invoice.qr_reference and not is_qr_iban(invoice.iban):
         logger.warning("ocr: extracted qr_reference=%r but iban=%r is not a "
                        "QR-IBAN — dropping the QR-reference; will try a SCOR "
                        "fallback", invoice.qr_reference, invoice.iban)
@@ -1346,23 +1359,6 @@ def _prefer_draft_payment_fields(invoice: InvoiceData, draft: dict) -> InvoiceDa
     return replace(invoice, **updates) if updates else invoice
 
 
-def _is_qr_iban(iban: str | None) -> bool:
-    """True if `iban` is a Swiss QR-IBAN.
-
-    Per the Swiss QR-bill spec, a QR-IBAN is identified by its IID (bank
-    clearing number) in positions 5–9: `30000`–`31999`. Regular IBANs
-    have IIDs outside that range and Moco will 422 with
-    `"iban":["ist keine QR-IBAN"]` if we POST one under
-    `payment_method=bank_transfer_swiss_qr_esr`.
-    """
-    if not iban or len(iban) < 9 or not iban.startswith("CH"):
-        return False
-    iid = iban[4:9]
-    if not iid.isdigit():
-        return False
-    return 30000 <= int(iid) <= 31999
-
-
 def _resolve_due_date(invoice_date: str | None,
                       ocr_due_date: str | None) -> str | None:
     """Decide the `due_date` to send on the new Moco purchase.
@@ -1416,7 +1412,7 @@ def _payment_method_for(invoice: InvoiceData) -> str:
     """
     if invoice.already_paid_by_card:
         return "credit_card"
-    if invoice.qr_reference and _is_qr_iban(invoice.iban):
+    if invoice.qr_reference and is_qr_iban(invoice.iban):
         return "bank_transfer_swiss_qr_esr"
     return "bank_transfer"
 

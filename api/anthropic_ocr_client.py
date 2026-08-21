@@ -771,6 +771,14 @@ def _abs_or_none(value: float | None) -> float | None:
 
 QR_REFERENCE_LENGTH = 27
 
+# "Modulo 10, rekursiv" — the check-digit algorithm Swiss QR/ESR
+# references use. The 27th digit is a checksum over the first 26, so a
+# transcription error that happens to preserve the length is still
+# catchable. Table per the Six Payment Services ISR specification;
+# verified against four live references from Moco purchases (Solarmarkt,
+# smart-me, Krannich, Solar Manager) — all four check out.
+_QR_CHECK_TABLE = (0, 9, 4, 6, 8, 2, 7, 1, 3, 5)
+
 
 def _normalize_qr_reference(value) -> str | None:
     """QR-Referenznummer stripped to digits only — exactly 27 digits or None.
@@ -788,6 +796,15 @@ def _normalize_qr_reference(value) -> str | None:
     confidence score plus the Telegram review alert is the human-facing
     signal that a field was dropped; the operator can correct it in the
     Moco draft.
+
+    The **check digit** is verified too. Length alone let a
+    length-preserving misread through — and those happen: on one live
+    document the model transcribed `...000000339080540 24177` for
+    `...000000033908054024177`, dropping a zero from the long zero-run.
+    That one was caught by length, but the same slip landing on a digit
+    instead of a zero-run would not have been, and a wrong reference is a
+    payment posted against the wrong invoice at the supplier. Same
+    posture as `_normalize_iban`'s mod-97 gate: refuse rather than guess.
     """
     if value is None:
         return None
@@ -799,7 +816,43 @@ def _normalize_qr_reference(value) -> str | None:
                        "%d digits (expected %d), nulling field. raw=%r",
                        len(cleaned), QR_REFERENCE_LENGTH, value)
         return None
+    expected = _qr_check_digit(cleaned[:-1])
+    if int(cleaned[-1]) != expected:
+        logger.warning("OCR returned QR-reference with a bad check digit "
+                       "(%s, expected %d), nulling field. raw=%r",
+                       cleaned[-1], expected, value)
+        return None
     return cleaned
+
+
+def _qr_check_digit(first_26: str) -> int:
+    """Modulo-10-recursive check digit over the first 26 digits."""
+    carry = 0
+    for digit in first_26:
+        carry = _QR_CHECK_TABLE[(carry + int(digit)) % 10]
+    return (10 - carry) % 10
+
+
+def is_qr_iban(iban: str | None) -> bool:
+    """True if `iban` is a Swiss QR-IBAN.
+
+    Per the Swiss QR-bill spec a QR-IBAN is identified by its IID (bank
+    clearing number) in positions 5-9: `30000`-`31999`. Regular IBANs
+    have IIDs outside that range, and Moco 422s with
+    `"iban":["ist keine QR-IBAN"]` if one is POSTed under
+    `payment_method=bank_transfer_swiss_qr_esr`.
+
+    Lives here rather than in `supplier_invoice_ocr_service` (its
+    original home) so `PurchaseReviewGate` can use it too — the service
+    imports the gate, so the gate cannot import back from the service.
+    Sits with the rest of the IBAN knowledge either way.
+    """
+    if not iban or len(iban) < 9 or not iban.startswith("CH"):
+        return False
+    iid = iban[4:9]
+    if not iid.isdigit():
+        return False
+    return 30000 <= int(iid) <= 31999
 
 
 def _normalize_iban(value) -> str | None:

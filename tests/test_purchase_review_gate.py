@@ -280,3 +280,65 @@ def test_omitted_vat_argument_keeps_the_old_behaviour():
         category=supplier_category(), project_match=None)
 
     assert decision.review_pending is False
+
+
+# --- unpayable QR-IBAN (live: solar purchase 4646154) -----------------------
+#
+# A QR-IBAN is only payable WITH its QR-reference. Unlike a missing IBAN —
+# which the supplier record can supply — a reference is per-invoice and
+# exists only on the document, so there is nothing to recover from and a
+# human has to read it off the paper.
+
+QR_IBAN = "CH593000523118019101U"        # Solarmarkt, IID 30005
+PLAIN_IBAN = "CH7708836121049112006"     # IID outside the QR range
+QR_REFERENCE = "123456000000033908054024177"
+
+
+def test_qr_iban_without_reference_is_held():
+    decision = PurchaseReviewGate().evaluate(
+        invoice=make_invoice(iban=QR_IBAN, qr_reference=None),
+        company_id=555, category=supplier_category(), project_match=None)
+
+    assert decision.review_pending is True
+    assert decision.reasons == ["QR-IBAN ohne QR-Referenz (nicht zahlbar)"]
+    assert "Review pending" in decision.tags
+
+
+def test_qr_iban_with_its_reference_auto_releases():
+    decision = PurchaseReviewGate().evaluate(
+        invoice=make_invoice(iban=QR_IBAN, qr_reference=QR_REFERENCE),
+        company_id=555, category=supplier_category(), project_match=None)
+
+    assert decision.review_pending is False
+
+
+def test_plain_iban_without_reference_auto_releases():
+    """An ordinary IBAN bill needs no reference — holding those would stall
+    most invoices. It is the QR-IBAN that makes the gap fatal."""
+    decision = PurchaseReviewGate().evaluate(
+        invoice=make_invoice(iban=PLAIN_IBAN, qr_reference=None),
+        company_id=555, category=supplier_category(), project_match=None)
+
+    assert decision.review_pending is False
+
+
+def test_no_iban_at_all_is_not_this_reason():
+    """A company-less or IBAN-less bill has its own handling; this
+    condition must not claim it."""
+    decision = PurchaseReviewGate().evaluate(
+        invoice=make_invoice(iban=None, qr_reference=None),
+        company_id=555, category=supplier_category(), project_match=None)
+
+    assert decision.review_pending is False
+
+
+def test_already_paid_card_receipt_is_not_called_unpayable():
+    """Nothing is being paid on a settled receipt, so "nicht zahlbar" would
+    be a false statement. It is held anyway — by the category chain — so
+    this only keeps the stated reason honest."""
+    decision = PurchaseReviewGate().evaluate(
+        invoice=make_invoice(already_paid_by_card=True, iban=QR_IBAN,
+                             qr_reference=None),
+        company_id=555, category=supplier_category(), project_match=None)
+
+    assert "QR-IBAN ohne QR-Referenz (nicht zahlbar)" not in decision.reasons
