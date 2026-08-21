@@ -90,6 +90,24 @@ class MocoPurchaseClient:
         with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
             return json.loads(resp.read())
 
+    def get_purchase(self, purchase_id: int) -> dict:
+        """GET /purchases/{id} — read a real (non-draft) purchase.
+
+        Note the URL space: `purchases/drafts/{id}` above is a DIFFERENT
+        resource, and each 403s on the other's ids.
+
+        Used after `create_purchase` to hand `BexioExpenseSyncService`
+        exactly the shape a `Purchase` webhook would have delivered. The
+        create response is not a safe substitute: the expense sync reads
+        `file_url` and the expanded `items[].category.credit_account`,
+        and nothing guarantees the POST echoes every association Moco
+        resolves server-side.
+        """
+        url = f"{self._base_url}/purchases/{purchase_id}"
+        req = urlrequest.Request(url, headers=self._auth_headers)
+        with urlrequest.urlopen(req, timeout=self.HTTP_TIMEOUT_SECONDS) as resp:
+            return json.loads(resp.read())
+
     def delete_purchase_draft(self, purchase_id: int) -> None:
         """DELETE /purchases/drafts/{id} — remove a draft purchase.
 

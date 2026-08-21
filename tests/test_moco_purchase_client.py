@@ -307,3 +307,20 @@ def test_create_payment_propagates_http_errors(client, calls):
     calls["next_status"] = 422
     with pytest.raises(urlerror.HTTPError):
         client.create_payment(purchase_id=1, date="2026-01-01", total=1.0)
+
+
+def test_get_purchase_hits_the_non_draft_url(client, calls):
+    """Counterpart to `get_purchase_draft`: real purchases live at
+    /purchases/{id}, drafts at /purchases/drafts/{id}, and each 403s on
+    the other's ids. Used by the OCR service to re-fetch an auto-released
+    purchase before handing it to the Bexio expense sync."""
+    calls["next_response"] = json.dumps(
+        {"id": 4001234, "tags": ["OCR", "Auto"]}).encode()
+
+    result = client.get_purchase(4001234)
+
+    assert result == {"id": 4001234, "tags": ["OCR", "Auto"]}
+    call = calls["calls"][0]
+    assert call["url"] == "https://solar.mocoapp.com/api/v1/purchases/4001234"
+    assert "/drafts/" not in call["url"]
+    assert call["method"] == "GET"

@@ -76,9 +76,13 @@ REQUIRED_ENV_BREVO_SYNC = [
     *REQUIRED_ENV_TELEGRAM,
 ]
 
-# Supplier-invoice OCR is a Moco-only flow (no Bexio/Brevo). It needs:
+# Supplier-invoice OCR needs:
 #   - the usual Moco auth (webhook secret + account creds),
 #   - the Anthropic key for the OCR call.
+# The Bexio credentials are deliberately NOT required here: they are only
+# used to hand an auto-released purchase straight to the expense sync
+# (see OPTIONAL_ENV_BEXIO_HANDOFF below), and an instance without them
+# must keep OCRing rather than fail the whole endpoint with a 500.
 # The VAT code is resolved dynamically per invoice (OCR vat_rate matched
 # against GET /vat_code_purchases, falling back to the supplier's default),
 # so there's no env-var default. MOCO_SUBDOMAIN is the same value used by
@@ -88,6 +92,12 @@ REQUIRED_ENV_SUPPLIER_INVOICE_OCR = [
     "MOCO_API_KEY", "ANTHROPIC_API_KEY",
     *REQUIRED_ENV_TELEGRAM,
 ]
+
+# Enables the auto-release → Bexio hand-off when all three are present.
+# Same keys `REQUIRED_ENV_BEXIO_SYNC` needs; listed separately because
+# here they are opt-in, not a precondition.
+OPTIONAL_ENV_BEXIO_HANDOFF = ["BEXIO_CLIENT_ID", "BEXIO_CLIENT_SECRET",
+                              "REDIS_URL"]
 
 app = FastAPI()
 
@@ -343,6 +353,24 @@ async def supplier_invoice_ocr_webhook(request: Request) -> dict[str, Any]:
         subdomain=cfg["MOCO_SUBDOMAIN"],
         telegram=notifier,
     )
+    # Moco does not deliver a `Purchase:create` webhook for purchases
+    # created through the API, so an auto-released purchase would never
+    # reach `bexio-expense-sync` on its own. Hand it over directly when
+    # the Bexio credentials are configured; without them the OCR flow is
+    # unchanged and the purchase waits for a human to touch it in Moco.
+    bexio_expense = None
+    if all(os.environ.get(k) for k in OPTIONAL_ENV_BEXIO_HANDOFF):
+        bexio_expense = BexioExpenseSyncService(
+            bexio=_build_bexio_api({k: os.environ[k]
+                                    for k in OPTIONAL_ENV_BEXIO_HANDOFF}),
+            moco=moco,
+            subdomain=cfg["MOCO_SUBDOMAIN"],
+            telegram=notifier,
+        )
+    else:
+        logger.info("ocr: Bexio credentials absent — auto-released "
+                    "purchases will not be handed to the expense sync")
+
     service = SupplierInvoiceOcrService(
         moco=moco,
         purchase_client=purchase_client,
@@ -353,6 +381,7 @@ async def supplier_invoice_ocr_webhook(request: Request) -> dict[str, Any]:
         category_resolver=category_resolver,
         smartme=smartme_service,
         energy_credit_note=energy_credit_note_service,
+        bexio_expense=bexio_expense,
     )
 
     try:

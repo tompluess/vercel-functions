@@ -57,6 +57,7 @@ from api.anthropic_ocr_client import (
     _normalize_iban,
     _normalize_qr_reference,
 )
+from api.bexio_expense_sync_service import BexioExpenseSyncService
 from api.energy_credit_note_service import (
     EVU_TAG,
     EnergyCreditNoteService,
@@ -106,7 +107,8 @@ class SupplierInvoiceOcrService:
                  category_resolver: MocoCategoryResolver | None = None,
                  review_gate: PurchaseReviewGate | None = None,
                  smartme: SmartmeEnergyExpenseService | None = None,
-                 energy_credit_note: EnergyCreditNoteService | None = None):
+                 energy_credit_note: EnergyCreditNoteService | None = None,
+                 bexio_expense: BexioExpenseSyncService | None = None):
         self._moco = moco
         self._purchases = purchase_client
         self._ocr = ocr
@@ -140,6 +142,16 @@ class SupplierInvoiceOcrService:
         # anything it can't vouch for (no resolver wired → no trusted
         # category → held), which is the pre-existing behaviour.
         self._review_gate = review_gate or PurchaseReviewGate()
+        # Optional — when set, an AUTO-released purchase is handed
+        # straight to the Bexio expense sync instead of waiting for a
+        # `Purchase:create` webhook to come back round. Moco does not
+        # deliver that webhook for purchases created through the API
+        # (confirmed across 11 live auto-released purchases: ten never
+        # synced, and the one that did got its bill only after a human
+        # edited its labels in the UI, i.e. from an *update*). Left
+        # optional so an instance without Bexio credentials — and every
+        # existing unit test — keeps the old wait-for-webhook behaviour.
+        self._bexio_expense = bexio_expense
 
     def process(self, event: str, body: dict) -> dict[str, Any]:
         """Drive one Purchase webhook through OCR + new-purchase creation.
@@ -333,6 +345,8 @@ class SupplierInvoiceOcrService:
         assign_warnings: list[str] = []
         payment_registered = False
         payment_warning: str | None = None
+        bexio_bill_id: int | None = None
+        bexio_warning: str | None = None
         if new_purchase_id:
             self._post_summary_comments(new_purchase_id, invoice,
                                         draft_id, body,
@@ -345,6 +359,8 @@ class SupplierInvoiceOcrService:
             payment_registered, payment_warning = self._register_payment(
                 created, invoice)
             self._delete_draft_after_create(draft_id, new_purchase_id)
+            bexio_bill_id, bexio_warning = self._sync_auto_released_to_bexio(
+                new_purchase_id, review)
 
         # If we got this far without returning from the energy-credit-note
         # `if` above, all three of its detection signals came back False
@@ -358,7 +374,9 @@ class SupplierInvoiceOcrService:
                              checked_energy_credit_note=checked_energy_credit_note,
                              review=review,
                              payment_registered=payment_registered,
-                             payment_warning=payment_warning)
+                             payment_warning=payment_warning,
+                             bexio_bill_id=bexio_bill_id,
+                             bexio_warning=bexio_warning)
 
         assigned_project = (project_match.project
                             if project_match and project_match.status == "matched"
@@ -376,6 +394,7 @@ class SupplierInvoiceOcrService:
             "review_pending": review.review_pending,
             "review_reasons": review.reasons,
             "payment_registered": payment_registered,
+            "bexio_bill_id": bexio_bill_id,
             "assigned_project_id": (assigned_project.get("id")
                                     if assigned_project else None),
             "assigned_project_name": (assigned_project.get("name")
@@ -707,6 +726,62 @@ class SupplierInvoiceOcrService:
                              purchase_id)
         return True, None
 
+    # --- bexio hand-off -----------------------------------------------------
+
+    def _sync_auto_released_to_bexio(
+            self, purchase_id: int,
+            review: ReviewDecision) -> tuple[int | None, str | None]:
+        """Push an auto-released purchase to Bexio without a webhook.
+
+        Moco does not deliver a `Purchase:create` webhook for purchases
+        created through the API, so an auto-released purchase used to sit
+        in Moco untouched — the `Review pending` tag it deliberately
+        lacks is exactly what would have made a later *update* webhook
+        sync it. Ten of eleven live auto-released purchases had no Bexio
+        bill; the one that did got it minutes later, from a human editing
+        its labels.
+
+        Held purchases are NOT pushed: the whole point of the tag is that
+        a person looks first, and `BexioExpenseSyncService` would refuse
+        them anyway (`_has_review_pending_tag` is its first gate).
+
+        The purchase is re-fetched rather than reusing the create
+        response, so the sync sees exactly the shape a webhook would have
+        delivered (`file_url`, expanded `items[].category`).
+
+        Best-effort, like the project assign and the payment registration:
+        the Moco purchase is the authoritative side effect and the OCR
+        webhook has already succeeded. A Bexio failure must not escape to
+        `index.py`, where a 4xx would flip this run to `ok=false` and a
+        5xx would trigger a webhook retry that re-runs the whole (paid)
+        OCR. Returns the Bexio bill id, or a short warning for Telegram.
+        """
+        if self._bexio_expense is None or review.review_pending:
+            return None, None
+        try:
+            purchase = self._purchases.get_purchase(purchase_id)
+            result = self._bexio_expense.sync(purchase)
+        except urlerror.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")[:200]
+            logger.warning("ocr: bexio hand-off failed purchase_id=%s "
+                           "status=%s body=%s", purchase_id, e.code, detail)
+            return None, f"HTTP {e.code} {detail}"
+        except Exception as e:
+            logger.exception("ocr: bexio hand-off failed purchase_id=%s",
+                             purchase_id)
+            return None, str(e)
+        if result.get("skipped"):
+            # The sync's own Telegram alert already named the reason
+            # (no company / no account / bill not DRAFT); don't duplicate
+            # it, just record that no bill came back.
+            logger.info("ocr: bexio hand-off skipped purchase_id=%s reason=%s",
+                        purchase_id, result.get("skipped"))
+            return None, None
+        bill_id = result.get("bill_id")
+        logger.info("ocr: bexio hand-off ok purchase_id=%s bill_id=%s",
+                    purchase_id, bill_id)
+        return bill_id, None
+
     # --- telegram routing ---------------------------------------------------
 
     def _notify_outcome(self, purchase_id: int | None, draft_id: int,
@@ -715,7 +790,9 @@ class SupplierInvoiceOcrService:
                         checked_energy_credit_note: bool = False,
                         review: ReviewDecision | None = None,
                         payment_registered: bool = False,
-                        payment_warning: str | None = None) -> None:
+                        payment_warning: str | None = None,
+                        bexio_bill_id: int | None = None,
+                        bexio_warning: str | None = None) -> None:
         if not self._telegram:
             return
         link = (self._purchase_url(purchase_id) if purchase_id
@@ -745,6 +822,14 @@ class SupplierInvoiceOcrService:
         # `BexioExpenseSyncService` takes its MANUAL branch, which skips
         # booking and the outgoing payment *silently* by design. Rides on
         # the same message: one Telegram per draft stays the rule.
+        # An auto-released purchase claims in its Moco comment that it
+        # went to Bexio without review. Say on Telegram whether that
+        # actually happened — the hand-off is best-effort, so silence
+        # here would leave the claim unverifiable.
+        if bexio_bill_id:
+            suffix += f"\n🧾 Bexio-Rechnung erstellt (#{bexio_bill_id})"
+        elif bexio_warning:
+            suffix += f"\n⚠️ Bexio-Übergabe fehlgeschlagen: {bexio_warning}"
         if invoice.qr_reference and not invoice.iban:
             suffix += ("\n⚠️ QR-Referenz erkannt, aber keine IBAN gelesen — "
                        "Bexio bucht als MANUAL ohne Zahlungsausgang. "
