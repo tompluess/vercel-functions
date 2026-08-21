@@ -101,7 +101,12 @@ def test_extract_sends_pdf_as_base64_document_block(client, calls):
     client.extract(PDF_BYTES)
     payload = calls["calls"][0]["payload"]
     assert payload["model"] == "claude-sonnet-4-6"
-    assert payload["max_tokens"] >= 512
+    # Not just "some budget": the JSON object alone runs ~600 tokens and
+    # the prompt's length checks make Sonnet reason out loud first — a
+    # measured 811 tokens of scratchpad on one live QR-bill. Too tight a
+    # cap truncates the response before any JSON appears, which surfaces
+    # as `AnthropicOcrError(status_code=None)` and loses the draft.
+    assert payload["max_tokens"] >= 2048
     assert "system" in payload and "JSON object" in payload["system"]
     content_blocks = payload["messages"][0]["content"]
     doc_block = next(b for b in content_blocks if b["type"] == "document")

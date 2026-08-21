@@ -2640,3 +2640,171 @@ def test_manual_comment_renders_with_subject_alone():
 
 def test_manual_comment_is_empty_without_either_field():
     assert _format_manual_upload_comment(None, None) == ""
+
+
+# --- supplier-company IBAN fallback -----------------------------------------
+#
+# Live case: solar purchase 4645420. The model mangled a Zahlteil IBAN
+# ending in a letter ("...7001T"), `_normalize_iban` nulled it on the
+# checksum, and the IBAN-less purchase made `BexioExpenseSyncService`
+# take its MANUAL branch — which silently skips booking + the outgoing
+# payment. Moco held the correct IBAN on the supplier all along.
+
+SUPPLIER_IBAN = "CH773000523621577001T"   # real, mod-97 valid, QR-IBAN
+
+
+def test_missing_iban_is_recovered_from_the_supplier_record():
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "energiecheck bern ag"}]
+    moco.companies[555] = {"id": 555, "name": "energiecheck bern ag",
+                           "iban": SUPPLIER_IBAN}
+    purchases = FakePurchaseClient()
+    s = build_service(moco=moco, purchases=purchases, ocr=FakeOcr(
+        result=make_invoice(supplier_name="energiecheck bern ag", iban=None)))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.creates[0]["iban"] == SUPPLIER_IBAN
+
+
+def test_ocr_read_iban_is_never_overridden():
+    """The document wins when it's legible — a supplier can invoice from
+    an account other than the one on file."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "FLYERALARM"}]
+    moco.companies[555] = {"id": 555, "iban": SUPPLIER_IBAN}
+    purchases = FakePurchaseClient()
+    s = build_service(moco=moco, purchases=purchases, ocr=FakeOcr(
+        result=make_invoice(iban="CH4431999123000889012")))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.creates[0]["iban"] == "CH4431999123000889012"
+
+
+def test_malformed_supplier_iban_is_rejected_too():
+    """A hand-entered Moco IBAN is not automatically trustworthy — it goes
+    through the same mod-97 gate as the model's."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "FLYERALARM"}]
+    moco.companies[555] = {"id": 555, "iban": "CH7730005236215770010"}  # bad
+    purchases = FakePurchaseClient()
+    s = build_service(moco=moco, purchases=purchases, ocr=FakeOcr(
+        result=make_invoice(iban=None)))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert "iban" not in purchases.creates[0]
+
+
+def test_no_supplier_match_leaves_the_iban_missing():
+    purchases = FakePurchaseClient()
+    moco = FakeMoco()
+    moco.suppliers = []
+    s = build_service(moco=moco, purchases=purchases,
+                      ocr=FakeOcr(result=make_invoice(iban=None)))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert "iban" not in purchases.creates[0]
+
+
+def test_recovered_iban_restores_the_qr_payment_method():
+    """The point of the fallback: with the IBAN back, the QR-reference is
+    usable again and the purchase books as a QR-ESR transfer instead of
+    degrading to a plain one."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "energiecheck bern ag"}]
+    moco.companies[555] = {"id": 555, "iban": SUPPLIER_IBAN}
+    purchases = FakePurchaseClient()
+    s = build_service(moco=moco, purchases=purchases, ocr=FakeOcr(
+        result=make_invoice(supplier_name="energiecheck bern ag", iban=None,
+                            qr_reference="000000000000000000004091456")))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    created = purchases.creates[0]
+    assert created["payment_method"] == "bank_transfer_swiss_qr_esr"
+    assert created["reference"] == "000000000000000000004091456"
+
+
+def test_recovered_iban_is_flagged_in_the_ocr_comment():
+    """The reviewer is confirming a different claim than 'we read this off
+    the document', so the comment has to say which."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "energiecheck bern ag"}]
+    moco.companies[555] = {"id": 555, "iban": SUPPLIER_IBAN}
+    purchases = FakePurchaseClient()
+    s = build_service(moco=moco, purchases=purchases, ocr=FakeOcr(
+        result=make_invoice(supplier_name="energiecheck bern ag", iban=None)))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    comment = next(t for _, t in purchases.comments if "OCR-Extraktion" in t)
+    assert "aus Lieferant-Stammdaten" in comment
+
+
+def test_ocr_read_iban_is_not_flagged_in_the_comment():
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases, ocr=FakeOcr(
+        result=make_invoice(iban="CH4431999123000889012")))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    comment = next(t for _, t in purchases.comments if "OCR-Extraktion" in t)
+    assert "aus Lieferant-Stammdaten" not in comment
+
+
+# --- QR-reference-without-IBAN inconsistency --------------------------------
+
+def test_qr_reference_without_iban_warns_on_telegram():
+    """The Zahlteil was legible enough for a 27-digit reference but not the
+    IBAN beside it, and no supplier record could supply one. Downstream
+    that silently becomes a MANUAL Bexio payment with no Zahlungsausgang,
+    so it has to be said out loud."""
+    tg = FakeTelegram()
+    s = build_service(ocr=FakeOcr(result=make_invoice(
+        iban=None, qr_reference="000000000000000000004091456")), telegram=tg)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert any("QR-Referenz erkannt, aber keine IBAN" in m
+               for m in tg.messages)
+
+
+def test_no_warning_once_the_supplier_iban_recovers_it():
+    """The fallback ran, so there's nothing inconsistent left to report."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "energiecheck bern ag"}]
+    moco.companies[555] = {"id": 555, "iban": SUPPLIER_IBAN}
+    tg = FakeTelegram()
+    s = build_service(moco=moco, telegram=tg, ocr=FakeOcr(
+        result=make_invoice(supplier_name="energiecheck bern ag", iban=None,
+                            qr_reference="000000000000000000004091456")))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert not any("keine IBAN" in m for m in tg.messages)
+
+
+def test_no_warning_without_a_qr_reference():
+    """A plain invoice with no IBAN is ordinary — many suppliers bill
+    without one. Only the QR-reference makes the gap contradictory."""
+    tg = FakeTelegram()
+    s = build_service(ocr=FakeOcr(result=make_invoice(
+        iban=None, qr_reference=None)), telegram=tg)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert not any("keine IBAN" in m for m in tg.messages)
+
+
+def test_warning_rides_on_the_existing_message():
+    """One Telegram per draft — the warning is a suffix, not a second send."""
+    tg = FakeTelegram()
+    s = build_service(ocr=FakeOcr(result=make_invoice(
+        iban=None, qr_reference="000000000000000000004091456")), telegram=tg)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert len(tg.messages) == 1
