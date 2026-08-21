@@ -705,3 +705,80 @@ def test_missing_sender_env_notifies_and_skips_book_pay(
 def _io_bytes(data: bytes):
     import io
     return io.BytesIO(data)
+
+
+# --- payment remark (payment.note) ------------------------------------------
+#
+# Nothing asserted `note` before, and both branches produced text nobody
+# would want to read: the IBAN/QR one emitted a bare "-" whenever Moco's
+# `info` was empty (which is most invoices), and the MANUAL one left
+# dangling separators around empty parts. See
+# `specs/SPEC_manual_upload_subject.md` D6.
+
+def test_qr_payment_remark_is_the_purchase_title(service, bexio):
+    """Regression: this used to be `info or "-"`, and `info` (the QR-bill
+    Zahlungszweck) is empty on both live IBAN fixtures — so every QR
+    payment reached Bexio carrying a bare dash."""
+    bexio.contacts_by_name["FLYERALARM - RatePAY GmbH"] = [{"id": 5001}]
+    bexio.accounts_by_no["6600"] = [{"id": 7700, "tax_id": 42}]
+
+    service.sync(load_fixture("purchase_with_iban.json"))
+
+    payload = next(c[1] for c in bexio.calls if c[0] == "create_bill")
+    assert payload["payment"]["type"] == "QR"
+    assert payload["payment"]["note"] == "Visitenkarten und Flyer CH240067780"
+
+
+def test_manual_payment_remark_is_the_purchase_title(service, bexio):
+    """Same rule for both payment types — one remark, one code path."""
+    bexio.contacts_by_name["Restaurant Beispiel"] = [{"id": 5002}]
+    bexio.accounts_by_no["6640"] = [{"id": 7701, "tax_id": 42}]
+
+    service.sync(load_fixture("purchase_no_iban.json"))
+
+    payload = next(c[1] for c in bexio.calls if c[0] == "create_bill")
+    assert payload["payment"]["type"] == "MANUAL"
+    assert payload["payment"]["note"] == "Lunch meeting"
+
+
+def test_remark_falls_back_to_supplier_receipt_and_purpose():
+    from api.bexio_expense_sync_service import _payment_note
+    assert _payment_note({
+        "company": {"name": "Restaurant Beispiel"},
+        "receipt_identifier": "R-99999",
+        "info": "Geschäftsessen mit Kunde",
+    }) == "Restaurant Beispiel - R-99999 - Geschäftsessen mit Kunde"
+
+
+def test_remark_fallback_drops_empty_parts():
+    """Regression on `' - 000047 - '`: the old join filtered on
+    `is not None`, but its parts were `x or ""` and so never None. This is
+    the exact shape an OCR'd card receipt produces — no matched supplier,
+    no Zahlungszweck."""
+    from api.bexio_expense_sync_service import _payment_note
+    note = _payment_note({"receipt_identifier": "000047"})
+    assert note == "000047"
+    assert not note.startswith(" - ")
+    assert not note.endswith(" - ")
+
+
+def test_remark_fallback_drops_whitespace_only_parts():
+    from api.bexio_expense_sync_service import _payment_note
+    assert _payment_note({"company": {"name": "Ligu Lehm"},
+                          "receipt_identifier": "  ",
+                          "info": ""}) == "Ligu Lehm"
+
+
+def test_remark_is_truncated_to_the_bexio_budget():
+    from api.bexio_expense_sync_service import (
+        PAYMENT_NOTE_MAX_CHARS, _payment_note,
+    )
+    note = _payment_note({"title": "M" * 200})
+    assert len(note) == PAYMENT_NOTE_MAX_CHARS
+
+
+def test_remark_falls_back_to_a_dash_when_there_is_nothing_to_say():
+    """Kept from the n8n original — a non-empty note may be required by
+    Bexio, and this isn't the change to find that out on."""
+    from api.bexio_expense_sync_service import _payment_note
+    assert _payment_note({}) == "-"

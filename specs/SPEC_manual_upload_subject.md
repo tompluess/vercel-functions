@@ -85,6 +85,39 @@ email-imported draft the title *is* the Subject header, and it was being
 dropped. A title alone never renders as an email source: without an
 `email_from` that would claim a manual upload as an email.
 
+**D6 — the Bexio payment remark becomes the purchase title.** Once
+`position_title` carries the business purpose, the Moco purchase `title`
+is the best text available for `payment.note`, the remark shown against
+the payment in Bexio. `BexioExpenseSyncService._payment_note` uses it for
+BOTH payment types, falling back to composing supplier / Belegnummer /
+Zahlungszweck (empty parts dropped) and finally to `"-"`.
+
+Two defects fixed along the way, both inherited from
+`reference/Sync_expenses_from_Moco_to_Bexio.json`:
+
+- The IBAN/QR branch read only Moco's `info` — the QR-bill Zahlungszweck,
+  empty on both live IBAN fixtures and on most invoices — so nearly every
+  QR payment reached Bexio carrying a bare `"-"`.
+- The MANUAL branch's join filtered on `is not None`, but its parts were
+  `x or ""` and therefore never None, leaving dangling separators. An
+  OCR'd card receipt with an unmatched supplier and no Zahlungszweck
+  produced `" - 000047 - "` — the commonest shape this flow generates.
+
+(The n8n original was worse still: `receipt_identifier||"" + " - "` binds
+as `receipt_identifier || (" - ")`, so it concatenated with no separator
+at all. The port had already fixed that and introduced the empty-part
+artifact instead.)
+
+Reviewed and deliberately left alone: `message` / `booking_text` /
+`reference_no` keep carrying `receipt_identifier` and `reference` — those
+are payment-instruction fields, not the remark. The bill payment block
+sets both `message` and `reference_no` for QR while
+`_build_outgoing_payment_payload` makes them mutually exclusive; that
+asymmetry is in the n8n export too, so it is upstream intent rather than
+a porting slip. The outgoing-payment payload gains no `note`: the
+endpoint has no such field today and adding an unvalidated one risks a
+400 on a step that is already soft-failed.
+
 ## Out of scope
 
 Backfilling purchases already created from manual uploads — their drafts

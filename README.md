@@ -64,6 +64,7 @@ Receives Moco `Purchase` webhooks and creates a matching supplier bill in [Bexio
 - Downloads the Moco-signed `file_url` and uploads it to Bexio as an attachment.
 - Idempotent: searches `/4.0/purchase/bills?vendor=…&vendor_ref=…` — updates DRAFT bills in-place, creates new ones otherwise, and skips bills that are no longer DRAFT.
 - Branches on `iban`: present → QR or IBAN payment block on the default bank account; absent → MANUAL payment routed to the per-user bank account from `BEXIO_MANUAL_BANK_MAP`.
+- The payment remark (`payment.note`) is the Moco purchase title — for an OCR'd purchase that's the business purpose (`"Mittagessen 20.8. — Ligu Lehm, Bern"`) — falling back to supplier / Belegnummer / Zahlungszweck, capped at 80 chars. Same rule for QR/IBAN and MANUAL payments.
 - Posts a comment back to the Moco Purchase with the Bexio bill URL.
 - After create/update the bill is auto-booked (`/4.0/purchase/bills/{id}/bookings/BOOKED`) and an outgoing payment is created (`/4.0/payment/outgoing-payments`), then a second Moco comment is posted noting the booking + payment date. Sender (own-company) details come from `BEXIO_OUTGOING_PAYMENT_SENDER`. MANUAL bills (no IBAN) skip this step silently since Bexio rejects MANUAL outgoing-payment payloads. Failures are soft — log + Telegram alert with both URLs, the sync still returns `ok=true`.
 - Skip branches (no company, no booking account, bill no longer DRAFT) send a Telegram notification with entity context, mirroring the n8n `…Notification to Telegram` nodes.

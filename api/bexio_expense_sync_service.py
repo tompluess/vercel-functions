@@ -42,6 +42,11 @@ from api.telegram_notifier import TelegramNotifier
 
 logger = logging.getLogger("bexio_expense_sync_service")
 
+# Cap for the payment remark (`payment.note`). Inherited from the n8n
+# workflow, which truncated the MANUAL note here and left the IBAN one
+# uncapped; `_payment_note` now applies it to both.
+PAYMENT_NOTE_MAX_CHARS = 80
+
 
 class BexioExpenseSyncService:
     BEXIO_BILL_URL_TEMPLATE = "https://office.bexio.com/index.php/kb_bill/list#/show/{id}"
@@ -484,7 +489,7 @@ def _build_payment(body: dict, contact: dict, *, iban: str) -> dict:
             "city": contact.get("city") or "Unknown",
             "country_code": "CH",
             "salary_payment": False,
-            "note": body.get("info") or "-",
+            "note": _payment_note(body),
         }
     else:
         user = body.get("user") or {}
@@ -497,10 +502,7 @@ def _build_payment(body: dict, contact: dict, *, iban: str) -> dict:
             "name": company_name,
             "country_code": "CH",
             "salary_payment": False,
-            "note": _truncate(" - ".join(p for p in (company_name,
-                                                    receipt_id or "",
-                                                    body.get("info") or "")
-                                         if p is not None), 80),
+            "note": _payment_note(body),
         }
 
     if receipt_id:
@@ -581,6 +583,41 @@ def _add_days(iso_date: str | None, days: int) -> str | None:
     import datetime as dt
     parsed = dt.date.fromisoformat(iso_date)
     return (parsed + dt.timedelta(days=days)).isoformat()
+
+
+def _payment_note(body: dict) -> str:
+    """The remark Bexio shows against the payment, for BOTH payment types.
+
+    The Moco purchase `title` is the best text available: on an OCR'd
+    purchase it is `InvoiceData.position_title`, which folds a manual
+    upload's operator subject — the *business purpose*, e.g. "Mittagessen
+    20.8." — into the document's own description. Nothing else on the
+    purchase says what the expense was actually for, which is exactly
+    what someone approving a payment in Bexio needs to see.
+
+    Falls back to composing supplier / Belegnummer / Zahlungszweck for a
+    purchase with no title. Empty parts are dropped: the previous version
+    filtered on `is not None`, but its parts were `x or ""` and so never
+    None, which left dangling separators — an OCR'd card receipt with an
+    unmatched supplier and no Zahlungszweck produced `" - 000047 - "`.
+
+    Both branches used to differ here, and the IBAN/QR one read only
+    Moco's `info` (the QR-bill Zahlungszweck). That field is empty on
+    most invoices, so in practice every QR payment carried the bare "-"
+    placeholder. See `specs/SPEC_manual_upload_subject.md` D6.
+    """
+    title = (body.get("title") or "").strip()
+    if title:
+        return _truncate(title, PAYMENT_NOTE_MAX_CHARS)
+
+    parts = ((body.get("company") or {}).get("name") or "",
+             body.get("receipt_identifier") or "",
+             body.get("info") or "")
+    composed = " - ".join(p.strip() for p in parts if p and p.strip())
+    # "-" as the last resort rather than "": the n8n workflow this ports
+    # used it, so a non-empty note may well be required by Bexio, and a
+    # remark nobody reads is not the place to find out.
+    return _truncate(composed, PAYMENT_NOTE_MAX_CHARS) or "-"
 
 
 def _truncate(value: str, max_len: int) -> str:
