@@ -87,6 +87,10 @@ class FakeMoco:
 class FakePurchaseClient:
     def __init__(self):
         self.creates: list[dict] = []
+        # Bodies handed back by `get_purchase`, keyed by id — the Bexio
+        # hand-off re-fetches rather than reusing the create response.
+        self.purchases_by_id: dict[int, dict] = {}
+        self.get_purchase_error: Exception | None = None
         self.next_create_id: int = 4001234
         self.next_item_id: int = 311936153
         self.create_error: Exception | None = None
@@ -123,6 +127,12 @@ class FakePurchaseClient:
         # Moco recomputes it from the line item + VAT code. Left None by
         # default so the OCR-total fallback is what most tests exercise.
         self.create_gross_total: float | None = None
+
+    def get_purchase(self, purchase_id: int) -> dict:
+        if self.get_purchase_error:
+            raise self.get_purchase_error
+        return self.purchases_by_id.get(purchase_id,
+                                        {"id": purchase_id, "tags": ["Auto"]})
 
     def list_vat_codes(self) -> list[dict]:
         if self.vat_codes_error:
@@ -221,9 +231,26 @@ class FakeTelegram:
         return True
 
 
+class FakeBexioExpense:
+    """Stands in for `BexioExpenseSyncService` in the hand-off."""
+
+    def __init__(self, result=None, error: Exception | None = None):
+        self.result = result if result is not None else {
+            "action": "created", "bill_id": 9001, "contact_id": 5001}
+        self.error = error
+        self.synced: list[dict] = []
+
+    def sync(self, body: dict) -> dict:
+        self.synced.append(body)
+        if self.error:
+            raise self.error
+        return self.result
+
+
 def build_service(*, moco=None, purchases=None, ocr=None,
                   telegram=None, subdomain="solar",
-                  project_resolver=None, category_resolver=None):
+                  project_resolver=None, category_resolver=None,
+                  bexio_expense=None):
     return SupplierInvoiceOcrService(
         moco=moco or FakeMoco(),
         purchase_client=purchases or FakePurchaseClient(),
@@ -232,6 +259,7 @@ def build_service(*, moco=None, purchases=None, ocr=None,
         telegram=telegram,
         project_resolver=project_resolver,
         category_resolver=category_resolver,
+        bexio_expense=bexio_expense,
     )
 
 
@@ -2808,3 +2836,149 @@ def test_warning_rides_on_the_existing_message():
     s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
 
     assert len(tg.messages) == 1
+
+
+# --- auto-release → Bexio hand-off ------------------------------------------
+#
+# Moco does not deliver a `Purchase:create` webhook for purchases created
+# through the API, so an auto-released purchase never reached
+# `bexio-expense-sync` on its own: the `Review pending` tag it
+# deliberately lacks is exactly what a later *update* webhook would have
+# cleared. Ten of eleven live auto-released purchases had no Bexio bill.
+
+
+def _auto_release_service(**kwargs):
+    """A service whose gate auto-releases: company matched, category
+    trusted (4000 default), confidence above the bar."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "Digitec Galaxus AG"}]
+    kwargs.setdefault("moco", moco)
+    kwargs.setdefault("ocr", FakeOcr(result=make_invoice(
+        supplier_name="Digitec Galaxus AG", confidence=0.94)))
+    kwargs.setdefault("category_resolver", _category_resolver())
+    return build_service(**kwargs)
+
+
+def test_auto_released_purchase_is_handed_to_bexio():
+    bexio = FakeBexioExpense()
+    purchases = FakePurchaseClient()
+    s = _auto_release_service(purchases=purchases, bexio_expense=bexio)
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert result["review_pending"] is False
+    assert len(bexio.synced) == 1
+    assert result["bexio_bill_id"] == 9001
+
+
+def test_held_purchase_is_not_handed_to_bexio():
+    """The point of the tag is that a person looks first — and the expense
+    sync's own first gate would refuse it anyway."""
+    bexio = FakeBexioExpense()
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases, bexio_expense=bexio,
+                      ocr=FakeOcr(result=make_invoice(confidence=0.50)))
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert result["review_pending"] is True
+    assert bexio.synced == []
+    assert result["bexio_bill_id"] is None
+
+
+def test_handoff_sends_the_refetched_purchase_not_the_create_response():
+    """The expense sync reads `file_url` and the expanded
+    `items[].category`; nothing guarantees POST /purchases echoes every
+    association Moco resolves server-side."""
+    bexio = FakeBexioExpense()
+    purchases = FakePurchaseClient()
+    purchases.purchases_by_id[4001234] = {
+        "id": 4001234, "tags": ["OCR", "Auto"],
+        "file_url": "https://moco/signed.pdf",
+        "items": [{"category": {"credit_account": "4000"}}],
+    }
+    s = _auto_release_service(purchases=purchases, bexio_expense=bexio)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert bexio.synced[0]["file_url"] == "https://moco/signed.pdf"
+
+
+def test_bexio_failure_does_not_fail_the_ocr_sync():
+    """Best-effort, like the project assign and the payment. A 4xx escaping
+    to index.py would flip this run to ok=false; a 5xx would trigger a
+    webhook retry that re-runs the whole paid OCR."""
+    bexio = FakeBexioExpense(error=urlerror.HTTPError(
+        "https://bexio", 400, "Bad Request", {},
+        fp=io.BytesIO(b'{"message":"nope"}')))
+    purchases = FakePurchaseClient()
+    tg = FakeTelegram()
+    s = _auto_release_service(purchases=purchases, bexio_expense=bexio,
+                              telegram=tg)
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert result.get("skipped") is None          # the purchase still stands
+    assert result["purchase_id"] == 4001234
+    assert result["bexio_bill_id"] is None
+    assert any("Bexio-Übergabe fehlgeschlagen" in m for m in tg.messages)
+
+
+def test_bexio_transport_error_is_also_swallowed():
+    bexio = FakeBexioExpense(error=urlerror.URLError("connection refused"))
+    tg = FakeTelegram()
+    s = _auto_release_service(bexio_expense=bexio, telegram=tg)
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert result["purchase_id"] == 4001234
+    assert any("Bexio-Übergabe fehlgeschlagen" in m for m in tg.messages)
+
+
+def test_a_failed_refetch_does_not_fail_the_sync():
+    purchases = FakePurchaseClient()
+    purchases.get_purchase_error = urlerror.HTTPError(
+        "https://moco", 404, "Not Found", {}, fp=io.BytesIO(b"gone"))
+    bexio = FakeBexioExpense()
+    s = _auto_release_service(purchases=purchases, bexio_expense=bexio)
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert result["purchase_id"] == 4001234
+    assert bexio.synced == []
+
+
+def test_bexio_skip_is_reported_without_a_second_alert():
+    """The expense sync fires its own Telegram alert naming the reason
+    (no company / no account / bill not DRAFT) — don't duplicate it."""
+    bexio = FakeBexioExpense(result={"skipped": "no_account"})
+    tg = FakeTelegram()
+    s = _auto_release_service(bexio_expense=bexio, telegram=tg)
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert result["bexio_bill_id"] is None
+    assert not any("Bexio-Übergabe fehlgeschlagen" in m for m in tg.messages)
+
+
+def test_successful_handoff_is_reported_on_telegram():
+    """The Moco comment claims the purchase went to Bexio without review;
+    Telegram has to confirm that actually happened."""
+    tg = FakeTelegram()
+    s = _auto_release_service(bexio_expense=FakeBexioExpense(), telegram=tg)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert any("Bexio-Rechnung erstellt (#9001)" in m for m in tg.messages)
+
+
+def test_no_collaborator_keeps_the_old_behaviour():
+    """An instance without Bexio credentials still OCRs; the purchase just
+    waits for a human to touch it in Moco."""
+    purchases = FakePurchaseClient()
+    s = _auto_release_service(purchases=purchases)   # bexio_expense=None
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert result["review_pending"] is False
+    assert result["bexio_bill_id"] is None
