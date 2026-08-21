@@ -47,6 +47,26 @@ logger = logging.getLogger("bexio_expense_sync_service")
 # uncapped; `_payment_note` now applies it to both.
 PAYMENT_NOTE_MAX_CHARS = 80
 
+# Bexio's own limit, learned from a 400 on `POST /4.0/purchase/bills`:
+#   payment.booking_text size must be between 1 and 35
+# Moco purchase 4642736 (solar) carried a till-slip transaction line as
+# its `receipt_identifier` — "0750 19.08.2026 16:07 0011 000171 004642",
+# 40 chars — which the OCR flow reads off a Hornbach Kassenbon as the
+# invoice number.
+#
+# `booking_text` and `message` both carry that same receipt reference, so
+# the cap is applied once at the source. `message` may well tolerate more
+# (the Swiss unstructured-message limit is 140), but nothing we send it
+# is longer than a receipt id, so there is no value in guessing at a
+# second limit we have not been told.
+#
+# Deliberately NOT applied to `vendor_ref`: that is the idempotency key
+# `_find_existing_bill` searches on, Bexio accepted the full 40 chars in
+# the same request, and truncating it would make replays miss the bill
+# they should update. Nor to `reference_no` — a QR reference is exactly
+# 27 digits and a truncated payment reference is a wrong payment.
+PAYMENT_RECEIPT_REF_MAX_CHARS = 35
+
 
 class BexioExpenseSyncService:
     BEXIO_BILL_URL_TEMPLATE = "https://office.bexio.com/index.php/kb_bill/list#/show/{id}"
@@ -506,8 +526,9 @@ def _build_payment(body: dict, contact: dict, *, iban: str) -> dict:
         }
 
     if receipt_id:
-        payment["message"] = receipt_id
-        payment["booking_text"] = receipt_id
+        receipt_ref = _truncate(receipt_id, PAYMENT_RECEIPT_REF_MAX_CHARS)
+        payment["message"] = receipt_ref
+        payment["booking_text"] = receipt_ref
     if body.get("reference"):
         payment["reference_no"] = body["reference"]
 
@@ -568,12 +589,14 @@ def _build_outgoing_payment_payload(body: dict, contact: dict,
         payload["receiver_iban"] = iban
         if not has_reference:
             payload["fee_type"] = "NO_FEE"
-    if receipt_id:
-        payload["booking_text"] = receipt_id
+    receipt_ref = (_truncate(receipt_id, PAYMENT_RECEIPT_REF_MAX_CHARS)
+                   if receipt_id else None)
+    if receipt_ref:
+        payload["booking_text"] = receipt_ref
     if has_reference:
         payload["reference_no"] = body["reference"]
-    elif receipt_id:
-        payload["message"] = receipt_id
+    elif receipt_ref:
+        payload["message"] = receipt_ref
     return payload
 
 

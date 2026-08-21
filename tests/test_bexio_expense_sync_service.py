@@ -782,3 +782,86 @@ def test_remark_falls_back_to_a_dash_when_there_is_nothing_to_say():
     Bexio, and this isn't the change to find that out on."""
     from api.bexio_expense_sync_service import _payment_note
     assert _payment_note({}) == "-"
+
+
+# --- receipt-reference length cap -------------------------------------------
+#
+# Live 400 from POST /4.0/purchase/bills on Moco purchase 4642736:
+#   payment.booking_text size must be between 1 and 35
+# The OCR flow read a Hornbach Kassenbon's till-slip transaction line as
+# the invoice number, giving a 40-char `receipt_identifier`.
+
+LONG_RECEIPT_ID = "0750 19.08.2026 16:07 0011 000171 004642"  # 40 chars
+
+
+def _hornbach_body(**overrides) -> dict:
+    body = {
+        "date": "2026-08-19",
+        "gross_total": 57.8,
+        "title": "Hornbach Kassenbon: Sopec Markierungssp (Baumarkt)",
+        "receipt_identifier": LONG_RECEIPT_ID,
+        "company": {"name": "HORNBACH Baumarkt (Schweiz) AG"},
+        "user": {"firstname": "Romain"},
+    }
+    body.update(overrides)
+    return body
+
+
+def test_bill_payment_caps_booking_text_at_35():
+    from api.bexio_expense_sync_service import _build_payment
+    payment = _build_payment(_hornbach_body(), {}, iban="")
+    assert len(payment["booking_text"]) == 35
+
+
+def test_bill_payment_caps_message_at_35():
+    """Same receipt reference, so it gets the same cap — `message` may well
+    tolerate more, but nothing we put in it is longer than a receipt id."""
+    from api.bexio_expense_sync_service import _build_payment
+    payment = _build_payment(_hornbach_body(), {}, iban="")
+    assert len(payment["message"]) == 35
+
+
+def test_outgoing_payment_caps_booking_text_at_35():
+    from api.bexio_expense_sync_service import _build_outgoing_payment_payload
+    payload = _build_outgoing_payment_payload(
+        _hornbach_body(iban="CH7708836121049112006"), {}, {}, 9001)
+    assert len(payload["booking_text"]) == 35
+
+
+def test_short_receipt_identifiers_are_left_alone():
+    from api.bexio_expense_sync_service import _build_payment
+    payment = _build_payment(_hornbach_body(receipt_identifier="R-99999"),
+                             {}, iban="")
+    assert payment["booking_text"] == "R-99999"
+    assert payment["message"] == "R-99999"
+
+
+def test_vendor_ref_keeps_the_full_receipt_identifier(service, bexio):
+    """The cap must NOT reach `vendor_ref`: it's the idempotency key
+    `_find_existing_bill` searches on, Bexio accepted the full 40 chars in
+    the very request that rejected `booking_text`, and truncating it would
+    make a replay miss the bill it should update."""
+    bexio.contacts_by_name["HORNBACH Baumarkt (Schweiz) AG"] = [{"id": 5003}]
+    bexio.accounts_by_no["4000"] = [{"id": 7702, "tax_id": 42}]
+    body = load_fixture("purchase_no_iban.json")
+    inner = body.get("body", body)
+    inner["receipt_identifier"] = LONG_RECEIPT_ID
+    inner["company"] = {"name": "HORNBACH Baumarkt (Schweiz) AG"}
+    inner["items"][0]["category"] = {"credit_account": "4000"}
+
+    service.sync(body)
+
+    payload = next(c[1] for c in bexio.calls if c[0] == "create_bill")
+    assert payload["vendor_ref"] == LONG_RECEIPT_ID
+    assert len(payload["payment"]["booking_text"]) == 35
+
+
+def test_qr_reference_is_never_truncated():
+    """A 27-digit QR reference fits under the cap, and a truncated payment
+    reference is a wrong payment — `reference_no` must stay untouched."""
+    from api.bexio_expense_sync_service import _build_outgoing_payment_payload
+    qr_ref = "940000201026332300805729978"
+    payload = _build_outgoing_payment_payload(
+        _hornbach_body(iban="CH7030000001857721765", reference=qr_ref),
+        {}, {}, 9001)
+    assert payload["reference_no"] == qr_ref
