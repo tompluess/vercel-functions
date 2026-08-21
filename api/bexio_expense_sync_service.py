@@ -220,8 +220,8 @@ class BexioExpenseSyncService:
         bill_date = body.get("date")
         due_date = body.get("due_date") or _add_days(bill_date, 30)
         gross = body.get("gross_total")
-        title = _truncate(body.get("title") or "", 80)
-        line_title = _truncate(first_item.get("title") or "", 80)
+        title = _bexio_text(body.get("title") or "", 80)
+        line_title = _bexio_text(first_item.get("title") or "", 80)
 
         line_item = {
             "position": 0,
@@ -631,7 +631,7 @@ def _payment_note(body: dict) -> str:
     """
     title = (body.get("title") or "").strip()
     if title:
-        return _truncate(title, PAYMENT_NOTE_MAX_CHARS)
+        return _bexio_text(title, PAYMENT_NOTE_MAX_CHARS)
 
     parts = ((body.get("company") or {}).get("name") or "",
              body.get("receipt_identifier") or "",
@@ -640,7 +640,34 @@ def _payment_note(body: dict) -> str:
     # "-" as the last resort rather than "": the n8n workflow this ports
     # used it, so a non-empty note may well be required by Bexio, and a
     # remark nobody reads is not the place to find out.
-    return _truncate(composed, PAYMENT_NOTE_MAX_CHARS) or "-"
+    return _bexio_text(composed, PAYMENT_NOTE_MAX_CHARS) or "-"
+
+
+# Unicode dashes Bexio rejects on its text fields, mapped to the plain
+# ASCII hyphen. The OCR model writes German prose and reaches for an em
+# dash freely, so normalizing at the Bexio boundary is more reliable than
+# instructing the prompt alone — the separator between an operator
+# subject and the document description is only the *commonest* source,
+# not the only one. Moco keeps whatever the model wrote; this is a
+# translation for one downstream system, not a correction.
+_DASHES = str.maketrans({
+    "\u2014": "-",  # — em dash
+    "\u2013": "-",  # – en dash
+    "\u2012": "-",  # ‒ figure dash
+    "\u2015": "-",  # ― horizontal bar
+    "\u2212": "-",  # − minus sign
+})
+
+
+def _bexio_text(value: str, max_len: int) -> str:
+    """Normalize dashes, collapse the whitespace they leave, then truncate.
+
+    Every free-text field we send Bexio goes through here. Truncation
+    happens last so the cap counts the characters Bexio actually
+    receives.
+    """
+    cleaned = " ".join(value.translate(_DASHES).split())
+    return _truncate(cleaned, max_len)
 
 
 def _truncate(value: str, max_len: int) -> str:

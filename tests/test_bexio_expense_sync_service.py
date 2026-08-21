@@ -871,3 +871,65 @@ def test_qr_reference_is_never_truncated():
         _hornbach_body(iban="CH7030000001857721765", reference=qr_ref),
         {}, {}, 9001)
     assert payload["reference_no"] == qr_ref
+
+
+# --- dash normalisation on the Bexio boundary -------------------------------
+#
+# Bexio rejects an em dash on its text fields. The OCR model writes German
+# prose and reaches for one freely — the separator it puts between an
+# operator subject and the document description is the commonest source
+# but not the only one — so every free-text field we send is normalised
+# here rather than relying on the prompt alone.
+
+EM_DASH_TITLE = "Mittagessen 20.8. — Ligu Lehm, Bern"
+
+
+def test_payment_note_normalises_the_em_dash():
+    from api.bexio_expense_sync_service import _build_payment
+    note = _build_payment({"title": EM_DASH_TITLE}, {}, iban="")["note"]
+    assert note == "Mittagessen 20.8. - Ligu Lehm, Bern"
+    assert "—" not in note
+
+
+def test_bill_and_line_titles_normalise_the_em_dash(service, bexio):
+    bexio.contacts_by_name["Restaurant Beispiel"] = [{"id": 5002}]
+    bexio.accounts_by_no["6640"] = [{"id": 7701, "tax_id": 42}]
+    body = load_fixture("purchase_no_iban.json")
+    inner = body.get("body", body)
+    inner["title"] = EM_DASH_TITLE
+    inner["items"][0]["title"] = EM_DASH_TITLE
+
+    service.sync(body)
+
+    payload = next(c[1] for c in bexio.calls if c[0] == "create_bill")
+    assert payload["title"] == "Mittagessen 20.8. - Ligu Lehm, Bern"
+    assert payload["line_items"][0]["title"] == \
+        "Mittagessen 20.8. - Ligu Lehm, Bern"
+
+
+@pytest.mark.parametrize("dash", ["—", "–", "‒",
+                                  "―", "−"])
+def test_every_unicode_dash_becomes_a_hyphen(dash):
+    """En dash, figure dash, horizontal bar and the minus sign are all
+    plausible model output, not just the em dash."""
+    from api.bexio_expense_sync_service import _bexio_text
+    assert _bexio_text(f"A {dash} B", 80) == "A - B"
+
+
+def test_plain_hyphens_are_left_alone():
+    from api.bexio_expense_sync_service import _bexio_text
+    assert _bexio_text("Aircondition - Rechnung 80572997", 80) == \
+        "Aircondition - Rechnung 80572997"
+
+
+def test_normalisation_collapses_leftover_whitespace():
+    from api.bexio_expense_sync_service import _bexio_text
+    assert _bexio_text("Lunch   meeting\n with  Kunde", 80) == \
+        "Lunch meeting with Kunde"
+
+
+def test_truncation_counts_what_bexio_actually_receives():
+    """Normalise first, truncate last — otherwise the cap counts
+    characters that get rewritten afterwards."""
+    from api.bexio_expense_sync_service import _bexio_text
+    assert len(_bexio_text("M — " * 40, 35)) == 35

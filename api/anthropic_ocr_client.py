@@ -68,8 +68,9 @@ class InvoiceData:
     # `description`, which stays a pure reading of the document: when the
     # draft was uploaded by hand the operator's subject line (the
     # BUSINESS PURPOSE — "Mittagessen 20.8." on a restaurant receipt, a
-    # thing no OCR can infer) is folded in here by the model. None when
-    # the model omitted it; callers fall back to `description`.
+    # thing no OCR can infer) is folded in here by the model, joined with
+    # a plain ASCII hyphen (Bexio rejects an em dash). None when the
+    # model omitted it; callers fall back to `description`.
     position_title: str | None
     # Gutschrift / Rechnung discriminator. Defaults to False (the common
     # case) so callers can branch with `if invoice.is_credit_note: ...`
@@ -267,7 +268,8 @@ SYSTEM_PROMPT = (
     'something the document itself cannot tell you (e.g. '
     '\\"Mittagessen 20.8.\\" on a restaurant receipt, or '
     '\\"Geschäftsessen mit Beraterin E. Aschwanden\\"). Lead with it, and '
-    'append the document\'s own description after \\" — \\" only when that '
+    'append the document\'s own description after \\" - \\" (a plain '
+    'ASCII hyphen — Bexio rejects an em dash downstream) only when that '
     'adds information the Betreff does not already carry. IGNORE the '
     'Betreff completely when it is just a file name or scanner output '
     '(ends in .pdf/.jpg/.jpeg/.png/.heic, or looks like '

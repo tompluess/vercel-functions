@@ -118,6 +118,17 @@ a porting slip. The outgoing-payment payload gains no `note`: the
 endpoint has no such field today and adding an unvalidated one risks a
 400 on a step that is already soft-failed.
 
+**D7 — a plain ASCII hyphen joins subject and description.** Bexio
+rejects an em dash on its text fields, and the `position_title` separator
+flows through to the bill title, the line-item title and the payment
+remark. The prompt therefore asks for `" - "`. Because the model writes
+German prose and can reach for a dash anywhere in it — not only at the
+join — `BexioExpenseSyncService._bexio_text` also normalizes em, en,
+figure, horizontal-bar and minus characters at the boundary, then
+collapses whitespace, then truncates (in that order, so the cap counts
+what Bexio actually receives). Moco keeps whatever the model wrote; this
+is a translation for one downstream system, not a correction.
+
 ## Out of scope
 
 Backfilling purchases already created from manual uploads — their drafts
