@@ -14,7 +14,9 @@ A purchase is **auto-released** only when all five hold:
 3. the model's own confidence is at least `AUTO_RELEASE_CONFIDENCE`,
 4. it isn't a credit note (those always need a human to check the sign),
 5. the VAT rate came off the document (or the supplier / account default),
-   not from `VatCodeResolver`'s payment-method floor.
+   not from `VatCodeResolver`'s payment-method floor,
+6. the payment instruction is actually payable — no QR-IBAN left without
+   its QR-reference.
 
 Anything else is held, and `ReviewDecision.reasons` names which conditions
 failed so the log line, the Telegram message and the batch script's column
@@ -34,7 +36,7 @@ See `specs/SPEC_purchase_payment_already_paid.md` and
 import logging
 from dataclasses import dataclass, field
 
-from api.anthropic_ocr_client import InvoiceData
+from api.anthropic_ocr_client import InvoiceData, is_qr_iban
 from api.moco_category_resolver import CategoryDecision
 from api.moco_project_resolver import ProjectMatch
 from api.vat_code_resolver import VatDecision
@@ -108,6 +110,24 @@ class PurchaseReviewGate:
             rate = f"{vat.rate:g}%" if vat.rate is not None else "unbekannt"
             reasons.append(f"MWST-Satz nicht auf dem Beleg erkannt "
                            f"(Annahme {rate})")
+
+        # A QR-IBAN is only payable WITH its QR-reference, so this pair is
+        # a bill no bank will accept — releasing it to Bexio unreviewed
+        # produces a Zahlungsausgang that cannot be executed. Unlike a
+        # missing IBAN, which `_apply_supplier_iban_fallback` can recover
+        # from the supplier record, a reference is per-invoice and exists
+        # only on the document: there is nothing to fall back to, so a
+        # human has to read it off the paper.
+        #
+        # Skipped for an already-paid card receipt: nothing is being paid,
+        # so "not payable" would be a false statement in `reasons`. This
+        # is not a strictness carve-out — those are held anyway by the
+        # category chain (`MocoCategoryResolver` short-circuits at
+        # `already_paid`) — it only keeps the stated reason honest.
+        if (not invoice.already_paid_by_card
+                and is_qr_iban(invoice.iban)
+                and not invoice.qr_reference):
+            reasons.append("QR-IBAN ohne QR-Referenz (nicht zahlbar)")
 
         if invoice.confidence < self._min_confidence:
             reasons.append(f"Konfidenz {invoice.confidence:.0%} "

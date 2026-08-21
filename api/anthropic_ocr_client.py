@@ -833,6 +833,28 @@ def _qr_check_digit(first_26: str) -> int:
     return (10 - carry) % 10
 
 
+def is_qr_iban(iban: str | None) -> bool:
+    """True if `iban` is a Swiss QR-IBAN.
+
+    Per the Swiss QR-bill spec a QR-IBAN is identified by its IID (bank
+    clearing number) in positions 5-9: `30000`-`31999`. Regular IBANs
+    have IIDs outside that range, and Moco 422s with
+    `"iban":["ist keine QR-IBAN"]` if one is POSTed under
+    `payment_method=bank_transfer_swiss_qr_esr`.
+
+    Lives here rather than in `supplier_invoice_ocr_service` (its
+    original home) so `PurchaseReviewGate` can use it too — the service
+    imports the gate, so the gate cannot import back from the service.
+    Sits with the rest of the IBAN knowledge either way.
+    """
+    if not iban or len(iban) < 9 or not iban.startswith("CH"):
+        return False
+    iid = iban[4:9]
+    if not iid.isdigit():
+        return False
+    return 30000 <= int(iid) <= 31999
+
+
 def _normalize_iban(value) -> str | None:
     """IBAN normalized + mod-97 checksum-validated.
 

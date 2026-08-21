@@ -3187,3 +3187,28 @@ def test_recovered_qr_iban_without_reference_still_warns():
     assert purchases.creates[0]["payment_method"] == "bank_transfer"
     assert any("QR-IBAN erkannt, aber keine gültige QR-Referenz" in m
                for m in tg.messages)
+
+
+def test_recovered_qr_iban_without_reference_is_held_not_released():
+    """The 4646154 shape end to end: the supplier fallback fills the IBAN,
+    which makes the purchase LOOK complete, but with no QR-reference it
+    cannot be paid. It must not reach Bexio on its own — a warning alone
+    would leave an unexecutable Zahlungsausgang sitting there."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 762656480, "name": "Solarmarkt GmbH"}]
+    moco.companies[762656480] = {"id": 762656480, "iban": QR_IBAN}
+    purchases = FakePurchaseClient()
+    bexio = FakeBexioExpense()
+    s = build_service(moco=moco, purchases=purchases, bexio_expense=bexio,
+                      category_resolver=_category_resolver(),
+                      ocr=FakeOcr(result=make_invoice(
+                          supplier_name="Solarmarkt GmbH", iban=None,
+                          qr_reference=None, confidence=0.95)))
+
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert purchases.creates[0]["iban"] == QR_IBAN
+    assert result["review_pending"] is True
+    assert "QR-IBAN ohne QR-Referenz (nicht zahlbar)" in result["review_reasons"]
+    assert purchases.creates[0]["tags"] == ["OCR", "Review pending"]
+    assert bexio.synced == []      # never auto-released
