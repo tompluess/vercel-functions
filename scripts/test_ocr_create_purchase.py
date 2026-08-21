@@ -61,6 +61,7 @@ from api.moco_supplier_matcher import MocoSupplierMatcher
 from api.vat_code_resolver import VatCodeResolver
 from api.supplier_invoice_ocr_service import (
     SupplierInvoiceOcrService,
+    _apply_supplier_iban_fallback,
     _build_create_payload,
     _draft_uploader_name,
     _format_email_source_comment,
@@ -308,6 +309,13 @@ def main() -> int:
             full_company = moco.get_company(company_id)
         except Exception as e:
             log.warning("get_company failed: %s", e)
+    # Same recovery the webhook service runs — see the note in
+    # `batch_ocr_drafts.py`; it has to precede payload construction.
+    invoice, iban_from_supplier = _apply_supplier_iban_fallback(
+        invoice, full_company)
+    if iban_from_supplier:
+        print(f"  → IBAN {invoice.iban} aus Lieferant-Stammdaten "
+              "(nicht vom Beleg gelesen)")
     # The real chain, not a re-implementation of it: `VatCodeResolver` is
     # the same collaborator the webhook service runs.
     vat = VatCodeResolver(vat_codes).resolve(invoice, full_company)
@@ -401,7 +409,8 @@ def main() -> int:
     )
     ocr_comment = _format_ocr_comment(
         invoice, review=review_decision, company=full_company,
-        project_match=kommission_match, category=category_decision, vat=vat)
+        project_match=kommission_match, category=category_decision, vat=vat,
+        iban_from_supplier=iban_from_supplier)
     _print_section("POST /purchases payload (base64 blob elided)")
     _print_payload_summary(payload)
     # The service posts these as two separate Moco comments. Render each
