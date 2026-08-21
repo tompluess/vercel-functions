@@ -7,7 +7,9 @@ hostname/path, like `test_bexio_endpoints.py`.
 """
 
 import base64
+import io
 import json
+from urllib import error as urlerror
 
 import pytest
 from fastapi.testclient import TestClient
@@ -72,6 +74,9 @@ def stub_pipeline(monkeypatch):
             {"id": 13, "tax": 0.0, "code": "0", "active": True, "default": False},
         ],
         "next_purchase_id": 4001234,
+        # Set to an `HTTPError` to make POST /purchases fail — the
+        # duplicate-`receipt_identifier` 422 the live flow keeps hitting.
+        "purchase_create_error": None,
         "next_item_id": 311936153,
         # Moco /projects listing used by the Kommission resolver. Default
         # is an empty list so the resolver builds an empty index and the
@@ -155,6 +160,8 @@ def stub_pipeline(monkeypatch):
                 return FakeUrlopenResponse(
                     json.dumps({"id": 7655423}).encode())
             if method == "POST" and url.endswith("/purchases"):
+                if state["purchase_create_error"] is not None:
+                    raise state["purchase_create_error"]
                 # Confirm the base64'd PDF rode along — that's the whole point.
                 assert isinstance(payload, dict) and "file" in payload
                 assert payload["file"]["base64"]
@@ -345,6 +352,36 @@ def test_supplier_not_found_omits_company_id(client, stub_pipeline):
 
 
 # --- auth + dispatch gates --------------------------------------------------
+
+def test_moco_422_on_create_still_acks_200(client, stub_pipeline):
+    """A Moco 4xx on POST /purchases must ACK **200 ok=true**, not 4xx/5xx.
+
+    Anything else and Moco retries the webhook forever — a retry cannot
+    fix a rejected payload, and each one re-runs the (paid) OCR call. The
+    operator's signal is the Telegram alert, not the HTTP status. Covered
+    at the service level too; this pins the full request → response
+    contract through the endpoint (spec D5).
+    """
+    stub_pipeline["purchase_create_error"] = urlerror.HTTPError(
+        "https://solar.mocoapp.com/api/v1/purchases", 422,
+        "Unprocessable Entity", {},
+        fp=io.BytesIO(b'{"receipt_identifier":["ist bereits vergeben"]}'),
+    )
+    body = json.dumps(WEBHOOK_BODY).encode()
+    resp = client.post("/api/supplier-invoice-ocr", content=body,
+                       headers=signed_headers(body, target="Purchase::Draft",
+                                              event="create"))
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["ok"] is True
+    assert payload["skipped"] == "moco_rejected"
+    assert payload["moco_status"] == 422
+    # The draft must survive — it's the only remaining copy of the invoice.
+    assert not [c for c in stub_pipeline["calls"]
+                if c[0] == "DELETE" and "/purchases/drafts/" in c[1]]
+    # ...and the operator has to hear about it.
+    assert [c for c in stub_pipeline["calls"] if "api.telegram.org" in c[1]]
+
 
 def test_rejects_wrong_target(client):
     raw = json.dumps(WEBHOOK_BODY).encode()

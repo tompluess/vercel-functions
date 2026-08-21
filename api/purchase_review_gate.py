@@ -7,12 +7,14 @@ company matched, expense account determined, model confident — that review
 is busywork, so this gate releases the purchase straight through with an
 `Auto` tag instead.
 
-A purchase is **auto-released** only when all four hold:
+A purchase is **auto-released** only when all five hold:
 
 1. a supplier company was matched (`company_id is not None`),
 2. the resolved category is *trusted* — see `_category_trusted` below,
 3. the model's own confidence is at least `AUTO_RELEASE_CONFIDENCE`,
-4. it isn't a credit note (those always need a human to check the sign).
+4. it isn't a credit note (those always need a human to check the sign),
+5. the VAT rate came off the document (or the supplier / account default),
+   not from `VatCodeResolver`'s payment-method floor.
 
 Anything else is held, and `ReviewDecision.reasons` names which conditions
 failed so the log line, the Telegram message and the batch script's column
@@ -25,7 +27,8 @@ preview what the rule *would* decide for historical drafts. A private copy
 of the policy inside the service would let that preview drift away from the
 real gate, which is exactly what the preview exists to prevent.
 
-See `specs/SPEC_purchase_payment_already_paid.md` for the decisions.
+See `specs/SPEC_purchase_payment_already_paid.md` and
+`specs/SPEC_vat_code_fallback.md` for the decisions.
 """
 
 import logging
@@ -34,6 +37,7 @@ from dataclasses import dataclass, field
 from api.anthropic_ocr_client import InvoiceData
 from api.moco_category_resolver import CategoryDecision
 from api.moco_project_resolver import ProjectMatch
+from api.vat_code_resolver import VatDecision
 
 logger = logging.getLogger("purchase_review_gate")
 
@@ -82,7 +86,8 @@ class PurchaseReviewGate:
     def evaluate(self, *, invoice: InvoiceData,
                  company_id: int | None,
                  category: CategoryDecision | None,
-                 project_match: ProjectMatch | None = None) -> ReviewDecision:
+                 project_match: ProjectMatch | None = None,
+                 vat: VatDecision | None = None) -> ReviewDecision:
         reasons: list[str] = []
 
         if company_id is None:
@@ -91,6 +96,18 @@ class PurchaseReviewGate:
         category_reason = self._category_reason(category, project_match)
         if category_reason:
             reasons.append(category_reason)
+
+        # A rate nobody read off the document must not reach Bexio
+        # unreviewed — `VatCodeResolver`'s floor guesses by payment method
+        # (spec D3). In practice this only bites bank-transfer bills:
+        # already-paid card receipts are held anyway, because
+        # `MocoCategoryResolver` short-circuits at `already_paid` and
+        # leaves `category_id` None.
+        if vat is not None and vat.guessed:
+            # `:g` so 0.0 prints as "0%" and 8.1 stays "8.1%".
+            rate = f"{vat.rate:g}%" if vat.rate is not None else "unbekannt"
+            reasons.append(f"MWST-Satz nicht auf dem Beleg erkannt "
+                           f"(Annahme {rate})")
 
         if invoice.confidence < self._min_confidence:
             reasons.append(f"Konfidenz {invoice.confidence:.0%} "

@@ -63,16 +63,14 @@ from api.stromproduktion_project_matcher import (
 from api.supplier_invoice_ocr_service import (
     CONFIDENCE_THRESHOLD,
     SupplierInvoiceOcrService,
-    _account_default_vat_code,
     _build_create_payload,
-    _find_vat_code_by_rate,
     _is_notification_subject,
     _is_qr_iban,
     _payment_method_for,
     _prefer_draft_payment_fields,
-    _supplier_default_vat_code_id,
     _user_id_from_draft,
 )
+from api.vat_code_resolver import VatCodeResolver, VatDecision
 
 logging.basicConfig(level=logging.WARNING,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -164,31 +162,25 @@ def _step(msg: str) -> None:
     print(f"      {msg}", flush=True)
 
 
-def _resolve_vat_code_with_tier(invoice, company: dict | None,
-                                vat_codes: list[dict]
-                                ) -> tuple[int | None, str]:
-    """Mirror of `SupplierInvoiceOcrService._resolve_vat_code_id` that
-    additionally reports which tier of the 4-step chain won.
+def _format_vat_tier(vat: VatDecision) -> str:
+    """Operator-facing description of which tier produced the vat code.
 
-    Why a copy rather than a refactor on the service: the production
-    service returns only the id (the tier is purely operator-facing); the
-    refactor would touch every call site. Keeping the chain mirrored here
-    is ~20 lines and easy to diff against the service when it changes.
-    `company` is the matched supplier's full `get_company` record —
-    fetched once by the caller and shared with the category resolver.
+    Purely a presentation layer over `VatDecision.source` — the chain
+    itself is `VatCodeResolver`, the same class the webhook service runs,
+    so this preview cannot drift from the real rule. (It used to be a
+    hand-copied mirror of the chain; see `specs/SPEC_vat_code_fallback.md`
+    D4 for why that had to go.)
     """
-    if invoice.vat_rate is not None:
-        match = _find_vat_code_by_rate(vat_codes, invoice.vat_rate)
-        if match is not None:
-            return match.get("id"), f"matched OCR rate {invoice.vat_rate*100:.1f}%"
-    if company:
-        sid = _supplier_default_vat_code_id(company, vat_codes)
-        if sid is not None:
-            return sid, "supplier default"
-    account_default = _account_default_vat_code(vat_codes)
-    if account_default is not None:
-        return account_default.get("id"), "account default"
-    return None, "unresolved — Moco will 422"
+    rate = f"{vat.rate:g}%" if vat.rate is not None else "?"
+    if vat.vat_code_id is None:
+        return "unresolved — Moco will 422"
+    return {
+        "ocr": f"matched OCR rate {rate}",
+        "supplier": "supplier default",
+        "account_default": "account default",
+        "fallback_zero": f"fallback {rate} (already paid by card)",
+        "fallback_standard": f"fallback {rate} (standard rate)",
+    }.get(vat.source, vat.source or "?")
 
 
 def _format_review_cell(decision: ReviewDecision) -> str:
@@ -515,9 +507,9 @@ def _process_draft(draft: dict, *,
     except Exception as e:
         vat_codes = []
         log.warning("list_vat_codes failed: %s", e)
-    vat_code_id, vat_tier = _resolve_vat_code_with_tier(
-        invoice, full_company, vat_codes)
-    _step(f"vat_code {vat_code_id if vat_code_id else '?'} ({vat_tier})")
+    vat = VatCodeResolver(vat_codes).resolve(invoice, full_company)
+    _step(f"vat_code {vat.vat_code_id if vat.vat_code_id else '?'} "
+          f"({_format_vat_tier(vat)})")
 
     # --- payment method + IBAN tail ---------------------------------------
     method = _payment_method_for(invoice)
@@ -554,7 +546,8 @@ def _process_draft(draft: dict, *,
     # the REVIEW column is the real decision rather than a re-implementation.
     review_decision = PurchaseReviewGate().evaluate(
         invoice=invoice, company_id=company_id,
-        category=category_decision, project_match=kommission_match)
+        category=category_decision, project_match=kommission_match,
+        vat=vat)
     _step(f"review: {'HOLD' if review_decision.review_pending else 'AUTO'}"
           f"{' — ' + review_decision.reason_text() if review_decision.reasons else ''}")
     review_cell = _format_review_cell(review_decision)
@@ -571,7 +564,7 @@ def _process_draft(draft: dict, *,
 
     # --- apply: create + comments + delete draft --------------------------
     payload = _build_create_payload(
-        invoice, pdf_bytes, vat_code_id=vat_code_id,
+        invoice, pdf_bytes, vat_code_id=vat.vat_code_id,
         company_id=company_id, draft_id=draft_id,
         user_id=_user_id_from_draft(draft),
         category_id=category_decision.category_id,
@@ -601,7 +594,12 @@ def _process_draft(draft: dict, *,
         # as the webhook flow. Using the service's existing methods (rather
         # than re-implementing) keeps batch and webhook in lockstep.
         service._post_summary_comments(new_purchase_id, invoice,
-                                        draft_id, draft)
+                                        draft_id, draft,
+                                        review=review_decision,
+                                        company=full_company,
+                                        project_match=kommission_match,
+                                        category=category_decision,
+                                        vat=vat)
         assign_warnings = service._assign_resolved_project(
             created, kommission_match)
         if assign_warnings:
