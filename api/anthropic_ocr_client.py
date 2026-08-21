@@ -405,7 +405,17 @@ class AnthropicOcrClient:
     BASE_URL = "https://api.anthropic.com"
     DEFAULT_MODEL = "claude-sonnet-4-6"
     ANTHROPIC_VERSION = "2023-06-01"
-    MAX_TOKENS = 1024
+    # Headroom, not a target: `max_tokens` caps the response, it isn't
+    # billed unless used. The prompt's length checks ("count the digits,
+    # re-check before responding") make Sonnet reason out loud before
+    # emitting JSON, and on a dense QR-bill that scratchpad alone has been
+    # measured at 811 tokens — leaving under 250 for a ~600-token JSON
+    # object. Solar purchase 4645420 (a QR-bill whose IBAN ends in a
+    # letter, so the model counts characters especially carefully) hit the
+    # 1024 cap mid-reasoning and returned NO JSON at all on one of two
+    # consecutive runs: `AnthropicOcrError(status_code=None)` → app error
+    # → the draft never becomes a purchase. 4096 removes that cliff.
+    MAX_TOKENS = 4096
 
     def __init__(self, *, api_key: str, model: str | None = None):
         self._api_key = api_key
