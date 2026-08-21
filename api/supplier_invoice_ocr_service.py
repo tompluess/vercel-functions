@@ -738,6 +738,17 @@ class SupplierInvoiceOcrService:
             suffix += "\n💳 Zahlung erfasst (bereits bezahlt)"
         elif payment_warning:
             suffix += f"\n⚠️ Zahlung nicht registriert: {payment_warning}"
+        # A QR-reference with no IBAN is self-evidently a QR-bill we failed
+        # to read: the Zahlteil was legible enough to yield a 27-digit
+        # reference, but not the IBAN beside it, and the supplier record
+        # had none to recover from either. Left unsaid this is invisible —
+        # `BexioExpenseSyncService` takes its MANUAL branch, which skips
+        # booking and the outgoing payment *silently* by design. Rides on
+        # the same message: one Telegram per draft stays the rule.
+        if invoice.qr_reference and not invoice.iban:
+            suffix += ("\n⚠️ QR-Referenz erkannt, aber keine IBAN gelesen — "
+                       "Bexio bucht als MANUAL ohne Zahlungsausgang. "
+                       "IBAN beim Lieferanten in Moco hinterlegen.")
         if invoice.is_credit_note:
             # Gutschrift always triggers the alert regardless of confidence:
             # the reviewer must flip the sign on the total before approving.

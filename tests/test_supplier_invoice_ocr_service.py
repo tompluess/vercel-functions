@@ -2753,3 +2753,58 @@ def test_ocr_read_iban_is_not_flagged_in_the_comment():
 
     comment = next(t for _, t in purchases.comments if "OCR-Extraktion" in t)
     assert "aus Lieferant-Stammdaten" not in comment
+
+
+# --- QR-reference-without-IBAN inconsistency --------------------------------
+
+def test_qr_reference_without_iban_warns_on_telegram():
+    """The Zahlteil was legible enough for a 27-digit reference but not the
+    IBAN beside it, and no supplier record could supply one. Downstream
+    that silently becomes a MANUAL Bexio payment with no Zahlungsausgang,
+    so it has to be said out loud."""
+    tg = FakeTelegram()
+    s = build_service(ocr=FakeOcr(result=make_invoice(
+        iban=None, qr_reference="000000000000000000004091456")), telegram=tg)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert any("QR-Referenz erkannt, aber keine IBAN" in m
+               for m in tg.messages)
+
+
+def test_no_warning_once_the_supplier_iban_recovers_it():
+    """The fallback ran, so there's nothing inconsistent left to report."""
+    moco = FakeMoco()
+    moco.suppliers = [{"id": 555, "name": "energiecheck bern ag"}]
+    moco.companies[555] = {"id": 555, "iban": SUPPLIER_IBAN}
+    tg = FakeTelegram()
+    s = build_service(moco=moco, telegram=tg, ocr=FakeOcr(
+        result=make_invoice(supplier_name="energiecheck bern ag", iban=None,
+                            qr_reference="000000000000000000004091456")))
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert not any("keine IBAN" in m for m in tg.messages)
+
+
+def test_no_warning_without_a_qr_reference():
+    """A plain invoice with no IBAN is ordinary — many suppliers bill
+    without one. Only the QR-reference makes the gap contradictory."""
+    tg = FakeTelegram()
+    s = build_service(ocr=FakeOcr(result=make_invoice(
+        iban=None, qr_reference=None)), telegram=tg)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert not any("keine IBAN" in m for m in tg.messages)
+
+
+def test_warning_rides_on_the_existing_message():
+    """One Telegram per draft — the warning is a suffix, not a second send."""
+    tg = FakeTelegram()
+    s = build_service(ocr=FakeOcr(result=make_invoice(
+        iban=None, qr_reference="000000000000000000004091456")), telegram=tg)
+
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+
+    assert len(tg.messages) == 1
