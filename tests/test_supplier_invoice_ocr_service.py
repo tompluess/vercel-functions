@@ -15,6 +15,7 @@ from api.purchase_review_gate import OCR_TAG, REVIEW_PENDING_TAG
 from api.supplier_invoice_ocr_service import (
     CONFIDENCE_THRESHOLD,
     SupplierInvoiceOcrService,
+    _format_manual_upload_comment,
     _format_ocr_comment,
 )
 
@@ -39,6 +40,7 @@ def make_invoice(**overrides) -> InvoiceData:
         creditor_reference=None,
         payment_purpose="Rechnung Mai 2026",
         description="Solarmodule und Montage",
+        position_title=None,
         is_credit_note=False,
         commission=None,
         delivery_address=None,
@@ -90,6 +92,11 @@ class FakePurchaseClient:
         self.create_error: Exception | None = None
         self.comments: list[tuple[int, str]] = []
         self.comment_error: Exception | None = None
+        # Per-call failures, consumed in order — one entry per
+        # `post_comment`, None meaning "this one succeeds". Lets a test
+        # fail the provenance comment while the OCR summary still posts,
+        # which `comment_error` (all-or-nothing) can't express.
+        self.comment_errors: list[Exception | None] = []
         self.deleted_drafts: list[int] = []
         self.delete_draft_error: Exception | None = None
         # Each entry: dict of kwargs passed to assign_item_to_project.
@@ -159,6 +166,10 @@ class FakePurchaseClient:
     def post_comment(self, purchase_id: int, text: str) -> dict:
         if self.comment_error:
             raise self.comment_error
+        if self.comment_errors:
+            err = self.comment_errors.pop(0)
+            if err is not None:
+                raise err
         self.comments.append((purchase_id, text))
         return {"id": 1}
 
@@ -188,9 +199,14 @@ class FakeOcr:
         self.result = result
         self.error = error
         self.calls: list[bytes] = []
+        # Operator subjects seen per `extract` call, so tests can assert
+        # the manual-upload subject actually reaches the model.
+        self.subjects: list[str | None] = []
 
-    def extract(self, pdf_bytes: bytes) -> InvoiceData:
+    def extract(self, pdf_bytes: bytes, *,
+                subject: str | None = None) -> InvoiceData:
         self.calls.append(pdf_bytes)
+        self.subjects.append(subject)
         if self.error:
             raise self.error
         return self.result
@@ -2500,3 +2516,127 @@ def test_ocr_comment_standalone_render_keeps_legacy_banner():
 
     assert "Bitte Felder prüfen und freigeben" in text
     assert "Automatisch freigegeben" not in text
+
+
+# --- manual-upload subject --------------------------------------------------
+
+def test_manual_upload_subject_reaches_the_model():
+    """A hand-uploaded draft's title is the operator's statement of what
+    the expense was FOR — the one thing OCR can never recover."""
+    ocr = FakeOcr(result=make_invoice())
+    s = build_service(ocr=ocr)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf",
+                         "title": "Mittagessen 20.8."})
+    assert ocr.subjects == ["Mittagessen 20.8."]
+
+
+def test_email_subject_is_never_passed_as_an_operator_subject():
+    """Regression: a FORWARDED email carries both `email_from` and the
+    forwarding staff member as `user` (confirmed live, solar draft
+    3213194), so `email_from` — not `user` — is the discriminator. An
+    email Subject is not operator input and must not steer the title."""
+    ocr = FakeOcr(result=make_invoice())
+    s = build_service(ocr=ocr)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf",
+                         "title": "Fwd: Rechnung Bützi 257g",
+                         "email_from": "r.kaelin@pvcontracting.ch",
+                         "user": {"id": 42, "firstname": "Romain",
+                                  "lastname": "Kälin"}})
+    assert ocr.subjects == [None]
+
+
+def test_blank_subject_is_not_forwarded():
+    ocr = FakeOcr(result=make_invoice())
+    s = build_service(ocr=ocr)
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf", "title": "   "})
+    assert ocr.subjects == [None]
+
+
+def test_position_title_becomes_the_purchase_and_item_title():
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases, ocr=FakeOcr(result=make_invoice(
+        position_title="Mittagessen 20.8. — Ligu Lehm",
+        description="Küche (Kassenbon)")))
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    created = purchases.creates[0]
+    assert created["title"] == "Mittagessen 20.8. — Ligu Lehm"
+    assert created["items"][0]["title"] == "Mittagessen 20.8. — Ligu Lehm"
+
+
+def test_missing_position_title_falls_back_to_description():
+    """The model can omit the field, and every pre-`position_title` caller
+    passes None — both must land on the old behaviour, not on a blank."""
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases, ocr=FakeOcr(
+        result=make_invoice(position_title=None,
+                            description="Solarmodule und Montage")))
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert purchases.creates[0]["title"] == "Solarmodule und Montage"
+
+
+# --- provenance comment -----------------------------------------------------
+
+def test_manual_upload_gets_a_provenance_comment():
+    """The draft is deleted after the create, so this comment is the only
+    surviving record of who uploaded the document and what they called it."""
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases, ocr=FakeOcr(result=make_invoice()))
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf",
+                         "title": "Mittagessen 20.8.",
+                         "user": {"id": 933633806, "firstname": "Tom",
+                                  "lastname": "Plüss"}})
+    comment = purchases.comments[0][1]
+    assert "📎 Manueller Upload" in comment
+    assert "Mittagessen 20.8." in comment
+    assert "Tom Plüss" in comment
+
+
+def test_email_draft_gets_the_email_comment_not_the_manual_one():
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases, ocr=FakeOcr(result=make_invoice()))
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf",
+                         "title": "Ihr Beleg Rechnung 2026-4022608",
+                         "email_from": "rechnung@ch.krannich-solar.com"})
+    comment = purchases.comments[0][1]
+    assert "📧 Email-Quelle" in comment
+    assert "📎 Manueller Upload" not in comment
+    # The draft title IS the mail's Subject header — worth showing.
+    assert "Ihr Beleg Rechnung 2026-4022608" in comment
+
+
+def test_no_provenance_comment_when_the_draft_says_nothing():
+    """No email fields, no title, no user — skip rather than post an
+    empty header."""
+    purchases = FakePurchaseClient()
+    s = build_service(purchases=purchases, ocr=FakeOcr(result=make_invoice()))
+    s.process("create", {"id": 1, "file_url": "https://x/y.pdf"})
+    assert all("Manueller Upload" not in text
+               and "Email-Quelle" not in text
+               for _, text in purchases.comments)
+
+
+def test_provenance_comment_failure_does_not_block_the_ocr_comment():
+    """Independent best-effort posts — the OCR summary is the one the
+    reviewer actually works from."""
+    purchases = FakePurchaseClient()
+    purchases.comment_errors = [RuntimeError("boom")]
+    s = build_service(purchases=purchases, ocr=FakeOcr(result=make_invoice()))
+    result = s.process("create", {"id": 1, "file_url": "https://x/y.pdf",
+                                  "title": "Mittagessen 20.8."})
+    assert result.get("skipped") is None
+    assert any("OCR-Extraktion" in text for _, text in purchases.comments)
+
+
+def test_subject_is_html_escaped_in_the_comment():
+    assert "&lt;script&gt;" in _format_manual_upload_comment(
+        "<script>alert(1)</script>", "Tom Plüss")
+
+
+def test_manual_comment_renders_with_subject_alone():
+    out = _format_manual_upload_comment("Mittagessen 20.8.", None)
+    assert "Mittagessen 20.8." in out
+    assert "Hochgeladen von" not in out
+
+
+def test_manual_comment_is_empty_without_either_field():
+    assert _format_manual_upload_comment(None, None) == ""

@@ -353,6 +353,57 @@ def test_supplier_not_found_omits_company_id(client, stub_pipeline):
 
 # --- auth + dispatch gates --------------------------------------------------
 
+def test_manual_upload_subject_reaches_anthropic_and_the_titles(
+        client, stub_pipeline):
+    """Full pipeline for a hand-uploaded draft: the operator's subject is
+    sent to the model as context, the returned `position_title` becomes
+    both the purchase and line-item title, and a 📎 provenance comment
+    records who uploaded it."""
+    stub_pipeline["ocr_text"] = json.dumps(
+        {**SAMPLE_OCR, "position_title": "Mittagessen 20.8. — Ligu Lehm"})
+    body = json.dumps({**WEBHOOK_BODY,
+                       "title": "Mittagessen 20.8.",
+                       "user": {"id": 933633806, "firstname": "Tom",
+                                "lastname": "Plüss"}}).encode()
+    resp = client.post("/api/supplier-invoice-ocr", content=body,
+                       headers=signed_headers(body, target="Purchase::Draft",
+                                              event="create"))
+    assert resp.status_code == 200
+
+    anthropic = next(c for c in stub_pipeline["calls"]
+                     if "api.anthropic.com" in c[1])
+    text = next(b["text"] for b in anthropic[2]["messages"][0]["content"]
+                if b["type"] == "text")
+    assert "Mittagessen 20.8." in text
+
+    created = next(c[2] for c in stub_pipeline["calls"]
+                   if c[0] == "POST" and c[1].endswith("/purchases"))
+    assert created["title"] == "Mittagessen 20.8. — Ligu Lehm"
+    assert created["items"][0]["title"] == "Mittagessen 20.8. — Ligu Lehm"
+
+    comments = [c[2]["text"] for c in stub_pipeline["calls"]
+                if c[0] == "POST" and c[1].endswith("/comments")]
+    assert any("📎 Manueller Upload" in t and "Tom Plüss" in t
+               for t in comments)
+
+
+def test_email_draft_sends_no_operator_subject(client, stub_pipeline):
+    """An email Subject is not operator input — the request must stay
+    identical to what it was before the feature."""
+    body = json.dumps({**WEBHOOK_BODY,
+                       "title": "Ihr Beleg Rechnung 2026-4022608",
+                       "email_from": "rechnung@ch.krannich-solar.com"}).encode()
+    resp = client.post("/api/supplier-invoice-ocr", content=body,
+                       headers=signed_headers(body, target="Purchase::Draft",
+                                              event="create"))
+    assert resp.status_code == 200
+    anthropic = next(c for c in stub_pipeline["calls"]
+                     if "api.anthropic.com" in c[1])
+    text = next(b["text"] for b in anthropic[2]["messages"][0]["content"]
+                if b["type"] == "text")
+    assert text == "Extract the invoice data as JSON."
+
+
 def test_moco_422_on_create_still_acks_200(client, stub_pipeline):
     """A Moco 4xx on POST /purchases must ACK **200 ok=true**, not 4xx/5xx.
 

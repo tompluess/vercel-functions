@@ -62,7 +62,10 @@ from api.vat_code_resolver import VatCodeResolver
 from api.supplier_invoice_ocr_service import (
     SupplierInvoiceOcrService,
     _build_create_payload,
+    _draft_uploader_name,
     _format_email_source_comment,
+    _format_manual_upload_comment,
+    _manual_upload_subject,
     _format_ocr_comment,
     _user_id_from_draft,
 )
@@ -243,9 +246,13 @@ def main() -> int:
 
     # 2. OCR
     log.info("downloading PDF and running OCR via %s", ocr._model)
+    subject = _manual_upload_subject(draft)
+    if subject:
+        print(f"  Betreff (manueller Upload): {subject!r} "
+              "— fliesst in position_title ein")
     try:
         pdf_bytes = moco.download_file(file_url)
-        invoice = ocr.extract(pdf_bytes)
+        invoice = ocr.extract(pdf_bytes, subject=subject)
     except AnthropicOcrError as e:
         print(f"\nOCR failed: {e} (status_code={e.status_code})",
               file=sys.stderr)
@@ -382,9 +389,15 @@ def main() -> int:
         category_id=category_decision.category_id,
         tags=review_decision.tags,
     )
-    email_comment = _format_email_source_comment(
+    # Same provenance branch the service takes: email source, else the
+    # manual-upload block. Mutually exclusive.
+    source_comment = _format_email_source_comment(
+        subject=draft.get("title"),
         email_from=draft.get("email_from"),
         email_body=draft.get("email_body"),
+    ) or _format_manual_upload_comment(
+        subject=subject,
+        uploader=_draft_uploader_name(draft),
     )
     ocr_comment = _format_ocr_comment(
         invoice, review=review_decision, company=full_company,
@@ -393,11 +406,12 @@ def main() -> int:
     _print_payload_summary(payload)
     # The service posts these as two separate Moco comments. Render each
     # independently so the operator sees what each entry will look like.
-    if email_comment:
-        _print_section("Comment 1: 📧 Email-Quelle (rendered)")
-        print(_render_html_for_console(email_comment))
+    if source_comment:
+        _print_section("Comment 1: Herkunft (rendered)")
+        print(_render_html_for_console(source_comment))
     else:
-        _print_section("Comment 1: 📧 Email-Quelle — SKIPPED (no email fields on draft)")
+        _print_section("Comment 1: Herkunft — SKIPPED "
+                       "(no email fields and no subject/uploader on draft)")
     _print_section("Comment 2: 🤖 OCR-Extraktion (rendered)")
     print(_render_html_for_console(ocr_comment))
 

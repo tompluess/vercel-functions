@@ -692,3 +692,72 @@ def test_extract_energy_credit_note_tolerates_reasoning_preamble(client, calls):
     calls["next_response"] = _anthropic_response(text)
     credit = client.extract_energy_credit_note(PDF_BYTES)
     assert credit.gross_amount == 3785.65
+
+
+# --- operator subject (manual-upload drafts) --------------------------------
+
+def _text_block(call) -> str:
+    blocks = call["payload"]["messages"][0]["content"]
+    return next(b["text"] for b in blocks if b["type"] == "text")
+
+
+def test_subject_rides_in_the_user_turn_not_the_system_prompt(client, calls):
+    """The system prompt must stay byte-identical across requests; the
+    per-request operator subject belongs in the user turn. Asserted by
+    comparing two calls rather than by scanning for the subject string —
+    the prompt legitimately contains "Mittagessen 20.8." as its own
+    worked example of a business-purpose subject."""
+    client.extract(PDF_BYTES, subject="Mittagessen 20.8.")
+    client.extract(PDF_BYTES, subject="Abendessen Genf 3.6.")
+    first, second = calls["calls"]
+    assert first["payload"]["system"] == second["payload"]["system"]
+    assert "Abendessen Genf 3.6." not in first["payload"]["system"]
+
+    text = _text_block(first)
+    assert "Mittagessen 20.8." in text
+    assert "Operator-Betreff" in text
+    assert "Abendessen Genf 3.6." in _text_block(second)
+
+
+def test_subject_is_fenced_and_labelled_as_data(client, calls):
+    """It's employee-typed free text landing in a prompt — say so."""
+    client.extract(PDF_BYTES, subject="Mittagessen 20.8.")
+    text = _text_block(calls["calls"][0])
+    assert "«Mittagessen 20.8.»" in text
+    assert "nicht als Anweisung" in text
+
+
+def test_no_subject_leaves_the_request_unchanged(client, calls):
+    """An email-imported draft must produce exactly the request the
+    endpoint sent before this feature existed."""
+    client.extract(PDF_BYTES)
+    assert _text_block(calls["calls"][0]) == "Extract the invoice data as JSON."
+
+
+def test_empty_subject_is_treated_as_absent(client, calls):
+    client.extract(PDF_BYTES, subject="")
+    assert _text_block(calls["calls"][0]) == "Extract the invoice data as JSON."
+
+
+def test_system_prompt_documents_the_filename_escape_hatch(client, calls):
+    """Roughly half the live manual subjects are browser file names
+    ("trennscheibenblätter.pdf") — the model has to know to drop those."""
+    client.extract(PDF_BYTES)
+    system = calls["calls"][0]["payload"]["system"]
+    assert "position_title" in system
+    assert ".pdf" in system
+
+
+def test_position_title_is_parsed(client, calls):
+    calls["next_response"] = _anthropic_response(json.dumps(
+        {**SAMPLE_OCR, "position_title": "Mittagessen 20.8. — Ligu Lehm"}))
+    invoice = client.extract(PDF_BYTES, subject="Mittagessen 20.8.")
+    assert invoice.position_title == "Mittagessen 20.8. — Ligu Lehm"
+    # `description` stays a pure reading of the document.
+    assert invoice.description == SAMPLE_OCR["description"]
+
+
+def test_missing_position_title_is_none(client, calls):
+    calls["next_response"] = _anthropic_response(json.dumps(
+        {k: v for k, v in SAMPLE_OCR.items() if k != "position_title"}))
+    assert client.extract(PDF_BYTES).position_title is None

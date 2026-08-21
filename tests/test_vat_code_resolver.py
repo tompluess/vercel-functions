@@ -40,7 +40,8 @@ def make_invoice(**overrides) -> InvoiceData:
         total_amount=1234.50, net_amount=None, vat_amount=None,
         vat_rate=None, currency="CHF", iban=None, qr_reference=None,
         creditor_reference=None, payment_purpose=None,
-        description="Solarmodule", is_credit_note=False, commission=None,
+        description="Solarmodule", position_title=None,
+        is_credit_note=False, commission=None,
         delivery_address=None, already_paid_by_card=False, confidence=0.92,
     )
     base.update(overrides)
