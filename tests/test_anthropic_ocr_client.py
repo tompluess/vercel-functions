@@ -766,3 +766,51 @@ def test_missing_position_title_is_none(client, calls):
     calls["next_response"] = _anthropic_response(json.dumps(
         {k: v for k, v in SAMPLE_OCR.items() if k != "position_title"}))
     assert client.extract(PDF_BYTES).position_title is None
+
+
+# --- QR-reference check digit -----------------------------------------------
+#
+# The 27th digit is a "Modulo 10, rekursiv" checksum over the first 26.
+# Length alone let a length-preserving misread through, and those happen:
+# on a live Solarmarkt bill the model transcribed
+# `...000000339080540 24177` for `...000000033908054024177`, dropping a
+# zero from the long zero-run. A wrong reference is a payment posted
+# against the wrong invoice at the supplier.
+
+LIVE_QR_REFERENCES = [
+    "123456000000033908054024177",   # Solarmarkt GmbH
+    "000000000006547202647634381",   # smart-me AG
+    "971625000013275202640226089",   # Krannich Solar AG
+    "002953000013855365463231878",   # Solar Manager AG
+]
+
+
+@pytest.mark.parametrize("reference", LIVE_QR_REFERENCES)
+def test_live_references_pass_the_check_digit(reference):
+    """Guards the algorithm itself against a wrong lookup table: every one
+    of these was read off a real Swiss QR-bill."""
+    from api.anthropic_ocr_client import _normalize_qr_reference
+    assert _normalize_qr_reference(reference) == reference
+
+
+def test_bad_check_digit_is_nulled(client, calls):
+    """A single digit altered mid-reference keeps the length but breaks the
+    checksum — this is what length-only validation missed."""
+    calls["next_response"] = _anthropic_response(json.dumps(
+        {**SAMPLE_OCR, "qr_reference": "123456000000033908054024187"}))
+    assert client.extract(PDF_BYTES).qr_reference is None
+
+
+def test_check_digit_is_computed_over_the_first_26_digits():
+    from api.anthropic_ocr_client import _qr_check_digit
+    for reference in LIVE_QR_REFERENCES:
+        assert _qr_check_digit(reference[:26]) == int(reference[26])
+
+
+def test_formatting_is_stripped_before_the_check(client, calls):
+    """The slip prints the reference in groups and Sonnet echoes them; the
+    checksum must be computed on the digits-only form."""
+    calls["next_response"] = _anthropic_response(json.dumps(
+        {**SAMPLE_OCR, "qr_reference": "12 34560 00000 03390 80540 24177"}))
+    assert client.extract(PDF_BYTES).qr_reference == \
+        "123456000000033908054024177"

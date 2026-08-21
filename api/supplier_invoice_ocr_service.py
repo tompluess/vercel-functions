@@ -834,6 +834,18 @@ class SupplierInvoiceOcrService:
             suffix += ("\n⚠️ QR-Referenz erkannt, aber keine IBAN gelesen — "
                        "Bexio bucht als MANUAL ohne Zahlungsausgang. "
                        "IBAN beim Lieferanten in Moco hinterlegen.")
+        # The mirror image, and the more dangerous one: a QR-IBAN is only
+        # payable WITH a QR-reference, so this combination is a bill no
+        # bank will accept. It arises when the model reads the IBAN (or
+        # the supplier fallback supplies it) but drops the reference —
+        # e.g. by losing a digit from a long zero-run, which
+        # `_normalize_qr_reference` then nulls on length or check digit.
+        # Unlike a missing IBAN there is nothing to recover from: the
+        # reference is per-invoice and exists only on the document.
+        elif _is_qr_iban(invoice.iban) and not invoice.qr_reference:
+            suffix += ("\n⚠️ QR-IBAN erkannt, aber keine gültige QR-Referenz "
+                       "gelesen — so ist die Rechnung nicht zahlbar. "
+                       "QR-Referenz vom Beleg nachtragen.")
         if invoice.is_credit_note:
             # Gutschrift always triggers the alert regardless of confidence:
             # the reviewer must flip the sign on the total before approving.
