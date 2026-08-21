@@ -152,6 +152,60 @@ def test_skips_when_no_company(service, bexio):
     assert bexio.calls == []  # no Bexio calls at all
 
 
+def test_skips_silently_when_purchase_is_archived(service, bexio, source):
+    """Moco archives a purchase once it's been filed — that's closed
+    business, not something to (re-)push into Bexio. Skip first thing,
+    before ANY Bexio or source-Moco I/O, and without a Telegram alert:
+    every later edit of an archived purchase fires another update
+    webhook, so alerting would be pure noise."""
+    body = {**load_fixture("purchase_with_iban.json"), "status": "archived"}
+    result = service.sync(body)
+    assert result == {"skipped": "status_not_pending", "status": "archived"}
+    assert bexio.calls == []
+    assert source.calls == []
+    assert service._telegram is None or service._telegram.messages == []
+
+
+def test_skips_any_status_other_than_pending(service, bexio):
+    """`pending` is the only in-scope status; anything else Moco grows
+    later must be skipped rather than silently treated as payable."""
+    for status in ["archived", "ARCHIVED", "  Archived  ", "approved"]:
+        body = {**load_fixture("purchase_with_iban.json"), "status": status}
+        result = service.sync(body)
+        assert result["skipped"] == "status_not_pending", status
+        assert bexio.calls == []
+
+
+def test_pending_purchase_syncs_normally(service, bexio):
+    """The gate must not touch the normal path — the fixtures are all
+    `status: "pending"`, which is exactly what a live create/update
+    webhook carries."""
+    body = load_fixture("purchase_with_iban.json")
+    assert body["status"] == "pending"
+    bexio.contacts_by_name["FLYERALARM - RatePAY GmbH"] = [
+        {"id": 5001, "street_name": "Kasernenstrasse",
+         "house_number": "1", "postcode": "8004", "city": "Zürich"}
+    ]
+    bexio.accounts_by_no["6600"] = [{"id": 7700, "tax_id": 42}]
+    result = service.sync(body)
+    assert "skipped" not in result
+    assert any(c[0] == "create_bill" for c in bexio.calls)
+
+
+def test_purchase_without_status_field_still_syncs(service, bexio):
+    """Defensive: a body with no `status` proceeds. Every live webhook
+    carries the field, and dropping a real bill because some shape
+    omitted it is worse than syncing one purchase too many."""
+    body = {k: v for k, v in load_fixture("purchase_with_iban.json").items()
+            if k != "status"}
+    bexio.contacts_by_name["FLYERALARM - RatePAY GmbH"] = [
+        {"id": 5001, "street_name": "Kasernenstrasse",
+         "house_number": "1", "postcode": "8004", "city": "Zürich"}
+    ]
+    bexio.accounts_by_no["6600"] = [{"id": 7700, "tax_id": 42}]
+    assert "skipped" not in service.sync(body)
+
+
 def test_skips_silently_when_purchase_carries_review_pending_tag(service, bexio,
                                                                   source):
     """Purchases tagged 'Review pending' come from the OCR auto-create

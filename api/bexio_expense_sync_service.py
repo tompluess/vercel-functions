@@ -2,6 +2,8 @@
 
 Mirrors the n8n "Sync expenses from Moco to Bexio" workflow:
 
+  0. Skip (silently) unless the Moco Purchase is `status: "pending"` —
+     an archived purchase is closed business.
   1. Skip if the Moco Purchase has no company.
   2. Find the Bexio contact by company name; if missing, fetch full company
      data from the Moco account and create the contact.
@@ -83,6 +85,21 @@ class BexioExpenseSyncService:
         self._telegram = telegram
 
     def sync(self, body: dict) -> dict[str, Any]:
+        # Moco purchases move pending → archived once the operator has
+        # filed them; an archived purchase is closed business and must not
+        # be (re-)pushed to Bexio. Only `pending` is in scope. Skip
+        # silently — an archived purchase fires an update webhook on every
+        # later edit, so a Telegram alert here would be pure noise, and
+        # Moco gets ok=true so it stops retrying. A body with no `status`
+        # at all proceeds: every live webhook carries the field, and
+        # dropping a real bill because a shape omitted it is the worse
+        # failure than syncing one purchase too many.
+        status = _purchase_status(body)
+        if status and status != "pending":
+            logger.info("expense sync: skipped (status=%s) source_id=%s",
+                        status, body.get("id"))
+            return {"skipped": "status_not_pending", "status": status}
+
         # "Review pending" is the marker the /api/supplier-invoice-ocr flow
         # sets on auto-created purchases. Until a human strips the tag in
         # Moco's UI, the data is unreviewed — sync to Bexio would propagate
@@ -420,6 +437,19 @@ class BexioExpenseSyncService:
 
 
 # --- helpers ----------------------------------------------------------------
+
+def _purchase_status(body: dict) -> str:
+    """The Moco purchase's `status`, lowercased and trimmed ("" when absent).
+
+    Moco's own values are lowercase already (`pending`, `archived`); the
+    normalization is here so a hand-built body or a future casing change
+    can't slip past the `pending` gate in `sync`.
+    """
+    status = body.get("status")
+    if not isinstance(status, str):
+        return ""
+    return status.strip().casefold()
+
 
 def _has_review_pending_tag(body: dict) -> bool:
     """True if the Moco purchase carries the 'Review pending' tag.
