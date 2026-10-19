@@ -274,6 +274,33 @@ Required environment variables (configure in the Vercel project, then `vercel en
 
 The VAT code is resolved dynamically per invoice (OCR `vat_rate` → supplier company default → account-wide `default: true` flag in `/vat_code_purchases` → a 0%/8.1% payment-method floor), so there's no env-var default to configure.
 
+### Redis (Bexio token store) — setup & recovery
+
+The two Bexio endpoints (and the OCR auto-release hand-off) keep the rotating Bexio OAuth token in Redis under `bexio:oauth`. Without it every Bexio call fails. To provision it from scratch, or to recover after the Redis resource was deleted or uninstalled:
+
+1. **Delete the stale env var.** The old integration's `REDIS_URL` can survive the resource. Remove it first so the new integration can inject its own:
+   ```bash
+   vercel env rm REDIS_URL production --yes
+   vercel env rm REDIS_URL preview --yes
+   vercel env rm REDIS_URL development --yes   # if present
+   ```
+2. **Provision Redis from the Marketplace** (official `redis` product, free plan). Connect it to all three environments so `vercel env pull` brings `REDIS_URL` down for the local bootstrap:
+   ```bash
+   vercel integration add redis
+   ```
+   If the CLI hands off to the browser (terms, plan choice), finish there. In the dashboard: *Storage → Create Database → Redis*, then connect it to the `vercel-functions` project.
+3. **Check that `REDIS_URL` is set:** `vercel env ls | grep REDIS_URL`
+4. **Re-seed the Bexio token.** A new Redis is empty, so the old offline session is gone with it. Run the one-time OAuth flow again (it opens a browser to log in to Bexio):
+   ```bash
+   vercel env pull .env.local
+   set -a; source .env.local; set +a
+   .venv/bin/python scripts/bexio_oauth_bootstrap.py
+   ```
+   Sensitive vars (e.g. `BEXIO_CLIENT_SECRET`) pull as empty. Fill them into `.env.local` by hand before running the script.
+5. **Redeploy production.** Env var changes only reach *new* deployments: `vercel --prod` (or redeploy the latest production deployment from the dashboard).
+
+The first Bexio webhook afterwards refreshes the access token and writes the rotated refresh token back. If it fails you'll get a Telegram `bexio_error` alert.
+
 ## Author
 
 [@tompluess](https://github.com/tompluess)
